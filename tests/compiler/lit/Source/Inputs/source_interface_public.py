@@ -297,7 +297,13 @@ def Counter():
         return count
     @ac.method
     def add(delta: ac.u8) -> ac.u8:
+        before = count
+        assert before == count
+        ac.log("info", "add", "before", before, delta)
+        assert before == count, ""
+        ac.log("debug", "literal", "fixed")
         count = count + delta
+        ac.report("count", count)
         return count
     @ac.method
     def chain(delta: ac.u8) -> ac.u8:
@@ -368,9 +374,6 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
     other = Counter()
     alias = owner
     @ac.rule
-    def probe() -> None:
-        owner.guarded(permitted)
-    @ac.rule
     def work() -> Result:
         owner.guarded(True)
         before = alias.chain(delta)
@@ -381,8 +384,34 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
         bit = owner.fixed(fixed)
         packet = owner.packet(payload)
         return Result(before=before, after=after, fixed=bit, packet=packet)
-    probe()
     return work()
+"""
+    state_plan_text = """import pycircuit as ac
+@ac.module
+def StatePlan():
+    count: ac.u8 = 0
+    @ac.method
+    def instrument(delta: ac.u8) -> ac.u8:
+        before = count
+        assert before == count
+        ac.report("before", before)
+        count = count + delta
+        ac.log("info", "after", count, before, count)
+        return count
+    @ac.rule
+    def run() -> None:
+        unused = instrument(1)
+    run()
+"""
+    execution_text = """import pycircuit as ac
+from interfaces.method_provider import Counter
+@ac.system
+def MethodEffectsSystem():
+    owner = Counter()
+    @ac.rule
+    def drive() -> None:
+        unused = owner.add(1)
+    drive()
 """
     archive = root / "method-publication"
     archive.mkdir()
@@ -393,10 +422,14 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
     provider_source = source / "method_provider.py"
     relay_source = source / "method_relay.py"
     consumer_source = source / "method_consumer.py"
+    state_plan_source = source / "method_state_plan.py"
+    execution_source = source / "method_execution.py"
     for path, text in (
         (provider_source, provider_text),
         (relay_source, relay_text),
         (consumer_source, consumer_text),
+        (state_plan_source, state_plan_text),
+        (execution_source, execution_text),
     ):
         path.write_text(text)
         # This evidence copy is outside the declared --source-root. It cannot
@@ -409,13 +442,34 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
         archive / "relay",
         archive / "consumer",
     )
+    state_plan_unit = archive / "state-plan"
+    execution_unit = archive / "execution"
     compile_unit(provider_source.name, provider_unit)
     provider_source.unlink()
+    compile_unit(execution_source.name, execution_unit, [provider_unit])
     compile_unit(relay_source.name, relay_unit, [provider_unit])
     relay_source.unlink()
     compile_unit(consumer_source.name, consumer_unit, [provider_unit, relay_unit])
+    compile_unit(state_plan_source.name, state_plan_unit)
+    state_plan_source.unlink()
     assert not provider_source.exists() and not relay_source.exists()
-    for unit in (provider_unit, relay_unit, consumer_unit):
+    state_plan_before = archive / "state-plan-before.ac"
+    state_plan_after = archive / "state-plan-after.ac"
+    run([args.optimizer, payload(state_plan_unit, "body"), "-o", state_plan_before])
+    run(
+        [
+            args.optimizer,
+            payload(state_plan_unit, "body"),
+            "--ac-analyze-transaction-state-ssa",
+            "-o",
+            state_plan_after,
+        ]
+    )
+    assert state_plan_before.read_bytes() == state_plan_after.read_bytes()
+    state_plan_body = state_plan_after.read_text()
+    assert '"ac.expect"' in state_plan_body
+    assert state_plan_body.count('"ac.observe"') == 2
+    for unit in (provider_unit, relay_unit, consumer_unit, execution_unit):
         extracted = archive / (unit.name + "-extracted.ac")
         extract(payload(unit, "body"), extracted)
         actual = normalize(extracted, archive / (unit.name + "-actual.ac"))
@@ -429,16 +483,26 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
     provider_header = payload(provider_unit, "interface").read_text()
     for kind in ("boolean", "integer", "fixed_bits", "nominal"):
         assert f'source_kind = "{kind}"' in provider_header, provider_header
+    assert provider_header.count('kind = "check"') == 2, provider_header
+    assert provider_header.count('kind = "observe"') == 3, provider_header
+    assert 'check_kind = "assert"' in provider_header, provider_header
+    assert 'observation_kind = "log"' in provider_header, provider_header
+    assert 'observation_kind = "report"' in provider_header, provider_header
+    assert "ac.check_id" not in provider_header, provider_header
+    assert "ac.observation_id" not in provider_header, provider_header
+    provider_body = payload(provider_unit, "body").read_text()
+    assert provider_body.count('"ac.expect"') == 2, provider_body
+    assert provider_body.count('"ac.observe"') == 3, provider_body
+    assert "ac.check_id" not in provider_body, provider_body
+    assert "ac.observation_id" not in provider_body, provider_body
     consumer_body = payload(consumer_unit, "body").read_text()
     relay_body = payload(relay_unit, "body").read_text()
     assert consumer_body.count('"ac.instance"(') == 2, consumer_body
     assert relay_body.count('"ac.instance"(') == 2, relay_body
     assert '"ac.method.call"(' in consumer_body and '"ac.transaction"(' in consumer_body
 
-    # This closure invokes Methods across instances and contains active
-    # dynamic guards. It remains outside same-owner transaction materialization.
-    # Preserve the independently published interfaces and hardware outputs.
-    final = archive / "protected.ac"
+    # Retain a separately linked ordinary program as the publication control.
+    control_final = archive / "control.ac"
     cli(
         "link",
         child,
@@ -446,36 +510,48 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
         "--top",
         "interfaces.source_interface_parent.Parent",
         "-o",
-        final,
+        control_final,
     )
+    control_before = control_final.read_bytes()
+    transaction_input = archive / "method-transaction-input.ac"
+    transaction_output = archive / "method-transaction-output.ac"
+    final = archive / "method-final.ac"
+    # Materialize the bounded cross-source Method System. The larger
+    # relay/consumer graph above remains publication and admission coverage;
+    # its deliberately broad expansion is outside the fixed native work limit.
+    command = [args.linker]
+    for unit in (provider_unit, execution_unit):
+        command.extend(("--body", payload(unit, "body")))
+        command.extend(("--header", payload(unit, "interface")))
+    command.extend(
+        (
+            "--top",
+            "interfaces.method_execution.MethodEffectsSystem",
+            "--target",
+            "final",
+            "--output",
+            final,
+            "--transaction-input-out",
+            transaction_input,
+            "--transaction-output-out",
+            transaction_output,
+        )
+    )
+    run(command)
+    assert control_final.read_bytes() == control_before
+    assert transaction_input.is_file() and transaction_output.is_file()
     before_final = final.read_bytes()
+    assert b'"ac.method.call"' in transaction_input.read_bytes()
+    assert b"ac.sampled_admission" in transaction_output.read_bytes()
+    assert b'"ac.method.call"' not in transaction_output.read_bytes()
+    assert b"ac.observation_id" in before_final and b"ac.check_id" in before_final
     emitted = {}
     for target in ("cpp", "verilog"):
         output = archive / target
         cli("emit", final, "--target", target, "-o", output)
         emitted[target] = snapshot(output)
-    rejected = cli(
-        "link",
-        provider_unit,
-        relay_unit,
-        consumer_unit,
-        "--top",
-        "interfaces.method_consumer.Consumer",
-        "-o",
-        final,
-        accepted=False,
-    )
-    diagnostic = rejected.stderr.lower()
-    assert "lower" in diagnostic and (
-        "method" in diagnostic or "transaction" in diagnostic
-    ), rejected.stderr
-    assert (
-        "unresolved" not in diagnostic and "missing" not in diagnostic
-    ), rejected.stderr
     assert final.read_bytes() == before_final
-    assert all(
-        snapshot(archive / target) == expected for target, expected in emitted.items()
-    )
+    assert control_final.read_bytes() == control_before
 
     if args.method_checks == "admission":
         before_unit = snapshot(consumer_unit)
@@ -590,7 +666,7 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
     (scratch / ("method-" + args.method_checks + "-receipt.json")).write_text(
         json.dumps(
             {
-                "scope": "source publication and header authority; cross-instance and dynamic-guard Method closure remains rejected",
+                "scope": "source publication and header authority plus bounded cross-source Method System effect materialization, actual stage retention and dual emission",
                 "provider_python_unavailable": not provider_source.exists(),
                 "relay_python_unavailable": not relay_source.exists(),
                 "units": {
@@ -600,6 +676,13 @@ def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1
                     for unit in (provider_unit, relay_unit, consumer_unit)
                 },
                 "managed_hardware_outputs_preserved": True,
+                "transaction_stages": {
+                    "input": hashlib.sha256(transaction_input.read_bytes()).hexdigest(),
+                    "output": hashlib.sha256(
+                        transaction_output.read_bytes()
+                    ).hexdigest(),
+                    "final": hashlib.sha256(final.read_bytes()).hexdigest(),
+                },
                 "mode": args.method_checks,
                 "artifacts": str(retained),
                 "artifact_sha256": {

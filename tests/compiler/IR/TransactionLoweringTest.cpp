@@ -26,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace acir::ac {
@@ -970,6 +971,90 @@ TEST_F(TransactionLoweringTest,
 }
 
 TEST_F(TransactionLoweringTest,
+       PostPreparationNestedBodyEffectsFailCloneAndSourceAuthentication) {
+  auto file = parse();
+  ASSERT_TRUE(file);
+  auto bump = named<SourceMethodOp>(*file, "bump");
+  auto &body = bump.getBody().front();
+  auto next = *std::next(body.getOps<BitsBinaryOp>().begin());
+  auto one = (*owner(*file).getBody().front().getOps<BitsConstantOp>().begin())
+                 .getValue();
+  auto shape = builder.getArrayAttr({one});
+  auto table = TableType::get(&context, shape, next.getResult().getType());
+  builder.setInsertionPoint(next->getNextNode());
+  mlir::OperationState splat(next.getLoc(), TableSplatOp::getOperationName());
+  splat.addOperands(next.getResult());
+  splat.addTypes(table);
+  splat.addAttribute("shape", shape);
+  auto *input = builder.create(splat);
+  mlir::OperationState map(next.getLoc(), TableMapOp::getOperationName());
+  map.addOperands(input->getResults());
+  map.addTypes(table);
+  map.addAttribute("shape", shape);
+  map.addAttribute("operandSegmentSizes", builder.getDenseI32ArrayAttr({1, 0}));
+  map.addRegion();
+  auto *mapped = builder.create(map);
+  auto *local = new mlir::Block;
+  mapped->getRegion(0).push_back(local);
+  auto ordinal =
+      local->addArgument(BitsType::get(&context, one), mapped->getLoc());
+  auto element =
+      local->addArgument(next.getResult().getType(), mapped->getLoc());
+  builder.setInsertionPointToEnd(local);
+  mlir::OperationState yield(mapped->getLoc(), YieldOp::getOperationName());
+  yield.addOperands(element);
+  builder.create(yield);
+  ASSERT_TRUE(mlir::succeeded(capture([&] { return mlir::verify(*file); })))
+      << diagnostics;
+
+  SourceTransactionStateAnalysis analysis(file->getOperation());
+  ASSERT_TRUE(analysis.isValid()) << diagnostics;
+  HardwareSourceCheckLimits limits;
+  detail::SourceCheckBudget preparationBudget(limits);
+  auto prepared = capture([&] {
+    return acir::detail::prepareTransactionLowering(*file, analysis,
+                                                    preparationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(prepared)) << diagnostics;
+  detail::SourceCheckBudget initialMaterializationBudget(limits);
+  auto materialized = capture([&] {
+    return acir::detail::materializeTransactionLowering(
+        *prepared, initialMaterializationBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(materialized)) << diagnostics;
+
+  builder.setInsertionPoint(local->getTerminator());
+  mlir::OperationState observation(mapped->getLoc(),
+                                   SourceObserveOp::getOperationName());
+  observation.addOperands({ordinal, element});
+  observation.addAttribute("kind", builder.getStringAttr("report"));
+  observation.addAttribute("spec",
+                           builder.getDictionaryAttr({builder.getNamedAttr(
+                               "name", builder.getStringAttr("nested"))}));
+  observation.addAttribute("occurrence", occurrence("Owner", 30));
+  observation.addAttribute("ac.location", bump->getAttr("ac.guard_location"));
+  builder.create(observation);
+  auto before = identities(*file);
+  auto text = print(file->getOperation());
+
+  detail::SourceCheckBudget cloneBudget(limits);
+  EXPECT_TRUE(mlir::failed(capture([&] {
+    return acir::detail::materializeTransactionLowering(*prepared, cloneBudget);
+  })));
+  EXPECT_NE(diagnostics.find("sampled effect lowering"), std::string::npos)
+      << diagnostics;
+  detail::SourceCheckBudget proofBudget(limits);
+  EXPECT_TRUE(mlir::failed(capture([&] {
+    return acir::detail::verifyTransactionMaterialization(
+        *prepared, *materialized, proofBudget);
+  })));
+  EXPECT_NE(diagnostics.find("sampled effect lowering"), std::string::npos)
+      << diagnostics;
+  unchanged(*file, before);
+  EXPECT_EQ(text, print(file->getOperation()));
+}
+
+TEST_F(TransactionLoweringTest,
        IdentityWritesFromDistinctOuterRulesConflictBeforeElimination) {
   auto file = parse();
   ASSERT_TRUE(file);
@@ -1019,6 +1104,144 @@ TEST_F(TransactionLoweringTest,
   auto before = identities(*staged);
   EXPECT_TRUE(mlir::failed(lower(*staged))) << diagnostics;
   unchanged(*staged, before);
+}
+
+TEST_F(TransactionLoweringTest,
+       PlannedBodyEffectsMaterializeAndPassOriginalSourceAuthentication) {
+  for (llvm::StringRef kind : {"expect", "observe"}) {
+    auto file = parse();
+    ASSERT_TRUE(file);
+    auto run = named<SourceTransactionOp>(*file, "run");
+    auto &body = run.getBody().front();
+    auto path = body.getArgument(0);
+    builder.setInsertionPoint(body.getTerminator());
+    mlir::OperationState effect(
+        run.getLoc(), kind == "expect" ? SourceExpectOp::getOperationName()
+                                       : SourceObserveOp::getOperationName());
+    if (kind == "expect") {
+      effect.addOperands({path, path});
+      effect.addAttribute("kind", builder.getStringAttr("assert"));
+      effect.addAttribute("location", run->getAttr("ac.guard_location"));
+    } else {
+      effect.addOperands({path, body.getArgument(1)});
+      effect.addAttribute("kind", builder.getStringAttr("report"));
+      effect.addAttribute("spec",
+                          builder.getDictionaryAttr({builder.getNamedAttr(
+                              "name", builder.getStringAttr("candidate"))}));
+      effect.addAttribute("ac.location", run->getAttr("ac.guard_location"));
+    }
+    effect.addAttribute("occurrence", occurrence("Owner", 30));
+    builder.create(effect);
+    ASSERT_TRUE(mlir::succeeded(capture([&] { return mlir::verify(*file); })))
+        << diagnostics;
+    SourceTransactionStateAnalysis analysis(file->getOperation());
+    ASSERT_TRUE(analysis.isValid()) << diagnostics;
+    auto *plan = analysis.lookup(run);
+    ASSERT_NE(plan, nullptr);
+    EXPECT_EQ(plan->bodyChecks.size(), kind == "expect" ? 1u : 0u);
+    EXPECT_EQ(plan->observations.size(), kind == "observe" ? 1u : 0u);
+    auto before = identities(*file);
+    auto text = print(file->getOperation());
+    HardwareSourceCheckLimits limits;
+    detail::SourceCheckBudget preparationBudget(limits);
+    auto prepared = capture([&] {
+      return acir::detail::prepareTransactionLowering(*file, analysis,
+                                                      preparationBudget);
+    });
+    ASSERT_TRUE(mlir::succeeded(prepared)) << diagnostics;
+    detail::SourceCheckBudget materializationBudget(limits);
+    auto materialized = capture([&] {
+      return acir::detail::materializeTransactionLowering(
+          *prepared, materializationBudget);
+    });
+    ASSERT_TRUE(mlir::succeeded(materialized)) << diagnostics;
+    detail::SourceCheckBudget proofBudget(limits);
+    EXPECT_TRUE(mlir::succeeded(capture([&] {
+      return acir::detail::verifyTransactionMaterialization(
+          *prepared, *materialized, proofBudget);
+    }))) << diagnostics;
+    auto preparedIndex =
+        llvm::find_if(prepared->transactions, [&](const auto &entry) {
+          return entry.plan->transaction == run;
+        });
+    ASSERT_NE(preparedIndex, prepared->transactions.end());
+    auto index = std::distance(prepared->transactions.begin(), preparedIndex);
+    EXPECT_EQ(materialized->transactions[index].bodyChecks.size(),
+              kind == "expect" ? 1u : 0u);
+    EXPECT_EQ(materialized->transactions[index].observations.size(),
+              kind == "observe" ? 1u : 0u);
+    unchanged(*file, before);
+    EXPECT_EQ(text, print(file->getOperation()));
+    EXPECT_TRUE(mlir::succeeded(lower(*file))) << diagnostics;
+    unsigned remainingTransactions = 0;
+    file->walk([&](SourceTransactionOp) { ++remainingTransactions; });
+    EXPECT_EQ(remainingTransactions, 0u);
+  }
+}
+
+TEST_F(TransactionLoweringTest,
+       DirectLoweringSeamsAcceptAuthenticatedBodyEffectPlans) {
+  auto effectFile = parse();
+  ASSERT_TRUE(effectFile);
+  auto effectRun = named<SourceTransactionOp>(*effectFile, "run");
+  auto &effectBody = effectRun.getBody().front();
+  builder.setInsertionPoint(effectBody.getTerminator());
+  mlir::OperationState observe(effectRun.getLoc(),
+                               SourceObserveOp::getOperationName());
+  observe.addOperands({effectBody.getArgument(0), effectBody.getArgument(1)});
+  observe.addAttribute("kind", builder.getStringAttr("report"));
+  observe.addAttribute("spec",
+                       builder.getDictionaryAttr({builder.getNamedAttr(
+                           "name", builder.getStringAttr("candidate"))}));
+  observe.addAttribute("occurrence", occurrence("Owner", 30));
+  observe.addAttribute("ac.location", effectRun->getAttr("ac.guard_location"));
+  builder.create(observe);
+  mlir::OperationState check(effectRun.getLoc(),
+                             SourceExpectOp::getOperationName());
+  check.addOperands({effectBody.getArgument(0), effectBody.getArgument(0)});
+  check.addAttribute("kind", builder.getStringAttr("assert"));
+  check.addAttribute("occurrence", occurrence("Owner", 31));
+  check.addAttribute("location", effectRun->getAttr("ac.guard_location"));
+  builder.create(check);
+  ASSERT_TRUE(mlir::succeeded(capture([&] {
+    return mlir::verify(*effectFile);
+  }))) << diagnostics;
+  SourceTransactionStateAnalysis effectAnalysis(effectFile->getOperation());
+  ASSERT_TRUE(effectAnalysis.isValid()) << diagnostics;
+  auto *effectPlan = effectAnalysis.lookup(effectRun);
+  ASSERT_NE(effectPlan, nullptr);
+  ASSERT_EQ(effectPlan->observations.size(), 1u);
+  ASSERT_EQ(effectPlan->bodyChecks.size(), 1u);
+
+  HardwareSourceCheckLimits effectLimits;
+  detail::SourceCheckBudget effectPrepareBudget(effectLimits);
+  auto authenticPrepared = capture([&] {
+    return acir::detail::prepareTransactionLowering(*effectFile, effectAnalysis,
+                                                    effectPrepareBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(authenticPrepared)) << diagnostics;
+  detail::SourceCheckBudget effectMaterializeBudget(effectLimits);
+  auto authenticMaterialized = capture([&] {
+    return acir::detail::materializeTransactionLowering(
+        *authenticPrepared, effectMaterializeBudget);
+  });
+  ASSERT_TRUE(mlir::succeeded(authenticMaterialized)) << diagnostics;
+  detail::SourceCheckBudget effectProofBudget(effectLimits);
+  EXPECT_TRUE(mlir::succeeded(capture([&] {
+    return acir::detail::verifyTransactionMaterialization(
+        *authenticPrepared, *authenticMaterialized, effectProofBudget);
+  }))) << diagnostics;
+  auto effectEntry =
+      llvm::find_if(authenticPrepared->transactions, [&](const auto &entry) {
+        return entry.plan->transaction == effectRun;
+      });
+  ASSERT_NE(effectEntry, authenticPrepared->transactions.end());
+  auto effectIndex =
+      std::distance(authenticPrepared->transactions.begin(), effectEntry);
+  EXPECT_EQ(authenticMaterialized->transactions[effectIndex].bodyChecks.size(),
+            1u);
+  EXPECT_EQ(
+      authenticMaterialized->transactions[effectIndex].observations.size(), 1u);
 }
 
 TEST_F(TransactionLoweringTest,
@@ -1928,6 +2151,11 @@ TEST_F(
                                                         successfulBudget);
   });
   ASSERT_TRUE(mlir::succeeded(successful)) << diagnostics;
+  llvm::SmallVector<std::tuple<size_t, size_t, size_t>> planSizes;
+  for (const auto &transaction : prepared->transactions)
+    planSizes.emplace_back(transaction.plan->bodyChecks.size(),
+                           transaction.plan->observations.size(),
+                           transaction.plan->events.size());
   // The same admitted preparation must fail atomically when the caller gives
   // materialization an explicitly insufficient independent budget.
   HardwareSourceCheckLimits materializationLimits;
@@ -1942,6 +2170,13 @@ TEST_F(
   EXPECT_NE(diagnostics.find("transaction clone/materialization"),
             std::string::npos)
       << diagnostics;
+  EXPECT_EQ(diagnostics.find("sampled effect lowering"), std::string::npos)
+      << diagnostics;
+  for (auto [index, transaction] : llvm::enumerate(prepared->transactions))
+    EXPECT_EQ(planSizes[index],
+              std::make_tuple(transaction.plan->bodyChecks.size(),
+                              transaction.plan->observations.size(),
+                              transaction.plan->events.size()));
   unchanged(*file, before);
   EXPECT_EQ(print(file->getOperation()), text);
 }
