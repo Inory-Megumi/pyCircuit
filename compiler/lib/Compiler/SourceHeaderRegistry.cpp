@@ -2,6 +2,8 @@
 #include "SourceNamespace.h"
 #include "SourceUnit.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
+#include "pycircuit/Dialect/ACIR/SourceMethodAnalysis.h"
+#include "pycircuit/Dialect/ACIR/SourceHelperAnalysis.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OperationSupport.h"
@@ -11,6 +13,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSet.h"
 
+#include <algorithm>
 #include <functional>
 #include <tuple>
 
@@ -168,6 +171,7 @@ createBuiltin(OpBuilder &builder, StringRef kind,
   state.addAttribute("input_names", builder.getArrayAttr(inputNames));
   state.addAttribute("output_names", builder.getArrayAttr(outputNames));
   state.addAttribute("dependency_summary", builder.getArrayAttr(summary));
+  state.addAttribute("semantic_kind", builder.getStringAttr("hardware"));
   state.addAttribute("primitive_kind", builder.getStringAttr(kind));
   state.addAttribute("ac.declaration_role",
                      builder.getStringAttr("import_snapshot"));
@@ -477,28 +481,56 @@ SourceHeaderRegistry::create(MLIRContext *context, ArrayRef<ModuleOp> headers,
     if (failed(detail::verifyHeaderHelper(helper, registry, emitError)))
       return emitError() << "invalid helper export " << symbol;
 
-  llvm::DenseSet<Attribute> completed;
-  llvm::DenseSet<Attribute> active;
-  std::function<LogicalResult(Attribute)> visit =
-      [&](Attribute symbol) -> LogicalResult {
-    if (completed.contains(symbol))
+  // Record constructors retain their separate static contract, including
+  // rejection of recursive constructor calls.
+  llvm::DenseMap<Operation *, unsigned> constructorMarks, constructorHeights;
+  uint64_t constructorWork = 0;
+  std::function<LogicalResult(func::FuncOp, unsigned)> visitConstructor =
+      [&](func::FuncOp helper, unsigned depth) -> LogicalResult {
+    if (++constructorWork > 1024 * 1024 || depth > 128)
+      return emitError() << "record constructor closure budget exceeded";
+    unsigned mark = constructorMarks.lookup(helper);
+    if (mark == 1)
+      return emitError() << "recursive record constructor call graph";
+    if (mark == 2)
       return success();
-    if (!active.insert(symbol).second) {
-      emitError() << "recursive source helper call graph is not supported";
-      return failure();
-    }
-    auto helper = registry.lookupHelper(cast<FlatSymbolRefAttr>(symbol));
-    for (Operation &operation : helper.getBody().front())
-      if (auto call = dyn_cast<func::CallOp>(operation))
-        if (failed(visit(call.getCalleeAttr())))
+    constructorMarks[helper] = 1;
+    unsigned height = 0;
+    for (Operation &operation : helper.getBody().front()) {
+      if (++constructorWork > 1024 * 1024)
+        return emitError() << "record constructor closure budget exceeded";
+      if (auto call = dyn_cast<func::CallOp>(operation)) {
+        auto target = registry.lookupHelper(call.getCalleeAttr());
+        auto kind = target ? target->getAttrOfType<StringAttr>("ac.helper_kind")
+                           : StringAttr();
+        if (!kind || kind.getValue() != "record_constructor")
+          return emitError() << "record constructor calls a non-constructor";
+        if (failed(visitConstructor(target, depth + 1)))
           return failure();
-    active.erase(symbol);
-    completed.insert(symbol);
+        height = std::max(height, constructorHeights.lookup(target) + 1);
+      }
+    }
+    if (height > 128)
+      return emitError() << "record constructor closure depth exceeded";
+    constructorHeights[helper] = height;
+    constructorMarks[helper] = 2;
     return success();
   };
   for (auto &[symbol, helper] : registry.helpers_)
-    if (failed(visit(symbol)))
+    if (helper->getAttrOfType<StringAttr>("ac.helper_kind").getValue() ==
+            "record_constructor" &&
+        failed(visitConstructor(helper, 0)))
       return failure();
+
+  SmallVector<func::FuncOp> valueHelpers;
+  for (auto &[symbol, helper] : registry.helpers_)
+    if (helper->getAttrOfType<StringAttr>("ac.helper_kind").getValue() == "value")
+      valueHelpers.push_back(helper);
+  if (failed(ac::verifySourceValueHelperClosure(
+          valueHelpers, [&](FlatSymbolRefAttr symbol) {
+            return registry.lookupHelper(symbol);
+          })))
+    return failure();
 
   for (ModuleOp header : registry.headers_) {
     DictionaryAttr owner =
@@ -517,6 +549,19 @@ SourceHeaderRegistry::create(MLIRContext *context, ArrayRef<ModuleOp> headers,
   for (ModuleOp header : registry.headers_)
     if (failed(detail::verifyNamespaceImports(header, registry, emitError)))
       return failure();
+  SmallVector<Operation *> moduleDeclarations;
+  for (const auto &entry : registry.modules_)
+    moduleDeclarations.push_back(entry.second);
+  llvm::sort(moduleDeclarations, [](Operation *left, Operation *right) {
+    return symbolName(left) < symbolName(right);
+  });
+  auto lookupModule = [&](FlatSymbolRefAttr symbol) -> Operation * {
+    return registry.lookupDeclaration(symbol);
+  };
+  ac::SourceMethodSummariesAnalysis methodClosure(moduleDeclarations,
+                                                 lookupModule);
+  if (!methodClosure.isValid())
+    return emitError() << "source Method interface closure is invalid";
   return registry;
 }
 
@@ -578,7 +623,9 @@ SourceHeaderRegistry::lookupModule(FlatSymbolRefAttr canonical) const {
           declaration.getTypeParameters(),
           declaration.getInputNames(),
           declaration.getOutputNames(),
-          declaration.getDependencySummary(),
+          declaration.getSemanticKindAttr(),
+          declaration.getDependencySummaryAttr(),
+          declaration.getTransactionSummaryAttr(),
           declaration.getPrimitiveKindAttr(),
           declaration->getAttrOfType<StringAttr>("ac.return_form"),
           declaration->getAttrOfType<ArrayAttr>("ac.parameters"),
@@ -603,7 +650,9 @@ ModuleInterfaceView SourceHeaderRegistry::lookupBuiltin(StringRef kind) const {
           declaration.getTypeParameters(),
           declaration.getInputNames(),
           declaration.getOutputNames(),
-          declaration.getDependencySummary(),
+          declaration.getSemanticKindAttr(),
+          declaration.getDependencySummaryAttr(),
+          declaration.getTransactionSummaryAttr(),
           declaration.getPrimitiveKindAttr(),
           declaration->getAttrOfType<StringAttr>("ac.return_form"),
           declaration->getAttrOfType<ArrayAttr>("ac.parameters"),

@@ -117,6 +117,11 @@ def ACIR_BitsBinaryOp : ACIR_Op<"bits.binary", [Pure]> {
 
 def ACIR_BitsCompareOp : ACIR_Op<"bits.compare", [Pure]> {
   let summary = "Compare two same-width hardware bit vectors";
+  let description = [{
+    Ordinary comparisons preserve four-state unknown results. case_eq compares
+    the exact 0/1/X/Z symbols and returns a fully known one-bit result, ignoring
+    stored value noise beneath unknown bits. It does not change ordinary eq.
+  }];
   let arguments = (ins ACIR_BitsType:$lhs, ACIR_BitsType:$rhs,
       StrAttr:$predicate);
   let results = (outs ACIR_BitsType:$result);
@@ -160,6 +165,12 @@ def ACIR_ModuleImportOp : ACIR_Op<"module.import", [Symbol]> {
     output_names name those positions. Integer parameters and type_parameters
     are compile-time formals, with the same binding rules as ac.module.
 
+    semantic_kind is mandatory: hardware requires dependency_summary and
+    forbids transaction_summary; transactions requires transaction_summary and
+    forbids dependency_summary and primitive_kind. There is no default kind.
+    Transaction summaries are conservative source contracts, not executable
+    wire dependencies. Hardware analysis must reject transaction imports.
+
     dependency_summary is derived from actual combinational dataflow. Each
     entry is {output = {port, path}, inputs = [{port, path}, ...]}, where port
     is an ordinal within its direction and path is an ordered array of struct
@@ -199,7 +210,9 @@ def ACIR_ModuleImportOp : ACIR_Op<"module.import", [Symbol]> {
   let arguments = (ins StrAttr:$sym_name, DictionaryAttr:$source_owner,
       DictArrayAttr:$parameters, StrArrayAttr:$type_parameters,
       TypeAttrOf<FunctionType>:$function_type, StrArrayAttr:$input_names,
-      StrArrayAttr:$output_names, DictArrayAttr:$dependency_summary,
+      StrArrayAttr:$output_names, StrAttr:$semantic_kind,
+      OptionalAttr<DictArrayAttr>:$dependency_summary,
+      OptionalAttr<DictionaryAttr>:$transaction_summary,
       OptionalAttr<StrAttr>:$primitive_kind);
   let hasVerifier = 1;
 }
@@ -226,6 +239,17 @@ def ACIR_ModuleOp : ACIR_Op<"module", [Symbol, SymbolTable,
     body and nested rules are shared by ac.instance uses of the symbol.
     Instance-local wire values and leaf state belong to each occurrence,
     never to the shared definition.
+
+    In a final package only, optional ac.internal_ports records the original
+    physical prefix and appended compiler-generated wiring ports. Its exact
+    dictionary is {source_inputs: i64, source_outputs: i64, root_inputs: array}.
+    Prefix counts are nonnegative and bounded by the full signature, include
+    original hidden clock/reset ports, and leave at least one appended port.
+    root_inputs has one i64 zero per appended input, whose type must be fixed
+    Bits. The selected System occurrence binds these inputs to known zero and
+    exposes only source prefixes; ordinary instances explicitly bind every
+    physical port. Source units and imports cannot carry this attribute.
+    Absence leaves the entire physical signature as the source boundary.
 
     The body contains combination and fixed child instances. The graph's
     textual order does not define an execution schedule. SSA supplies one
@@ -266,6 +290,92 @@ def ACIR_RuleOp : ACIR_Op<"rule", [IsolatedFromAbove, SingleBlock, Pure]> {
   let hasRegionVerifier = 1;
 }
 
+// Typed source effects remain explicit until transaction lowering. These
+// operations are not executable final hardware and are never marked Pure.
+def ACIR_SourceStateOp : ACIR_Op<"state", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Declare one source-owned state and its old-Q value";
+  let arguments = (ins ACIR_BitsType:$clk, ACIR_BitsType:$rst,
+      ACIR_HardwareType:$initial, StrAttr:$instance_name,
+      DictionaryAttr:$occurrence);
+  let results = (outs ACIR_HardwareType:$q);
+  let hasVerifier = 1;
+}
+
+def ACIR_SourceStateReadOp : ACIR_Op<"state.read", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Read a selected transaction-local owner candidate";
+  let arguments = (ins ACIR_BitsType:$path, Variadic<ACIR_BitsType>:$indices,
+      StrAttr:$state, ArrayAttr:$selectors,
+      DictionaryAttr:$occurrence);
+  let results = (outs ACIR_HardwareType:$value);
+  let hasVerifier = 1;
+}
+
+def ACIR_SourceStateWriteOp : ACIR_Op<"state.write", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Propose a selected transaction-local owner update";
+  let arguments = (ins ACIR_BitsType:$path, ACIR_HardwareType:$value,
+      Variadic<ACIR_BitsType>:$indices, StrAttr:$state,
+      ArrayAttr:$selectors, DictionaryAttr:$occurrence);
+  let hasVerifier = 1;
+}
+
+def ACIR_SourceMethodOp : ACIR_Op<"method", [Symbol, IsolatedFromAbove,
+    SingleBlock, RecursiveMemoryEffects]> {
+  let summary = "Define an instance operation with entry guard and ordered body";
+  let description = [{
+    Both regions take the explicit function inputs followed by captures.
+    The guard yields one four-state predicate. The body yields the ordinary
+    function results. State access remains explicit and belongs to the calling
+    transaction; this definition does not introduce a commit boundary.
+    Required ac.parameters, ac.result_constraints and ac.return_form metadata
+    preserve source-call type authority independently of physical payload types.
+    Captures are not explicit source parameters.
+    Mandatory ac.guard_location is a provider-owned SourceSpan: the entire
+    explicit guard Lambda, or the entire callable declaration for a bare guard.
+    It is not reconstructed from the MLIR location or a caller's span.
+  }];
+  let arguments = (ins Variadic<ACIR_HardwareType>:$captures,
+      StrAttr:$sym_name, TypeAttrOf<FunctionType>:$function_type,
+      StrArrayAttr:$argument_names, DictionaryAttr:$occurrence);
+  let regions = (region AnyRegion:$guard, AnyRegion:$body);
+  let hasVerifier = 1;
+  let hasRegionVerifier = 1;
+}
+
+def ACIR_SourceMethodCallOp : ACIR_Op<"method.call", [
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Invoke a Method on a statically identified instance path";
+  let arguments = (ins ACIR_BitsType:$path,
+      Variadic<ACIR_HardwareType>:$arguments, SymbolRefAttr:$callee,
+      StrArrayAttr:$instance_path, DictionaryAttr:$occurrence);
+  let results = (outs Variadic<ACIR_HardwareType>:$results);
+  let hasVerifier = 1;
+}
+
+def ACIR_SourceTransactionOp : ACIR_Op<"transaction", [
+    IsolatedFromAbove, SingleBlock,
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Register a source Rule with explicit guard and ordered effects";
+  let description = [{
+    Both regions take captures. The guard yields one four-state predicate and
+    the body yields ordinary results. declaration identifies the source Rule;
+    occurrence identifies its unique registration in the owning module.
+    Admission and state SSA must be resolved before lowering to pure ac.rule.
+    Mandatory ac.guard_location has the same SourceSpan contract as ac.method;
+    it refers to the declaration's guard, never the registration call site.
+  }];
+  let arguments = (ins ACIR_BitsType:$clk, ACIR_BitsType:$rst,
+      Variadic<ACIR_HardwareType>:$captures, StrAttr:$name,
+      DictionaryAttr:$declaration, DictionaryAttr:$occurrence);
+  let results = (outs Variadic<ACIR_HardwareType>:$results);
+  let regions = (region AnyRegion:$guard, AnyRegion:$body);
+  let hasVerifier = 1;
+  let hasRegionVerifier = 1;
+}
+
 def ACIR_SourceObserveOp : ACIR_Op<"observe", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Record one source observation without runtime side effects";
@@ -277,8 +387,15 @@ def ACIR_SourceObserveOp : ACIR_Op<"observe", [
 def ACIR_SourceExpectOp : ACIR_Op<"expect", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary =
-      "Record one source assertion check without runtime side effects";
-  let arguments = (ins ACIR_BitsType:$condition, ACIR_BitsType:$path, StrAttr:$kind,
+      "Record one source check and its optional physical sampling pins";
+  let description = [{
+    assert and range have no sampling operands. guard_known requires exactly
+    two one-bit sampling operands, clock then reset, associated with the owning
+    sampled Rule. Condition is the raw guard, path is its reached prefix.
+    Checks retain effects until whole-system validation; they are not pure data.
+  }];
+  let arguments = (ins ACIR_BitsType:$condition, ACIR_BitsType:$path,
+      Variadic<ACIR_BitsType>:$sampling, StrAttr:$kind,
       DictionaryAttr:$location);
   let hasVerifier = 1;
 }

@@ -1,0 +1,348 @@
+# MLIR 分析与变换合同
+
+本文件定义[串行 Rule/Method 扩展](README.md)的目标编译责任。
+下列阶段是规范性职责，不代表同名 pass 已经存在，也不要求每项单独成为可执行工具。
+
+## 当前边界与需要改变的地方
+
+`compiler/lib/Compiler/SourceUnit.cpp` 当前组织写分析、绑定推导、source lowering、
+record wire 简化及克隆后的接口提取。`SourceRuleWritesAnalysis` 保留包括原值回写在内
+的源码写意图；`SourceMemoryBindingsAnalysis` 当前还持有准备好的 importer context。
+`PythonImportRuleCall.inc` 和 `PythonImportComposition.inc` 构造并合并候选值/使能。
+
+最终 `ac.rule` 是 Pure 的组合计算，显式 captures/results 本身不携带完整的
+Method 效果、资源请求、guard 或事务身份。扩展必须在这些信息消失以前建立可验证边界。
+不得对最终纯 SSA 猜测已经丢失的源码写意图；不得仅把私有 importer 函数包装为多个
+pass，却仍让每个 pass 独立解释 Python AST 或依赖不可检查的隐含状态。
+
+## 必须保留的语义信息
+
+从绑定完成到事务降低之间，操作或其正式可验证属性必须表达以下信息。
+下节固定首个实现增量的 ODS 名称，落到现有 ACIR 中；不得另建语义编译器或另一个前端。
+
+| 信息 | 必须能够验证的内容 |
+| --- | --- |
+| 定义与 occurrence | Module 定义、实例路径、Rule 注册和 Method 调用位置分别有稳定身份 |
+| owner 引用 | 资源的实际实例、声明、字段/索引路径；别名不复制状态 |
+| 调用 | callee、typed 实参/结果、调用者 Rule、源位置和静态调用次序 |
+| 状态访问 | 读/写、旧 Q 或事务候选版本、准确写域、原值回写意图 |
+| 路径 | 执行条件、值有效条件、guard、错误检查路径分别保留 |
+| 效果 | owner 更新、资源消费/生产、检查、观测和资源端口需求 |
+| 资源契约 | 容量、延迟、可见性、reset、端口及已支持的策略 |
+| 事务 | 唯一外层 Rule、请求集合、获准条件以及每项效果的归属 |
+| 来源 | source owner、声明/调用/写入位置和发布接口身份 |
+
+有状态效果或隐含资源要求的操作不得标为 Pure。普通 MLIR memory effects 接口
+可以参与基础分类，但其通用读写集合不能替代本表中的 guard、事务和资源语义。
+操作 verifier 检查局部结构；闭包 verifier 检查真实 owner、跨调用关系和完整效果集合。
+
+<a id="typed-effects"></a>
+
+## 类型化效果操作
+
+首个原生 IR 增量使用以下六个操作，不增加新的引用、token 或 payload 类型。
+这组操作的原生验证本身不授予 source-unit 发布或 emit 权限；源码 producer、摘要和最终
+lowering 分别验收。已接入的 source-unit 路径依照发布合同保留 typed effects，完整 link
+必须在支持的范围内降低它们；verified final 边界拒绝残留事务操作。不能把源 body 中
+保留 typed effects 与最终硬件中残留未降低效果混为一谈。
+
+| 操作 | 输入 → 输出 | 身份和区域 |
+| --- | --- | --- |
+| `ac.state` | clock、reset、initial → old Q | 非 Symbol 分配操作，`instance_name` 和 declaration occurrence；复用现有分配命名空间 |
+| `ac.state.read` | path、索引值 → payload | `state` 字符串定位实际本模块 state inventory；字段/索引 selectors |
+| `ac.state.write` | path、payload、索引值 → 无 | 同样的 owner 定位和 selectors；保留原值回写 |
+| `ac.method` | 普通 captures → 无 | 真正的 Symbol；function type、参数名、guard/body 两区 |
+| `ac.method.call` | path、显式实参 → 普通结果 | qualified Method symbol 与已验证的静态 `instance_path` |
+| `ac.transaction` | clock、reset、captures → 普通结果 | 非 Symbol，`name`、Rule declaration occurrence 和注册 occurrence；guard/body 两区 |
+
+MLIR Symbol 不能携带 SSA 结果，因而 state/transaction 复用既有 Queue/Rule 的命名方式，
+不得接纳旧的 `sym_name` 别名。Method 定义本身没有 SSA 结果，其 body yield 提供调用结果。
+Method 两区的 block 参数为显式形参之后接 captures；transaction 两区的 block 参数为
+captures。guard yield 一个一位四态条件，body yield 对应普通结果。
+
+Method 的逻辑类型权威必须复用现有 source-call metadata：`ac.parameters`、
+`ac.result_constraints` 和 `ac.return_form` 三项必填，即使参数或返回为空。
+`ac.parameters` 按 `argument_names` 排列，沿用 `name/binding/constraint/default/origin/location`
+六字段行；首批只接纳 `positional_or_keyword` 且无默认值。`constraint` 复用已有
+hardware/source_kind/type/domain 编码，不以物理 Bits 位宽推断 Boolean、Integer 或
+fixed bits。零返回的 return form 为 `none`，单返回为 `single`；多返回不属于首批。
+参数 occurrence 的 definition 仍为所属 module 的 FlatSymbolRef，location 路径必须
+匹配其 SourceOwner；Method occurrence 与所属 module 共同确定声明身份。captures 不计入
+显式参数契约，也不另建 guard 签名。原生验证与 module 接口共享类型／域校验，module
+专属的 nominal Struct 返回限制保留在 module 验证入口。缺失契约必须拒绝，不提供旧 IR
+默认值。此要求是独立发布的前置条件，不表示发布、调用效果摘要或执行已经完成。
+
+动态采样的精确 final schema、共同 proof API、物理 wiring/history 与验收见
+[事务采样准入](sampled-admission.md)；以下位置与比较合同是其前置，不构成动态执行声明。
+
+每个 `ac.method` 和 `ac.transaction` 还必须携带 `ac.guard_location`，使用既有闭合
+SourceSpan。显式 guard 保存整个 Lambda 的捕获位置；裸 guard 保存整个 FunctionDef
+声明的位置。path 必须等于声明模块 SourceOwner 的 path，不能从 MLIR Location 或调用
+点拼出默认值。发布摘要的 `guard_location`、统一 Method view 和 GuardBoundary.location
+保留同一属性；源 body 重验拒绝被更改的摘要位置。降低到纯 Rule 时移除这个源专属属性。
+该 hard break 的位置权威是采样准入的前置条件，不表示动态 guard 已可执行。
+
+共同 IR 的 `ac.bits.compare` 接纳 `case_eq`：比较准确的 0/1/X/Z 符号，结果始终是已知
+一位，忽略未知位下面不可观察的 value 噪声。C++ 复用现有 `compare<CASE_EQ>` 和
+`FourState::parityEquivalent`，RTL 使用 `===`。普通 `eq` 的四态语义不变，包括 X/Z
+输入的 `eq(x,x)` 仍是未知。这是共同 IR 运算，不新增 Python intrinsic。
+
+path、clock、reset 都用现有 width-one Bits，不用 builtin i1 丢掉四态信息。
+`selectors` 为 `{field = "field_name"}` 或 `{index = N : i64}` 的序列；后者按顺序引用
+索引 operands，不能将动态索引塞入静态 owner identity。所有投影须验证实际名义类型。
+定位名字不是身份：最终 owner key 来自验证后的实例 occurrence 链和 state declaration
+occurrence，必须核对所属模块和重复身份。
+
+state old-Q 输出可以被显式捕获为普通快照；候选 owner 访问必须保留 `state.read/write`。
+首个 initializer verifier 只接纳已验证的闭合字面量/构造/投影 DAG，不执行另一个 SSA
+算术解释器。更广 source initializer 接入必须复用现有静态语义，不能忽略不支持的节点。
+
+未完成证明的 read 仍有检查义务，除状态 Read 外保留 check Write effect，防止 MLIR
+将未使用读取提前当作 trivially dead。call/transaction 保守携带状态及检查 effects。
+原生正反例位于 `tests/compiler/IR/TransactionEffectsTest.cpp` 和现有 IR lit 入口；
+它们不证明 Python Method、动态执行或跨源 Method 已完成。
+
+## 阶段职责和不变量
+
+### 绑定、类型与所有权
+
+输入是单个源文件的 capture 与完整已发布依赖接口。扩展既有绑定和类型分析，输出
+类型化的源语义表示。必须固定实例身份、Method 声明、owner 路径、标量 kind、名义类型、
+静态形状及隐藏域。读取引用和按值复制不可混淆。
+
+无法解析的 owner、动态实例创建、签名不一致、被遮蔽的内建名字和不支持的跨域调用必须
+在此阶段或其闭包核对中拒绝。Python capture 只保存语法与位置，不执行设计函数。
+实例生成仅复用现有已准入规则；新 Method 不扩大一般静态参数支持。
+
+### 跨过程效果摘要
+
+公共 Dialect 层的 `SourceMethodSummariesAnalysis`
+（`SourceMethodAnalysis.h/.cpp`），由 Transforms 层的 `AnalyzeSourceMethods.cpp`
+接入 `ac-analyze-source-method-summaries`。它对真实定义和已验证接口 row 共用调用图、
+实例闭包、递归及有值事务的保守 totality。`SourceMethodResolution.cpp` 提供唯一的
+Method／receiver 解析，`SourceTransactionSummary.cpp` 派生有序直接摘要；资源、端口及
+最终执行调度仍需后续分析。源 compiler 和 interface extraction 必须复用这些 IR-only owners，不能反向形成
+Transforms → SourceCompiler 的库依赖或复制证明算法。
+
+当前恒真事实只来自已验证的一位常量和普通 capture/formal 传递；状态初始化不是证明。
+通用 Method 摘要对显式形参取 Unknown；调用实例的常量事实单独证明，不污染通用缓存。
+未调用的 guarded Method 不影响一个 total Rule；所有声明中的递归仍拒绝，包括死路径。
+
+按调用图推导并实例化条件性读写、返回依赖、required guard、资源请求、顺序、端口和
+时钟域摘要。声明摘要可先建立，涉及具体 SSA 的写域及条件事实在状态版本明确后精化。
+递归调用拒绝；调用深度、摘要大小、访问数量和证明工作量必须有预算与明确诊断。
+
+摘要中的 owner 路径是相对于定义或明确引用的路径；调用点绑定后必须指向真实 occurrence。
+两次构造是两个 owner；两个别名指向同一次构造仍是一个 owner。不得为了内联 Method
+复制实例或持久状态。对同一事实使用统一分析，不能在 source、link 和 backend 各推导一套。
+
+### 事务局部状态 SSA
+
+每个基础 Rule 从其 owner 的旧 Q 开始。按实际语句顺序生成局部版本，Method 调用接收
+并返回相应候选版本，分支通过既有四态选择语义合并。保存过的局部值保持快照。
+字段、索引更新必须保留完整宽度的索引事实和未触及的写域。
+
+同 owner 多次调用共享事务局部候选；不同 Rule 不继承候选。写入同值仍保留源码写意图，
+不能在冲突证明前被优化掉。Memory/Queue 访问依据其原语合同生成请求，不能用普通变量
+SSA 隐式改变同步读、旧队头或端口策略。
+
+输出应能独立检查：所有读都有唯一版本来源；分支 join 类型一致；每个更新都有 owner、
+路径及外层 Rule；不存在未绑定的候选状态。
+
+先导的原生分析出口使用 `SourceTransactionStateAnalysis`，由薄 pass
+`ac-analyze-transaction-state-ssa` 查询。它保持输入 IR 不变，给后续变换提供引用真实
+MLIR Value/Operation 的 typed plan；它本身不等于完成上述 SSA materialization。
+计划至少包含实例、调用帧、普通值绑定、owner、Q0/写版本、读写关联、guard 边界和
+统一的有序事件。相同 Method 的不同调用帧保有独立的值绑定和入口快照，沿同一外层
+事务共享 owner 候选版本；不同 Rule 分别从 old-Q 开始。纯表达式仍由原有 ACIR 表达，
+不增加值解释器或另一套执行模型。
+
+第一分析出口只接纳有真实 body 的直线调用和 whole-owner 访问。effect path 必须经
+既有 literal fact owner 证明为 true；false/unknown guard 则保留有序准入义务。
+selectors、条件效果、分支和跨域证明缺口在该分析入口拒绝，不改变现有逐源发布的
+准入范围。consumer compile 仍只使用接口，不能为了运行此分析读取 provider Python。
+
+owner 身份必须包含词法实例 anchor、实际 instance occurrence 链和 state declaration。
+普通 old-Q capture 保持原始快照；仅 `state.read` 查询当前候选。guard 固定调用入口的
+版本，Method 返回不提交状态。时钟和复位分别沿实际形参、capture 和 instance 输入
+绑定追溯，二者都必须得到相同 anchor 下相同的 SSA wire；不同常量或表达式不按值猜测
+等价。无状态/只读 Method 也从 receiver 的合法 domain metadata 检查域，不能省略。
+
+分析先有界预检、复用 native verifier 和 Method summaries，再完整构建计划；任何事务
+失败时不得暴露其他事务的部分计划。分配、调用展开、绑定边、版本、快照和事件均计费，
+IR 修改后分析必须失效。原生计划测试只证明版本来源和顺序，不证明数值、采样、X/Z
+准入或 C++/Verilog 执行；完整硬件出口仍须完成后续 materialization 与验收。
+
+### 值有效性与事务准入
+
+至少区分三类事实：组合值的求值有效条件、Rule 能否发射、普通返回数据中的状态值。
+只有 required guard 加入外层获准条件。名为 `accepted`、`valid` 或 `retry` 的字段均无
+隐含语言含义；不能按字段名字推导 guard。
+
+对在已知有效路径 `p` 上调用且要求条件 `g` 的 Method，其逻辑义务是 `p` 成立时 `g`
+必须成立。该关系不是把未知值强行转成二态的许可。完整四态和错误行为服从源语义合同。
+guarded value 的条件分支必须分别携带“值有效且为真”“值有效且为假”；无效不进入 else。
+
+普通状态返回仍是数据。PFL 风格 retry 的游标更新不得消失。可选操作、合法前缀选择和
+真正必需操作的区别来自作者代码/Method 合同，不来自编译器对算法的猜测。
+
+### 资源请求、冲突与因果分析
+
+先构造条件性请求及依赖，再计算可实现的获准关系，最后物化有效传输。
+Queue 的事务内容量抵扣见[资源合同](extensions.md#queue-request-admission)。不能直接产生
+`fire → pop → ready → fire`，也不能通过 runtime 固定点寻找一个结果。
+
+复用既有 owner/字段写集合、SSA grant 和地址分离证明，检查跨事务写域；同事务可合法
+合并的候选写最终形成对应 D/E。检查实际 primitive 的读写端口和操作组合，不能把
+“串行源码”理解为无限端口或自动多周期复用。
+
+数据、guard、容量、候选可见性和显式顺序关系必须进入统一的因果检查。旧 Q 是真正的
+时间边界，事务内候选和同拍前递不是。未使用结果也不能隐藏非法环或错误资源连接。
+源码相邻但无依赖的纯计算不得被无条件串接。
+
+请求、路径有效性、冲突和因果分析可以共享 provisional 表示，但必须在有界分析内完成；
+失败或预算耗尽必须诊断，不能降格为“默认可执行”。不得添加隐式仲裁或任意 winner。
+
+### 事务降低 {#transaction-lowering}
+
+输入必须已经完成 owner、guard、冲突、资源和因果义务。统一 Rule 获准条件门控其实际
+路径上的全部效果，输出现有组合操作、Table 操作、`ac.value.merge`、Queue 输入及
+存储 D/E。随后才允许移除高层事务/Method 操作并形成纯 `ac.rule`。
+
+必须保留合法未知数据、未知有效控制的错误、reset 优先级、held/falling-clock 行为及
+所有需要的观测/检查。事务不发射不等于系统失败；硬错误仍在任何 Xfer 前取消全系统
+的数据及候选时钟历史。现有 Runtime 和 managed RTL lifecycle 继续拥有提交边界。
+
+每个高层效果必须有唯一 lowering 归宿，或有经过证明的无效果解释。
+“backend 不支持所以忽略”与“结果无人使用所以删除效果”均不合法。
+
+以下首个增量的恒真 guard、E=true 条款是历史限制，用于解释演进和保留回归。
+后续实现须采用[统一采样合同](sampled-admission.md)：所有事务（含恒真/恒假、只读和无状态）
+均物化采样、guard 和完整 wiring；不得从历史增量恢复 true-only 快路。普通外层返回值的
+totality 限制继续有效。这里的演进顺序不构成后续增量已验收的声明。
+
+首个可执行切片在同一个 `ac-lower-transactions` 中物化直线、同 owner、whole-owner
+fixed Bits 状态；实际 Rule/Method guard 和 effect path 都必须证明为 true，每个 owner
+最多有一个外层事务 writer。重复或身份写仍参与冲突检查。不同事务分别从 Q0 开始，
+同一调用链复用候选版本。未调用 Method 先通过声明、摘要和递归验证，再在完整 link
+闭包中删除；不能通过提前删除规避检查。这个切片不关闭跨实例接线、动态 guard、部分
+更新、资源或完整 Method `@system` 验收，也不建立另一条临时 lowering 路线。
+
+输入采用现有 link 合并状态：有 `ac.source_units` 与唯一 `ac.system`，无 `ac.stage`
+和单源 envelope 属性。普通 provider imports 已解消。公共 link 通过仍存活的
+`SourceHeaderRegistry` 重验 primitive imports 的 canonical 权威；原生 pass 只验证
+DFFE 的既有 IR schema 和时间依赖，不把 schema-valid 声明当作源发布权威。
+
+先复用事务状态分析，再在 detached clone 中生成真正的 `ac.rule` 和既有 DFFE。
+每个状态声明恰好一个 storage leaf；唯一 writer 的最终候选接 D，E 为已知 true，
+未写 owner 则 D=Q、E=false。clk/reset/init、instance occurrence 和源 owner 保留。
+完成 native、无残留事务及 hardware verification 后才一次提交 clone，并使旧分析失效。
+失败保持原包对象身份、属性、值及 regions。没有 source transaction operations 的普通
+硬件通过同一 pass 的既有 hardware verification 路径进入 final，不引入事务分析的预算
+或额外 clone 限制；分类复用既有残留事务检查的六类 operation owner。
+
+新 Rule 保持 `IsolatedFromAbove`。live-ins 包含原 captures、实际 Method 词法 captures、
+隐式 owner Q 及实际纯 region 使用的模块级值；按真实 Value 身份去重，以 module block
+argument ordinal、顶层 op/result ordinal 排序，并保留精确类型。每个 invocation 有独立
+局部 IRMapping，guard/body 形参分别绑定；嵌套纯 region 参数不逃逸。模块分配和初始化
+留在模块内，候选通过内部 Rule results 返回。先建立所有 replacement，再统一替换旧
+transaction 的普通结果，不能依赖逐个删除的顺序。
+
+阶段产物由真实 SourceLink pass instrumentation 捕获：preanalysis 成功后、lowering
+之前的完整 typed 包，以及同一次 pass 成功提交后的 final 包。`SourceLinkStages` 仅在
+完整 link 成功后更新；失败保留调用者原值。原生 linker 的成对
+`--transaction-input-out`／`--transaction-output-out` 仅接受 final link 和 fresh 普通
+文件；所有输入、final、owner report 和两个诊断路径不得互相覆盖，失败回滚本次新文件。
+这不扩展 Python 公共 CLI。公共验收用相同 linker/top、按 SourceOwner 排序的相同
+body/header 字节重放同一 link，要求 replay final 与公共 final 完全一致，after-stage
+与 replay final 完全一致；不能删位置、owner 或语义属性后再比较。双目标仍消费原公共
+final。阶段文件不是另一套 source authority 或编译路线。
+
+跨实例增量继续使用这一 pass，按[专项接线合同](cross-instance-lowering.md)将实际
+owner Q/词法值向上传递、D/E 向下传递；原定义及存储保留。此增量移除上文首个切片的
+same-owner 限制，其余恒真 guard、whole Bits、同域及唯一 writer 边界保持。
+共享 `ModulePortLayout` 验证 final-only `ac.internal_ports`，source publication 不接受
+此属性。C++ selected scalar wrapper 与 RTL root wrapper 执行已验证的内部零绑定，
+普通 child 接完整物理口。涉及 Collection 的明确拒绝边界以专项规格为准。
+
+### 效果安全优化
+
+优化前必须检查原表示的语义合法性，避免 DCE 隐藏冲突、死环、检查或未实现操作。
+扩展已有 record wire 简化及纯表达式优化，优先删除冗余传输、复用公共计算并保留紧凑
+Struct/Table 表示。不得将每个数组元素、每次 Method 调用都提前完整展开。
+
+| 优化 | 准入条件 | 不允许的变化 |
+| --- | --- | --- |
+| CSE/共享纯计算 | 相同类型、值及有效性上下文，且无隐含效果 | 合并资源调用、复制/合并持久 owner |
+| 字段投影/稀疏更新 | 名义布局、类型和未写字段保留 | 用整记录覆盖其他 writer 的字段 |
+| 常量/位宽传播 | kind、范围、溢出及四态合同已证明 | 将区间当常量、丢弃 X/Z 或静默截断 |
+| 写合并 | 写意图、检查及资源义务已验证，候选顺序等价 | 去掉仍影响未知使能失败的操作 |
+| mux/归约重组 | 精确四态运算下的等价性证明 | 仅凭二态代数或循环形状重排 |
+| 资源共享 | 允许的操作组合及既定成本目标 | 增加周期、改仲裁、超端口 |
+
+任何 mutating pass 都必须失效受影响的分析，重新验证变换后的事实。预算、错误诊断和
+接口权威不能依赖已经失效的缓存。优化不会自动授予 retiming、pipeline 插入或 CDC 支持。
+
+### 最终验证与双后端
+
+最终包必须闭合，不能残留未降低的 Method、事务、资源占位符或未经核对的 import。
+共同验证确认类型、源 owner、组合/采样环、primitive 合同及检查计划后，两个 emitter
+消费同一保存的 final artifact。backend 不重新推导 guard、优先级、事务或前递语义。
+
+## compile、link 与接口发布
+
+局部事实在 compile 验证。依赖完整实例闭包的事务绑定、资源冲突和因果义务必须显式保留
+到 link。源单元 body 可保留本扩展的类型化语义操作；这仍是同一逐源编译路线。
+
+发布接口必须包含 Method 签名、可绑定 owner 路径、条件效果、返回有效性、域及顺序/端口
+要求。只发布一个“有副作用”位或值端口列表不够。link 必须用 provider body 重新核对
+摘要及其绑定；摘要不能作为未验证的用户声明直接获得权威。
+
+精确字段、value/capture 作用域、直接实例组合及原生 API 见[事务接口摘要合同](publication-summary.md)。
+原生派生与 body 重验是独立发布的前置出口，不提前开放 source-unit 或 final hardware admission。
+
+消费方 compile 不得读取 provider Python 或 implementation body 代替接口；link 使用
+显式提供的 body/interface closure。变换改变摘要事实时，必须在发布前重新提取/验证，
+不能沿用旧哈希、旧依赖或旧 source owner。
+
+本扩展改变 source-unit body/interface 的可表达内容，第一任务必须同时更新其 schema、
+结构验证和注册表验证；遇到未知或不兼容内容必须拒绝。不得添加 legacy fallback。
+仍保留原 Python basename、source owner、独立 unit 以及生成文件归属，不能整设计展开
+后再切分文件伪装逐源编译。
+
+## 检查点与保留产物
+
+| 检查点 | 必须可检查的证据 |
+| --- | --- |
+| Capture | 原始 source snapshot、capture 与源位置 |
+| 类型化效果 | 实例/owner、调用、状态访问、guard 和 Rule 归属 |
+| 状态 SSA | 前后版本、分支合并、Method 组合和写域 |
+| 准入/资源 | 请求、获准条件、冲突和因果证明结果 |
+| 公共硬件 | 完成 lowering 的 IR、效果覆盖验证与优化前后结果 |
+| Link/emit | unit interfaces、完整 closure、final IR 和同源 C++/Verilog |
+
+现有 `--source-import-out` 捕获的是 source lowering 后的硬件 IR，不是新的类型化效果层。
+新增阶段检查应扩展现有 pass instrumentation、测试和 manifest owner；不能把旧输出改名
+冒充新证据，也不能引入另一个产品编译入口。精确检查输出形式由第一任务确定，默认 public
+CLI 不增加参数。验收必须把所有产物绑定到相同候选源码、工具和命令。
+
+## 效率与可扩展性
+
+分析工作应复用调用摘要和 MLIR 缓存；展开和证明均有预算。缓存 key 必须覆盖 definition、
+实际 bindings、状态版本及该证明使用的 stop policy，不能以同名、同宽或同类型代替身份。
+定义级准备可以复用，实例级 effects、物理路由和 history 仍按实际 occurrence 验证。
+复用准备数据不等于复用成功结论；变换后不得访问借用旧 IR 的计划。重叠的完整闭包验证
+应在既有 canonical owner 中收敛，同时保留 source-plan 认证和独立 final 验证两层责任。
+
+必须先对分配、展开和证明工作计费。合法但超预算的输入明确拒绝，不能通过抬高限额、
+减少候选/实例、跳过 private-use 或在测试中修复 IR 来满足既定容量用例。扩展容量先记录
+耗费阶段及结构规模，在既有 owner 消除重复准备/遍历，再证明完整正反例保持。
+容量与失效验收见 `METHOD-ANALYSIS-BOUNDS`，不额外增加作者配置或产品 profiler。
+
+基准必须分别记录编译时间、
+峰值内存、IR 大小、存储位/端口、组合深度及模拟吞吐。可用时报告同约束下的综合面积/时序。
+单独的 IR 数量、Python 行数或一个 native 运行结果不证明硬件更高效。
+
+基础验收要求不增加隐式周期/状态，不复制 Method owner，且指定等价夹具中的冗余纯
+计算/记录传输被消除。跨设计速度或面积改善必须有单独测量；没有测量就不宣称改善。
+验收具体场景及交接文件见[验收标准](acceptance.md)和[实现分解](implementation-plan.md)。

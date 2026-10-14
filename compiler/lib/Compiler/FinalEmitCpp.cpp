@@ -120,10 +120,14 @@ FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
     return fail() << "system root requires verified clock/reset domains";
   uint64_t clockOrdinal = clock.getValue().getZExtValue();
   uint64_t resetOrdinal = reset.getValue().getZExtValue();
-  auto inputs = root.getInputNames();
+  auto layout = ac::getModulePortLayout(root);
+  if (failed(layout))
+    return failure();
+  auto inputs =
+      root.getInputNames().getValue().take_front(layout->sourceInputCount);
   if (clockOrdinal == resetOrdinal || inputs.size() != 2 ||
       clockOrdinal >= inputs.size() || resetOrdinal >= inputs.size() ||
-      !root.getOutputNames().empty())
+      layout->sourceOutputCount != 0)
     return fail() << "system root must be closed except for clock/reset";
   auto legal = [&](uint64_t ordinal) {
     return legalizeIdentifier(cast<StringAttr>(inputs[ordinal]).getValue(),
@@ -269,6 +273,9 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
   auto root = rootModule(context);
   if (failed(root))
     return failure();
+  auto rootLayout = ac::getModulePortLayout(*root);
+  if (failed(rootLayout))
+    return failure();
   FinalCppSourceParts parts;
   parts.sourceCheckCount = context.sourceChecks().checks.size();
   auto rootType = context.rootCppType();
@@ -295,6 +302,7 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
   bool observes = !descriptorTable->empty();
   parts.supportHeader =
       "#pragma once\n#include <gfsim/wire.h>\n#include <gfsim/dff.h>\n"
+      "#include <gfsim/sampled_clock.h>\n"
       "#include <gfsim/sync_mem.h>\n#include <gfsim/byte_mem.h>\n#include "
       "<gfsim/fifo.h>\n"
       "#include <gfsim/SimModule.h>\n#include <gfsim/SimSystem.h>\n"
@@ -409,7 +417,7 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
     out << "#include <gfsim/SimSystem.h>\n#include <stdexcept>\n"
            "class pyc_dut final {\npublic:\n";
     SmallVector<std::string> inputs, outputs;
-    auto ports = [&](StringRef typeName, ArrayAttr names,
+    auto ports = [&](StringRef typeName, ArrayRef<Attribute> names,
                      SmallVectorImpl<std::string> &ports) -> LogicalResult {
       out << "  struct " << typeName << " {\n";
       for (Attribute raw : names) {
@@ -424,8 +432,14 @@ emitPreparedCppSourceParts(HardwareEmitContext &context) {
       out << "  };\n";
       return success();
     };
-    if (failed(ports("Inputs", root->getInputNames(), inputs)) ||
-        failed(ports("Outputs", root->getOutputNames(), outputs)))
+    if (failed(ports("Inputs",
+                     root->getInputNames().getValue().take_front(
+                         rootLayout->sourceInputCount),
+                     inputs)) ||
+        failed(ports("Outputs",
+                     root->getOutputNames().getValue().take_front(
+                         rootLayout->sourceOutputCount),
+                     outputs)))
       return failure();
     out << "  explicit pyc_dut(std::size_t workers = 1) : executor_(workers), ";
     if (observes)

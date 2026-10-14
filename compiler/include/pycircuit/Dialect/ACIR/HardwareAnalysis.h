@@ -14,6 +14,19 @@ namespace acir::ac {
 /// Nominal struct/enum and type-parameter owner identities remain significant.
 bool areEquivalentHardwareTypes(mlir::Type lhs, mlir::Type rhs);
 
+/// Source physical prefix and final-only compiler-generated port suffix.
+/// Counts include original hidden domain ports. Ordinary instances always bind
+/// the full signature; defaults apply only to the selected System occurrence.
+struct ModulePortLayout {
+  unsigned sourceInputCount;
+  unsigned sourceOutputCount;
+  mlir::ArrayAttr rootInputDefaults;
+};
+/// Validate the closed ac.internal_ports contract. Without it, every physical
+/// port belongs to the source boundary and rootInputDefaults is an empty array.
+mlir::FailureOr<ModulePortLayout>
+getModulePortLayout(mlir::Operation *declaration);
+
 struct EnumMember {
   mlir::StringAttr name;
   MathIntAttr code;
@@ -57,6 +70,15 @@ struct HardwareBindings {
   llvm::StringMap<mlir::Type> types;
 };
 
+struct HardwareCheckSamplingBinding {
+  ModuleOp definition;
+  mlir::Value clock, reset;
+  uint64_t localOrdinal = 0;
+};
+struct HardwareCheckSamplingOccurrence {
+  uint64_t bindingIndex = 0, ownerOccurrence = 0, ordinal = 0;
+};
+
 /// Definition-local obligations and their actual linked owner occurrences.
 /// These views retain original IR; they must be revalidated after mutations.
 struct HardwareCheckBinding {
@@ -69,6 +91,7 @@ struct HardwareCheckBinding {
   mlir::StringAttr message;
   mlir::Value condition, path;
   uint64_t requiredIndex = 0, conditionResult = 0, pathResult = 0;
+  std::optional<uint64_t> samplingBindingIndex;
 };
 struct HardwareCheckOccurrenceStep {
   mlir::Operation *allocation = nullptr;
@@ -91,6 +114,7 @@ struct HardwareResolvedSourceCheck {
   uint64_t bindingIndex = 0, ownerOccurrence = 0;
   HardwareCheckResetContext reset;
   uint64_t ordinal = 0;
+  std::optional<uint64_t> samplingOccurrenceIndex;
 };
 struct HardwareCheckCommitEndpoint {
   uint64_t ownerOccurrence = 0;
@@ -106,6 +130,8 @@ struct HardwareSourceCheckPlan {
   llvm::SmallVector<HardwareCheckOwnerOccurrence> owners;
   llvm::SmallVector<HardwareResolvedSourceCheck> checks;
   llvm::SmallVector<HardwareCheckCommitEndpoint> commits;
+  llvm::SmallVector<HardwareCheckSamplingBinding> samplingBindings;
+  llvm::SmallVector<HardwareCheckSamplingOccurrence> samplingOccurrences;
   bool hasChecks() const { return !checks.empty(); }
 };
 using FieldPath = llvm::SmallVector<mlir::StringAttr>;
@@ -206,6 +232,11 @@ public:
   mlir::FailureOr<HardwareBindings>
   bindInstance(CollectionOp collection,
                const HardwareBindings &parent = {}) const;
+  mlir::FailureOr<HardwareBindings>
+  bindCallee(mlir::Operation *callee, mlir::ArrayAttr actualParameters,
+             mlir::ArrayAttr actualTypeArguments,
+             const HardwareBindings &parent,
+             mlir::Operation *diagnosticSite) const;
   mlir::FailureOr<ModuleAnalysis>
   analyzeModule(ModuleOp definition,
                 const HardwareBindings &bindings = {}) const;

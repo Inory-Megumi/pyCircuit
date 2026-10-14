@@ -12,12 +12,42 @@
 
 #include <cstdint>
 
+namespace acir::ac {
+class HardwareAnalysis;
+class ModuleImportOp;
+}
+
 namespace acir::ac::detail {
 
 using EmitError = llvm::function_ref<mlir::InFlightDiagnostic()>;
 
+// Typed effects are verified intermediate IR, not published or final hardware.
+// Inspect operation kinds without recursively traversing raw attribute/type
+// graphs or imposing transaction-analysis limits on ordinary hardware.
+mlir::Operation *findUnloweredTransaction(mlir::Operation *root);
+mlir::LogicalResult verifyNoUnloweredTransactions(mlir::Operation *root);
+bool isCombinationalHardwareOperation(mlir::Operation *operation);
+
 // Optional source-call authority on existing hardware module declarations.
 mlir::LogicalResult verifyModuleSourceCallContract(mlir::Operation *owner);
+mlir::LogicalResult verifyModuleSignature(mlir::Operation *declaration);
+mlir::LogicalResult verifyModuleImportSummarySelection(
+    ModuleImportOp imported);
+
+// Callable constraints resolve hardware in the lexical module; diagnostics
+// belong to the module or Method whose source contract is being checked.
+mlir::LogicalResult verifySourceCallHardwareConstraint(
+    mlir::Attribute raw, mlir::Type physical, const HardwareAnalysis &analysis,
+    mlir::Operation *lexicalModule, mlir::Operation *diagnosticOperation,
+    llvm::StringRef description);
+mlir::LogicalResult verifyRequiredSourceParameter(
+    mlir::Attribute raw, mlir::StringAttr expectedName,
+    mlir::DictionaryAttr sourceOwner, mlir::FlatSymbolRefAttr definition,
+    mlir::Operation *diagnosticOperation, llvm::StringRef description);
+mlir::LogicalResult verifyRequiredSourceParameter(
+    mlir::Attribute raw, mlir::StringAttr expectedName,
+    mlir::Operation *lexicalModule, mlir::Operation *diagnosticOperation,
+    llvm::StringRef description);
 
 // Validate original hardware syntax against its lexical module inventories.
 // Bound forwarded actuals are resolved separately by HardwareAnalysis.
@@ -71,6 +101,9 @@ mlir::FailureOr<uint32_t> decodeU32(mlir::IntegerAttr value,
 
 mlir::LogicalResult verifySourceSpan(mlir::DictionaryAttr value,
                                      EmitError emitError);
+mlir::LogicalResult verifySourceGuardLocation(mlir::DictionaryAttr location,
+                                              mlir::DictionaryAttr sourceOwner,
+                                              EmitError emitError);
 
 mlir::LogicalResult verifyPathComponent(mlir::DictionaryAttr value,
                                         EmitError emitError);

@@ -2,6 +2,7 @@
 #include "HardwareSourceChecks.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceEffects.h"
+#include "pycircuit/Dialect/ACIR/SourceMethodAnalysis.h"
 #include "llvm/ADT/StringSet.h"
 using namespace mlir;
 namespace acir::ac {
@@ -19,6 +20,15 @@ bool equivalentTypes(TypeRange lhs, TypeRange rhs) {
 }
 } // namespace
 namespace detail {
+bool isCombinationalHardwareOperation(Operation *operation) {
+  return isa<BitsConstantOp, BitsUnaryOp, BitsBinaryOp, BitsCompareOp,
+             BitsSelectOp, BitsConcatOp, BitsExtractOp, BitsResizeOp,
+             StructCreateOp, StructGetOp, EnumCreateOp, EnumToBitsOp,
+             EnumFromBitsOp, TableCreateOp, TableSplatOp, TableMapOp,
+             TableViewOp, TableIndexOp, TableGetOp, TableMatchOp,
+             TableChooseOp, TableFoldOp, ValueMergeOp>(operation);
+}
+
 LogicalResult verifyHardwareTypeScope(Type type, Operation *owner);
 LogicalResult verifyHardwareAttributeScope(Attribute attr, Operation *owner) {
   if (auto expr = dyn_cast_or_null<StaticExprAttr>(attr)) {
@@ -31,9 +41,11 @@ LogicalResult verifyHardwareAttributeScope(Attribute attr, Operation *owner) {
           ref ? ref.getAs<FlatSymbolRefAttr>("owner") : FlatSymbolRefAttr();
       auto name = ref ? ref.getAs<StringAttr>("name") : StringAttr();
       bool declared = false;
-      for (auto raw : owner->getAttrOfType<ArrayAttr>("parameters"))
-        if (cast<DictionaryAttr>(raw).getAs<StringAttr>("name") == name)
-          declared = true;
+      if (auto parameters = owner->getAttrOfType<ArrayAttr>("parameters"))
+        for (auto raw : parameters)
+          if (auto parameter = dyn_cast<DictionaryAttr>(raw))
+            if (parameter.getAs<StringAttr>("name") == name)
+              declared = true;
       if (!kind || kind.getValue() != "parameter" || !symbol ||
           symbol.getValue() != SymbolTable::getSymbolName(owner).getValue() ||
           !declared)
@@ -64,10 +76,11 @@ LogicalResult verifyHardwareTypeScope(Type type, Operation *owner) {
     return verifyHardwareTypeScope(table.getElementType(), owner);
   }
   if (auto formal = dyn_cast<TypeParamType>(type)) {
-    if (formal.getOwner().getValue() !=
-            SymbolTable::getSymbolName(owner).getValue() ||
-        !llvm::is_contained(owner->getAttrOfType<ArrayAttr>("type_parameters"),
-                            Attribute(formal.getName())))
+    auto parameters = owner->getAttrOfType<ArrayAttr>("type_parameters");
+    auto symbol = SymbolTable::getSymbolName(owner);
+    if (!parameters || !symbol ||
+        formal.getOwner().getValue() != symbol.getValue() ||
+        !llvm::is_contained(parameters, Attribute(formal.getName())))
       return owner->emitOpError()
              << "wire type parameter must belong to its declaring module";
   }
@@ -76,8 +89,8 @@ LogicalResult verifyHardwareTypeScope(Type type, Operation *owner) {
   return success();
 }
 } // namespace detail
-namespace {
-LogicalResult signature(Operation *op) {
+namespace detail {
+LogicalResult verifyModuleSignature(Operation *op) {
   if (!isa<mlir::ModuleOp>(op->getParentOp()))
     return op->emitOpError() << "module declaration requires package placement";
   auto error = [&] { return op->emitOpError(); };
@@ -91,6 +104,9 @@ LogicalResult signature(Operation *op) {
   if (!sig || !inputs || !outputs || inputs.size() != sig.getNumInputs() ||
       outputs.size() != sig.getNumResults())
     return error() << "port name counts must match function signature";
+  auto layout = getModulePortLayout(op);
+  if (failed(layout))
+    return failure();
   Attribute rawRootKind = op->getAttr("ac.root_kind");
   auto rootKind = dyn_cast_or_null<StringAttr>(rawRootKind);
   if (rawRootKind && (!rootKind || rootKind.getValue() != "system"))
@@ -108,8 +124,8 @@ LogicalResult signature(Operation *op) {
   if (!parameters || !types)
     return error() << "module requires parameter inventories";
   if (rootKind &&
-      (!parameters.empty() || !types.empty() || sig.getNumInputs() != 2 ||
-       sig.getNumResults() != 0 || !outputs.empty() ||
+      (!parameters.empty() || !types.empty() || layout->sourceInputCount != 2 ||
+       layout->sourceOutputCount != 0 ||
        !op->getAttrOfType<DictionaryAttr>("ac.domain_inputs")))
     return error() << "source system must be a closed zero-result definition "
                       "with one inferred clock/reset domain";
@@ -152,6 +168,8 @@ LogicalResult signature(Operation *op) {
       return error() << "output must have hardware payload type";
   return detail::verifyModuleSourceCallContract(op);
 }
+} // namespace detail
+namespace {
 LogicalResult body(Operation *op, TypeRange inputs, TypeRange outputs) {
   auto &region = op->getRegion(0);
   if (!region.hasOneBlock())
@@ -166,13 +184,7 @@ LogicalResult body(Operation *op, TypeRange inputs, TypeRange outputs) {
   for (Operation &nested : block.without_terminator()) {
     if (isa<YieldOp>(nested))
       return op->emitOpError() << "early yield is invalid";
-    if (isa<RuleOp>(op) &&
-        !isa<BitsConstantOp, BitsUnaryOp, BitsBinaryOp, BitsCompareOp,
-             BitsSelectOp, BitsConcatOp, BitsExtractOp, BitsResizeOp,
-             StructCreateOp, StructGetOp, EnumCreateOp, EnumToBitsOp,
-             EnumFromBitsOp, TableCreateOp, TableSplatOp,
-             TableMapOp, TableViewOp, TableIndexOp, TableGetOp, TableMatchOp,
-             TableChooseOp, TableFoldOp, ValueMergeOp>(nested))
+    if (isa<RuleOp>(op) && !detail::isCombinationalHardwareOperation(&nested))
       return nested.emitOpError()
              << "rule accepts only closed combinational hardware operations";
   }
@@ -183,7 +195,7 @@ LogicalResult ModuleOp::verify() {
   if ((*this)->hasAttr("primitive_kind"))
     return emitOpError()
            << "primitive_kind belongs only to trusted leaf imports";
-  return signature(*this);
+  return detail::verifyModuleSignature(*this);
 }
 LogicalResult ModuleOp::verifyRegions() {
   if (failed(body(*this, getFunctionType().getInputs(),
@@ -243,13 +255,16 @@ LogicalResult InstanceOp::verifySymbolUses(SymbolTableCollection &) {
   return a.verifyInstance(*this, b);
 }
 LogicalResult YieldOp::verify() {
-  if (!isa_and_nonnull<ModuleOp, RuleOp, TableMapOp, TableMatchOp>(
+  if (!isa_and_nonnull<ModuleOp, RuleOp, TableMapOp, TableMatchOp,
+                      SourceMethodOp, SourceTransactionOp>(
           (*this)->getParentOp()))
-    return emitOpError() << "must terminate module or rule";
+    return emitOpError() << "must terminate a module, rule, table region, "
+                           "Method or transaction";
   return success();
 }
 LogicalResult ModuleImportOp::verify() {
-  if (failed(signature(*this)))
+  if (failed(detail::verifyModuleSignature(*this)) ||
+      failed(detail::verifyModuleImportSummarySelection(*this)))
     return failure();
   if ((*this)->hasAttr("cpp_binding") || (*this)->hasAttr("rtl_binding"))
     return emitOpError()
@@ -260,6 +275,8 @@ LogicalResult ModuleImportOp::verify() {
                                               "sync_mem_dp", "byte_mem"},
                           primitive.getValue()))
     return emitOpError() << "unknown trusted primitive kind";
+  if (getSemanticKind() == "transactions")
+    return verifySourceTransactionSummary(*this, getTransactionSummaryAttr());
   return HardwareAnalysis((*this)->getParentOfType<mlir::ModuleOp>())
       .verifyImport(*this);
 }

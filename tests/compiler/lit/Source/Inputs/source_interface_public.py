@@ -17,6 +17,8 @@ for name in ("repo", "source-compiler", "linker", "emitter", "optimizer", "scrat
     parser.add_argument("--" + name, required=True)
 parser.add_argument("--invalid", action="store_true")
 parser.add_argument("--query-checks", choices=("syntax", "admission", "resources"))
+parser.add_argument("--method-checks", choices=("publication", "admission"))
+parser.add_argument("--helper-checks", action="store_true")
 args = parser.parse_args()
 repo = Path(args.repo).resolve()
 scratch = Path(args.scratch).resolve()
@@ -134,6 +136,498 @@ for unit in (child, parent):
     assert '"ac.module"' not in actual and '"ac.system"' not in actual
     assert 'ac.unit_kind = "interface"' in actual
 
+if args.helper_checks:
+    provider_text = """import pycircuit as ac
+@ac.struct
+class Pair:
+    left: ac.u8
+    right: ac.u8
+def bump(value: ac.u8) -> ac.u8:
+    result: ac.u8 = value + 1
+    return result
+def chain(value: ac.u8) -> ac.u8:
+    saved = bump(value)
+    return bump(saved)
+def swap(value: Pair) -> Pair:
+    rebuilt = Pair(left=value.right, right=value.left)
+    return rebuilt
+def consume(value: ac.u8) -> None:
+    temporary: ac.u8 = value + 1
+    return
+"""
+    consumer_text = """import pycircuit as ac
+from interfaces.helper_provider import bump, chain, swap, consume, Pair
+@ac.module
+def Consumer(left: ac.u8, right: ac.u8) -> Pair:
+    snapshot = left + 1
+    def captured(value: ac.u8) -> ac.u8:
+        return value ^ snapshot
+    snapshot = right + 1
+    consume(left)
+    return swap(Pair(left=chain(left), right=captured(right)))
+"""
+    stages = root / "helper-publication"
+    stages.mkdir()
+    retained = scratch / "helper-publication-artifacts"
+    retained.mkdir(exist_ok=True)
+    snapshots = retained / "sources"
+    snapshots.mkdir(exist_ok=True)
+    provider_source = source / "helper_provider.py"
+    consumer_source = source / "helper_consumer.py"
+    for path, text in (
+        (provider_source, provider_text),
+        (consumer_source, consumer_text),
+    ):
+        path.write_text(text)
+        (snapshots / path.name).write_text(text)
+    provider_unit, consumer_unit = stages / "provider", stages / "consumer"
+    compile_unit(provider_source.name, provider_unit)
+    provider_body = payload(provider_unit, "body").read_text()
+    assert '"ac.module"(' not in provider_body and "func.func" in provider_body
+    provider_source.unlink()
+    compile_unit(consumer_source.name, consumer_unit, [provider_unit])
+    assert not provider_source.exists()
+    for unit in (provider_unit, consumer_unit):
+        extracted = stages / (unit.name + "-extracted.ac")
+        extract(payload(unit, "body"), extracted)
+        actual = normalize(extracted, stages / (unit.name + "-actual.ac"))
+        expected = normalize(
+            payload(unit, "interface"), stages / (unit.name + "-expected.ac")
+        )
+        assert actual == expected, unit
+        assert 'ac.helper_kind = "value"' in expected
+        assert "ac.capture_types =" in expected
+    final = stages / "final.ac"
+    cli(
+        "link",
+        provider_unit,
+        consumer_unit,
+        "--top",
+        "interfaces.helper_consumer.Consumer",
+        "-o",
+        final,
+    )
+    final_text = final.read_text()
+    assert "func.func" not in final_text and "func.call" not in final_text, final_text
+    emitted = {}
+    for target in ("cpp", "verilog"):
+        output = stages / target
+        cli("emit", final, "--target", target, "-o", output)
+        emitted[target] = snapshot(output)
+    protected_unit, protected_final = snapshot(consumer_unit), final.read_bytes()
+    negatives = {
+        "missing-provider": (consumer_text, []),
+        "wrong-helper-kind": (
+            consumer_text.replace("chain(left)", "chain(True)"),
+            [provider_unit],
+        ),
+        "wrong-nominal": (
+            consumer_text.replace(
+                "swap(Pair(left=chain(left), right=captured(right)))", "swap(left)"
+            ),
+            [provider_unit],
+        ),
+        "none-as-value": (
+            consumer_text.replace("chain(left)", "consume(left)"),
+            [provider_unit],
+        ),
+    }
+    for name, (text, imports) in negatives.items():
+        consumer_source.write_text(text)
+        absent = stages / ("invalid-" + name)
+        compile_unit(consumer_source.name, absent, imports, accepted=False)
+        assert not absent.exists(), name
+        compile_unit(
+            consumer_source.name, consumer_unit, imports, replace=True, accepted=False
+        )
+        assert snapshot(consumer_unit) == protected_unit, name
+        assert final.read_bytes() == protected_final, name
+        assert all(
+            snapshot(stages / target) == expected
+            for target, expected in emitted.items()
+        ), name
+    consumer_source.write_text(consumer_text)
+    destination = retained / "stages"
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(stages, destination)
+    (scratch / "helper-publication-receipt.json").write_text(
+        json.dumps(
+            {
+                "scope": "ordinary helper-only provider, unavailable provider Python, consumer source publication/link/dual emit",
+                "provider_python_unavailable": not provider_source.exists(),
+                "artifact_sha256": {
+                    path.relative_to(retained)
+                    .as_posix(): hashlib.sha256(path.read_bytes())
+                    .hexdigest()
+                    for path in sorted(retained.rglob("*"))
+                    if path.is_file()
+                },
+                "tools": {
+                    str(Path(tool).resolve()): hashlib.sha256(
+                        Path(tool).read_bytes()
+                    ).hexdigest()
+                    for tool in (
+                        args.source_compiler,
+                        args.linker,
+                        args.emitter,
+                        args.optimizer,
+                    )
+                },
+                "managed_publications_preserved": True,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print("Ordinary helper publication checks passed")
+    sys.exit(0)
+
+if args.method_checks:
+    provider_text = """import pycircuit as ac
+from typing import Annotated
+@ac.struct
+class Packet:
+    value: ac.u8
+@ac.module
+def Counter():
+    count: ac.u8 = 0
+    @ac.method
+    def read() -> ac.u8:
+        return count
+    @ac.method
+    def add(delta: ac.u8) -> ac.u8:
+        count = count + delta
+        return count
+    @ac.method
+    def chain(delta: ac.u8) -> ac.u8:
+        saved = add(delta)
+        return add(saved)
+    @ac.method
+    def boolean(value: bool) -> bool:
+        return value
+    @ac.method
+    def integer(value: Annotated[int, range(1 << 1)]) -> Annotated[int, range(1 << 1)]:
+        return value
+    @ac.method
+    def fixed(value: ac.u1) -> ac.u1:
+        return value
+    @ac.method
+    def packet(value: Packet) -> Packet:
+        return value
+    @ac.method(guard=lambda allow: allow)
+    def guarded(allow: bool) -> None:
+        count = count
+    @ac.rule
+    def inspect() -> None:
+        saved = count
+    inspect()
+"""
+    relay_text = """import pycircuit as ac
+from typing import Annotated
+from interfaces.method_provider import Counter, Packet
+@ac.module
+def Relay():
+    left = Counter()
+    alias = left
+    right = Counter()
+    @ac.method
+    def chain(delta: ac.u8) -> ac.u8:
+        before = alias.read()
+        saved = left.chain(delta)
+        return right.add(saved)
+    @ac.method
+    def boolean(value: bool) -> bool:
+        return left.boolean(value)
+    @ac.method
+    def integer(value: Annotated[int, range(1 << 1)]) -> Annotated[int, range(1 << 1)]:
+        return left.integer(value)
+    @ac.method
+    def fixed(value: ac.u1) -> ac.u1:
+        return left.fixed(value)
+    @ac.method
+    def packet(value: Packet) -> Packet:
+        return left.packet(value)
+    @ac.method
+    def guarded(allow: bool) -> None:
+        alias.guarded(allow)
+"""
+    consumer_text = """import pycircuit as ac
+from typing import Annotated
+from interfaces.method_provider import Counter, Packet
+from interfaces.method_relay import Relay
+@ac.struct
+class Result:
+    before: ac.u8
+    after: ac.u8
+    fixed: ac.u1
+    packet: Packet
+@ac.module
+def Consumer(delta: ac.u8, permitted: bool, logical: Annotated[int, range(1 << 1)], fixed: ac.u1, payload: Packet) -> Result:
+    owner = Relay()
+    other = Counter()
+    alias = owner
+    @ac.rule
+    def probe() -> None:
+        owner.guarded(permitted)
+    @ac.rule
+    def work() -> Result:
+        owner.guarded(True)
+        before = alias.chain(delta)
+        after = owner.chain(before)
+        unused = other.add(delta)
+        flag = owner.boolean(permitted)
+        number = owner.integer(logical)
+        bit = owner.fixed(fixed)
+        packet = owner.packet(payload)
+        return Result(before=before, after=after, fixed=bit, packet=packet)
+    probe()
+    return work()
+"""
+    archive = root / "method-publication"
+    archive.mkdir()
+    retained = scratch / ("method-" + args.method_checks + "-artifacts")
+    retained.mkdir(exist_ok=True)
+    source_snapshots = retained / "sources"
+    source_snapshots.mkdir(exist_ok=True)
+    provider_source = source / "method_provider.py"
+    relay_source = source / "method_relay.py"
+    consumer_source = source / "method_consumer.py"
+    for path, text in (
+        (provider_source, provider_text),
+        (relay_source, relay_text),
+        (consumer_source, consumer_text),
+    ):
+        path.write_text(text)
+        # This evidence copy is outside the declared --source-root. It cannot
+        # satisfy a provider Python read after the active source is removed.
+        (source_snapshots / path.name).write_text(text)
+    for name in ("source_interface_child.py", "source_interface_parent.py"):
+        shutil.copyfile(source / name, source_snapshots / name)
+    provider_unit, relay_unit, consumer_unit = (
+        archive / "provider",
+        archive / "relay",
+        archive / "consumer",
+    )
+    compile_unit(provider_source.name, provider_unit)
+    provider_source.unlink()
+    compile_unit(relay_source.name, relay_unit, [provider_unit])
+    relay_source.unlink()
+    compile_unit(consumer_source.name, consumer_unit, [provider_unit, relay_unit])
+    assert not provider_source.exists() and not relay_source.exists()
+    for unit in (provider_unit, relay_unit, consumer_unit):
+        extracted = archive / (unit.name + "-extracted.ac")
+        extract(payload(unit, "body"), extracted)
+        actual = normalize(extracted, archive / (unit.name + "-actual.ac"))
+        expected = normalize(
+            payload(unit, "interface"), archive / (unit.name + "-expected.ac")
+        )
+        assert actual == expected, unit
+        assert 'semantic_kind = "transactions"' in expected, expected
+        assert "transaction_summary =" in expected, expected
+        assert '"ac.method"(' not in expected and '"ac.transaction"(' not in expected
+    provider_header = payload(provider_unit, "interface").read_text()
+    for kind in ("boolean", "integer", "fixed_bits", "nominal"):
+        assert f'source_kind = "{kind}"' in provider_header, provider_header
+    consumer_body = payload(consumer_unit, "body").read_text()
+    relay_body = payload(relay_unit, "body").read_text()
+    assert consumer_body.count('"ac.instance"(') == 2, consumer_body
+    assert relay_body.count('"ac.instance"(') == 2, relay_body
+    assert '"ac.method.call"(' in consumer_body and '"ac.transaction"(' in consumer_body
+
+    # This closure invokes Methods across instances and contains active
+    # dynamic guards. It remains outside same-owner transaction materialization.
+    # Preserve the independently published interfaces and hardware outputs.
+    final = archive / "protected.ac"
+    cli(
+        "link",
+        child,
+        parent,
+        "--top",
+        "interfaces.source_interface_parent.Parent",
+        "-o",
+        final,
+    )
+    before_final = final.read_bytes()
+    emitted = {}
+    for target in ("cpp", "verilog"):
+        output = archive / target
+        cli("emit", final, "--target", target, "-o", output)
+        emitted[target] = snapshot(output)
+    rejected = cli(
+        "link",
+        provider_unit,
+        relay_unit,
+        consumer_unit,
+        "--top",
+        "interfaces.method_consumer.Consumer",
+        "-o",
+        final,
+        accepted=False,
+    )
+    diagnostic = rejected.stderr.lower()
+    assert "lower" in diagnostic and (
+        "method" in diagnostic or "transaction" in diagnostic
+    ), rejected.stderr
+    assert (
+        "unresolved" not in diagnostic and "missing" not in diagnostic
+    ), rejected.stderr
+    assert final.read_bytes() == before_final
+    assert all(
+        snapshot(archive / target) == expected for target, expected in emitted.items()
+    )
+
+    if args.method_checks == "admission":
+        before_unit = snapshot(consumer_unit)
+        missing = compile_unit(
+            consumer_source.name,
+            archive / "missing-provider",
+            [relay_unit],
+            accepted=False,
+        )
+        assert any(
+            word in missing.stderr.lower()
+            for word in ("dependency", "provider", "interface")
+        ), missing.stderr
+        assert not (archive / "missing-provider").exists()
+        cases = {
+            "unknown-method": consumer_text.replace(
+                "alias.chain(delta)", "alias.missing(delta)"
+            ),
+            "arity": consumer_text.replace(
+                "alias.chain(delta)", "alias.chain(delta, delta)"
+            ),
+            "integer-is-not-boolean": consumer_text.replace(
+                "owner.boolean(permitted)", "owner.boolean(logical)"
+            ),
+            "boolean-is-not-integer": consumer_text.replace(
+                "owner.integer(logical)", "owner.integer(permitted)"
+            ),
+            "fixed-is-not-logical-integer": consumer_text.replace(
+                "owner.integer(logical)", "owner.integer(fixed)"
+            ),
+            "fixed-is-not-boolean": consumer_text.replace(
+                "owner.boolean(permitted)", "owner.boolean(fixed)"
+            ),
+            "boolean-result-is-not-integer": consumer_text.replace(
+                "owner.integer(logical)", "owner.integer(owner.boolean(permitted))"
+            ),
+            "integer-result-is-not-boolean": consumer_text.replace(
+                "owner.boolean(permitted)", "owner.boolean(owner.integer(logical))"
+            ),
+            "fixed-width": consumer_text.replace(
+                "owner.fixed(fixed)", "owner.fixed(delta)"
+            ),
+            "fixed-width-integer-constant": consumer_text.replace(
+                "other.add(delta)", "other.add(256)"
+            ),
+            "fixed-width-captured-integer": consumer_text.replace(
+                "    owner = Relay()", "    too_large = 256\n    owner = Relay()"
+            ).replace("other.add(delta)", "other.add(too_large)"),
+            "logical-integer-interval": consumer_text.replace(
+                "owner.integer(logical)", "owner.integer(2)"
+            ),
+            "nominal": consumer_text.replace(
+                "@ac.module\ndef Consumer",
+                "@ac.struct\nclass Other:\n    value: ac.u8\n@ac.module\ndef Consumer",
+            ).replace("owner.packet(payload)", "owner.packet(Other(value=delta))"),
+            "guarded-valued-rule": consumer_text.replace(
+                "        before = alias.chain(delta)",
+                "        owner.guarded(permitted)\n        before = alias.chain(delta)",
+            ),
+        }
+        for name, text in cases.items():
+            assert text != consumer_text, name
+            consumer_source.write_text(text)
+            absent = archive / ("invalid-" + name)
+            fresh = compile_unit(
+                consumer_source.name,
+                absent,
+                [provider_unit, relay_unit],
+                accepted=False,
+            )
+            assert not absent.exists(), name
+            replacement = compile_unit(
+                consumer_source.name,
+                consumer_unit,
+                [provider_unit, relay_unit],
+                replace=True,
+                accepted=False,
+            )
+            if name in (
+                "boolean-result-is-not-integer",
+                "integer-result-is-not-boolean",
+            ):
+                expected_kind = (
+                    "Integer" if name == "boolean-result-is-not-integer" else "Boolean"
+                )
+                diagnostic = (
+                    "binding boundary requires declared "
+                    + expected_kind
+                    + " source kind"
+                )
+                assert diagnostic in fresh.stderr, fresh.stderr
+                assert diagnostic in replacement.stderr, replacement.stderr
+            assert snapshot(consumer_unit) == before_unit, name
+            assert final.read_bytes() == before_final, name
+            assert all(
+                snapshot(archive / target) == expected
+                for target, expected in emitted.items()
+            ), name
+        consumer_source.write_text(consumer_text)
+    # Keep complete actual publication and extraction artifacts beyond the
+    # TemporaryDirectory lifetime. Tests do not read these evidence copies.
+    stages = retained / "stages"
+    if stages.exists():
+        shutil.rmtree(stages)
+    shutil.copytree(archive, stages)
+    controls = retained / "controls"
+    if controls.exists():
+        shutil.rmtree(controls)
+    controls.mkdir()
+    for unit in (child, parent):
+        shutil.copytree(unit, controls / unit.name)
+    (scratch / ("method-" + args.method_checks + "-receipt.json")).write_text(
+        json.dumps(
+            {
+                "scope": "source publication and header authority; cross-instance and dynamic-guard Method closure remains rejected",
+                "provider_python_unavailable": not provider_source.exists(),
+                "relay_python_unavailable": not relay_source.exists(),
+                "units": {
+                    unit.name: hashlib.sha256(
+                        payload(unit, "interface").read_bytes()
+                    ).hexdigest()
+                    for unit in (provider_unit, relay_unit, consumer_unit)
+                },
+                "managed_hardware_outputs_preserved": True,
+                "mode": args.method_checks,
+                "artifacts": str(retained),
+                "artifact_sha256": {
+                    path.relative_to(retained)
+                    .as_posix(): hashlib.sha256(path.read_bytes())
+                    .hexdigest()
+                    for path in sorted(retained.rglob("*"))
+                    if path.is_file()
+                },
+                "tools": {
+                    str(Path(tool).resolve()): hashlib.sha256(
+                        Path(tool).read_bytes()
+                    ).hexdigest()
+                    for tool in (
+                        args.source_compiler,
+                        args.linker,
+                        args.emitter,
+                        args.optimizer,
+                    )
+                },
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print("Method " + args.method_checks + " checks passed")
+    sys.exit(0)
+
 if args.query_checks:
     sys.path.insert(0, str(repo / "python"))
     sys.path.insert(0, str(fixtures / "table-queries"))
@@ -157,7 +651,7 @@ if args.query_checks:
         for name in ("zero-args", "two-args"):
             positives[name] = negatives.pop(name)
         positives["multi-input-map"] = positives["ordinary"].replace(
-            "entries.first(where=lambda row: Write(state))",
+            "entries.first(where=lambda row: predicate(state))",
             "entries.map(lambda lane, other: lane, entries)",
         )
         for accepted, cases in ((True, positives), (False, negatives)):

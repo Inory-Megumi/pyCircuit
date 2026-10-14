@@ -96,10 +96,10 @@ verifyBodySnapshotsAgainstAuthority(ModuleOp body, ModuleOp owningHeader,
     auto symbol =
         operation.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
     auto snapshotOwner = ac::detail::declarationSourceOwner(&operation);
-    bool localNominal = isa<ac::StructOp, ac::EnumOp>(operation) && role &&
-                        role.getValue() == "definition" &&
-                        snapshotOwner == owner;
-    if (!role || (role.getValue() != "import_snapshot" && !localNominal) ||
+    bool localDefinition =
+        isa<ac::StructOp, ac::EnumOp, func::FuncOp>(operation) && role &&
+        role.getValue() == "definition" && snapshotOwner == owner;
+    if (!role || (role.getValue() != "import_snapshot" && !localDefinition) ||
         !symbol || !snapshotOwner)
       return emitError() << "source body contains an unverified declaration";
     auto canonical =
@@ -115,11 +115,13 @@ verifyBodySnapshotsAgainstAuthority(ModuleOp body, ModuleOp owningHeader,
   if (bodyKind.getValue() == "implementation" && executableModules == 0)
     return emitError() << "implementation body must own at least one module";
 
-  // Authority is bidirectional: a consumer's retained snapshot cannot stand
-  // in for a nominal definition deleted from the actual owner's body.
+  // Every published definition must still have its actual owning body.
+  // A retained snapshot cannot replace a deleted module, nominal or helper
+  // definition.
   for (Operation &declaration : owningHeader.getBody()->getOperations()) {
     auto role = declaration.getAttrOfType<StringAttr>("ac.declaration_role");
-    if (!isa<ac::StructOp, ac::EnumOp>(declaration) || !role ||
+    if (!isa<ac::ModuleImportOp, ac::StructOp, ac::EnumOp, func::FuncOp>(
+            declaration) || !role ||
         role.getValue() != "definition" ||
         ac::detail::declarationSourceOwner(&declaration) != owner)
       continue;
@@ -131,9 +133,11 @@ verifyBodySnapshotsAgainstAuthority(ModuleOp body, ModuleOp owningHeader,
             : StringAttr();
     if (!definition || !bodyRole || bodyRole.getValue() != "definition" ||
         ac::detail::declarationSourceOwner(definition) != owner ||
-        !detail::sameDeclaration(&declaration, definition))
+        (isa<ac::ModuleImportOp>(declaration)
+             ? !isa<ac::ModuleOp>(definition)
+             : !detail::sameDeclaration(&declaration, definition)))
       return emitError()
-             << "owning header nominal declaration has no matching body "
+             << "owning header declaration has no matching body "
                 "definition: "
              << symbol;
   }

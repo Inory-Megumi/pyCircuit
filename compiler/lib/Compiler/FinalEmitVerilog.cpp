@@ -83,7 +83,11 @@ FailureOr<std::string> managedReset(ac::ModuleOp root) {
   if (!domain || domain.empty())
     return std::string("1'b0");
   auto reset = domain.getAs<IntegerAttr>("reset");
-  auto names = root.getInputNames();
+  auto layout = ac::getModulePortLayout(root);
+  if (failed(layout))
+    return failure();
+  auto names =
+      root.getInputNames().getValue().take_front(layout->sourceInputCount);
   if (!reset || reset.getValue().getActiveBits() > 64 ||
       reset.getValue().getZExtValue() >= names.size())
     return root.emitOpError()
@@ -96,7 +100,11 @@ FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
   auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
   auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
   auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
-  auto inputs = root.getInputNames();
+  auto layout = ac::getModulePortLayout(root);
+  if (failed(layout))
+    return failure();
+  auto inputs =
+      root.getInputNames().getValue().take_front(layout->sourceInputCount);
   if (!domain || domain.size() != 2 || !clock || !reset ||
       clock.getValue().getActiveBits() > 64 ||
       reset.getValue().getActiveBits() > 64)
@@ -106,7 +114,7 @@ FailureOr<SystemControls> systemControls(ac::ModuleOp root) {
   uint64_t resetIndex = reset.getValue().getZExtValue();
   if (clockIndex == resetIndex || inputs.size() != 2 ||
       clockIndex >= inputs.size() || resetIndex >= inputs.size() ||
-      !root.getOutputNames().empty())
+      layout->sourceOutputCount != 0)
     return root.emitOpError()
            << "system root must be closed except for clock/reset";
   auto legal = [&](uint64_t index) {
@@ -263,42 +271,53 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
          "  logic pyc_rst = 1'b0;\n"
          "  logic [2:0] pyc_phase = 3'd0;\n"
          "  logic pyc_root_commit_ok = 1'b0;\n"
+         "  wire pyc_check_complete;\n"
+         "  wire pyc_sampling_error;\n"
          "  wire pyc_local_error;\n"
          "  localparam longint unsigned pyc_max_cycles = "
          "64'd4611686018427387903;\n"
          "  longint unsigned pyc_cycles = 64'd10;\n"
          "  longint unsigned pyc_epoch = 64'd0;\n"
          "  longint unsigned pyc_cycle;\n"
-         "  string pyc_cycles_text;\n  "
+         "  string pyc_cycles_text;\n"
+         "  bit pyc_cycles_valid;\n  "
       << wrapper << " dut (\n    ." << controls->clock << "(pyc_clk),\n    ."
       << controls->reset
       << "(pyc_rst),\n"
          "    .pyc_phase(pyc_phase),\n"
          "    .pyc_root_commit_ok(pyc_root_commit_ok),\n"
+         "    .pyc_check_complete(pyc_check_complete),\n"
+         "    .pyc_sampling_error(pyc_sampling_error),\n"
          "    .pyc_local_error(pyc_local_error)\n  );\n";
   for (const auto &report : reports)
     out << "  longint unsigned pyc_report_value_" << report.ordinal
         << " = 0;\n  longint unsigned pyc_report_update_" << report.ordinal
         << " = 0;\n";
-  out << "  function automatic bit pyc_parse_cycles(\n"
-         "      input string text, output longint unsigned value);\n"
+  out << "  task automatic pyc_parse_cycles(\n"
+         "      input string text, output bit accepted,\n"
+         "      output longint unsigned value);\n"
          "    integer index;\n"
          "    integer character;\n"
          "    longint unsigned digit;\n"
          "    begin\n"
          "      value = 0;\n"
-         "      if (text.len() == 0) return 1'b0;\n"
-         "      for (index = 0; index < text.len(); index = index + 1) begin\n"
-         "        character = text.getc(index);\n"
-         "        if (character < 48 || character > 57) return 1'b0;\n"
-         "        digit = character - 48;\n"
-         "        if (value > (pyc_max_cycles - digit) / 10) return 1'b0;\n"
-         "        value = value * 10 + digit;\n"
+         "      accepted = text.len() != 0;\n"
+         "      for (index = 0; accepted && index < text.len();\n"
+         "           index = index + 1) begin\n"
+         "        character = text[index];\n"
+         "        if (character < 48 || character > 57)\n"
+         "          accepted = 1'b0;\n"
+         "        else begin\n"
+         "          digit = character - 48;\n"
+         "          if (value > (pyc_max_cycles - digit) / 10)\n"
+         "            accepted = 1'b0;\n"
+         "          else\n"
+         "            value = value * 10 + digit;\n"
+         "        end\n"
          "      end\n"
-         "      return value != 0;\n"
+         "      accepted = accepted && (value != 0);\n"
          "    end\n"
-         "  endfunction\n"
-         "  task automatic pyc_publish_observations;\n    begin\n";
+         "  endtask\n";
   struct ObservationGroup {
     size_t begin, size;
     SmallVector<ObservationAddress> addresses;
@@ -335,16 +354,45 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
     return address.object + ".pyc_observation_" + field.str() + "_" +
            std::to_string(address.localIndex);
   };
-  // Check every group before emitting any record from this epoch. A partially
-  // active later group must not publish an earlier complete group's prefix.
+  out << "  bit pyc_observation_groups_ok;\n";
   for (const auto &group : groups)
+    out << "  bit pyc_observation_active_" << group.begin << " = 1'b0;\n";
+  out << "  task automatic pyc_validate_observations(output bit accepted);\n"
+         "    begin\n"
+         "      accepted = 1'b1;\n";
+  // Validate every frozen group before granting commit permission. A later
+  // partial group cannot commit hardware or publish an earlier group's prefix.
+  for (const auto &group : groups) {
+    const auto &first = group.addresses[0];
+    out << "      pyc_observation_active_" << group.begin << " = 1'b0;\n";
+    for (const auto &address : group.addresses)
+      out << "      if ((" << signal(address, "pending") << " !== 1'b0) && ("
+          << signal(address, "pending") << " !== 1'b1)) accepted = 1'b0;\n";
     for (size_t index = 1; index < group.size; ++index)
-      out << "      if ((" << signal(group.addresses[index], "valid")
-          << " !== " << signal(group.addresses[0], "valid") << ") || ("
-          << signal(group.addresses[index], "path")
-          << " !== " << signal(group.addresses[0], "path") << "))\n"
-          << "        $fatal(1, \"pycircuit_sim: inconsistent observation "
-             "group\");\n";
+      out << "      if (" << signal(group.addresses[index], "pending")
+          << " !== " << signal(first, "pending") << ") accepted = 1'b0;\n";
+    out << "      if (" << signal(first, "pending") << " === 1'b1) begin\n";
+    for (const auto &address : group.addresses) {
+      for (StringRef field : {"path", "valid"})
+        out << "        if ((" << signal(address, field) << " !== 1'b0) && ("
+            << signal(address, field) << " !== 1'b1)) accepted = 1'b0;\n";
+    }
+    for (size_t index = 1; index < group.size; ++index)
+      out << "        if (" << signal(group.addresses[index], "path")
+          << " !== " << signal(first, "path") << ") accepted = 1'b0;\n";
+    // Known false paths suppress the whole group even when payload validity
+    // differs. On a true path only all-invalid or all-valid groups are legal.
+    out << "        if (" << signal(first, "path") << " === 1'b1) begin\n";
+    for (size_t index = 1; index < group.size; ++index)
+      out << "          if (" << signal(group.addresses[index], "valid")
+          << " !== " << signal(first, "valid") << ") accepted = 1'b0;\n";
+    out << "          if (" << signal(first, "valid") << " === 1'b1)\n"
+        << "            pyc_observation_active_" << group.begin << " = 1'b1;\n"
+        << "        end\n"
+        << "      end\n";
+  }
+  out << "    end\n  endtask\n"
+         "  task automatic pyc_publish_observations;\n    begin\n";
   for (const auto &group : groups) {
     const auto &occurrence = plan->occurrences[group.begin];
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
@@ -391,8 +439,7 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
       }
     }
     record += "]}";
-    out << "      if (" << signal(group.addresses[0], "valid") << " && "
-        << signal(group.addresses[0], "path") << ") begin\n";
+    out << "      if (pyc_observation_active_" << group.begin << ") begin\n";
     if (occurrence.site.gauge) {
       const std::string value = signal(group.addresses[0], "value");
       out << "        pyc_report_value_" << occurrence.ordinal
@@ -409,10 +456,29 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
          "    begin\n"
          "      pyc_clk = level;\n"
          "      pyc_root_commit_ok = 1'b0;\n"
+         "      #1; // Settle combinational pins before the shared PREPARE "
+         "edge.\n"
          "      pyc_phase = 3'd1; #1;\n"
+         "      if (pyc_check_complete !== 1'b1) begin\n"
+         "        pyc_phase = 3'd3; #1;\n"
+         "        $fatal(1, \"pycircuit_sim: incomplete check snapshot "
+         "at epoch %0d\", pyc_epoch);\n"
+         "      end\n"
+         "      if (pyc_sampling_error !== 1'b0) begin\n"
+         "        pyc_phase = 3'd3; #1;\n"
+         "        $fatal(1, \"pycircuit_sim: physical sampling check failed "
+         "at epoch %0d\", pyc_epoch);\n"
+         "      end\n"
          "      if (pyc_local_error !== 1'b0) begin\n"
          "        pyc_phase = 3'd3; #1;\n"
          "        $fatal(1, \"pycircuit_sim: source or primitive check failed "
+         "at epoch %0d\", pyc_epoch);\n"
+         "      end\n"
+         "      pyc_validate_observations(pyc_observation_groups_ok);\n"
+         "      if (!pyc_observation_groups_ok) begin\n"
+         "        pyc_root_commit_ok = 1'b0;\n"
+         "        pyc_phase = 3'd3; #1;\n"
+         "        $fatal(1, \"pycircuit_sim: inconsistent observation group "
          "at epoch %0d\", pyc_epoch);\n"
          "      end\n"
          "      pyc_root_commit_ok = 1'b1;\n"
@@ -424,13 +490,16 @@ FailureOr<std::string> systemSimulationTop(HardwareEmitContext &context,
          "    end\n  endtask\n"
          "  initial begin\n"
          "    if ($value$plusargs(\"cycles=%s\", pyc_cycles_text)) begin\n"
-         "      if (!pyc_parse_cycles(pyc_cycles_text, pyc_cycles))\n"
+         "      pyc_parse_cycles(pyc_cycles_text, pyc_cycles_valid, "
+         "pyc_cycles);\n"
+         "      if (!pyc_cycles_valid)\n"
          "        $fatal(1, \"pycircuit_sim: +cycles requires a positive "
          "decimal value no greater than 4611686018427387903\");\n"
          "    end else if ($test$plusargs(\"cycles\"))\n"
          "      $fatal(1, \"pycircuit_sim: +cycles requires a positive decimal "
          "value no greater than 4611686018427387903\");\n"
          "    pyc_clk = 1'b0; pyc_rst = 1'b0;\n"
+         "    #1; // Reset initializers settle before RESET_PREPARE.\n"
          "    pyc_root_commit_ok = 1'b1; pyc_phase = 3'd4; #1;\n"
          "    pyc_phase = 3'd2; #1;\n"
          "    pyc_phase = 3'd0; pyc_root_commit_ok = 1'b0;\n"
@@ -478,6 +547,9 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
   if (failed(bindings))
     return failure();
   auto signature = root.getFunctionType();
+  auto layout = ac::getModulePortLayout(root);
+  if (failed(layout))
+    return failure();
   bool first = true;
   auto port = [&](StringRef direction, Type type,
                   StringRef name) -> LogicalResult {
@@ -493,11 +565,13 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     first = false;
     return success();
   };
-  for (auto [i, type] : llvm::enumerate(signature.getInputs()))
+  for (auto [i, type] : llvm::enumerate(
+           signature.getInputs().take_front(layout->sourceInputCount)))
     if (failed(port("input", type,
                     cast<StringAttr>(root.getInputNames()[i]).getValue())))
       return failure();
-  for (auto [i, type] : llvm::enumerate(signature.getResults()))
+  for (auto [i, type] : llvm::enumerate(
+           signature.getResults().take_front(layout->sourceOutputCount)))
     if (failed(port("output", type,
                     cast<StringAttr>(root.getOutputNames()[i]).getValue())))
       return failure();
@@ -505,6 +579,8 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     out << (first ? "\n" : ",\n")
         << "  input wire [2:0] pyc_phase,\n"
            "  input wire pyc_root_commit_ok,\n"
+           "  output wire pyc_check_complete,\n"
+           "  output wire pyc_sampling_error,\n"
            "  output wire pyc_local_error";
     first = false;
   }
@@ -516,20 +592,44 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     return failure();
   out << "  " << callee << *parameters << " dut (";
   first = true;
-  auto connection = [&](StringRef name) -> LogicalResult {
+  auto connection = [&](StringRef name, StringRef expression) -> LogicalResult {
     auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
     if (failed(id))
       return failure();
-    out << (first ? "\n" : ",\n") << "    ." << *id << "(" << *id << ")";
+    out << (first ? "\n" : ",\n") << "    ." << *id << "(" << expression << ")";
     first = false;
     return success();
   };
-  for (auto raw : root.getInputNames())
-    if (failed(connection(cast<StringAttr>(raw).getValue())))
+  for (auto [index, raw] : llvm::enumerate(root.getInputNames())) {
+    StringRef name = cast<StringAttr>(raw).getValue();
+    std::string expression;
+    if (index < layout->sourceInputCount) {
+      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      if (failed(id))
+        return failure();
+      expression = std::move(*id);
+    } else {
+      auto width = context.analysis.getPackedWidth(signature.getInput(index),
+                                                   *bindings, root);
+      if (failed(width))
+        return failure();
+      expression = std::to_string(*width) + "'d0";
+    }
+    if (failed(connection(name, expression)))
       return failure();
-  for (auto raw : root.getOutputNames())
-    if (failed(connection(cast<StringAttr>(raw).getValue())))
+  }
+  for (auto [index, raw] : llvm::enumerate(root.getOutputNames())) {
+    StringRef name = cast<StringAttr>(raw).getValue();
+    std::string expression;
+    if (index < layout->sourceOutputCount) {
+      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      if (failed(id))
+        return failure();
+      expression = std::move(*id);
+    }
+    if (failed(connection(name, expression)))
       return failure();
+  }
   if (context.managesChecks()) {
     auto reset = managedReset(root);
     if (failed(reset))
@@ -539,6 +639,8 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
            "    .pyc_root_commit_ok(pyc_root_commit_ok),\n"
            "    .pyc_reset_active("
         << *reset << "),\n"
+        << "    .pyc_check_complete(pyc_check_complete),\n"
+           "    .pyc_sampling_error(pyc_sampling_error),\n"
         << "    .pyc_local_error(pyc_local_error)";
     first = false;
   }

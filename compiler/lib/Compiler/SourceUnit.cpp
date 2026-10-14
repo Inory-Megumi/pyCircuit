@@ -59,13 +59,32 @@ compilePythonSourceUnit(ModuleOp transport, DictionaryAttr sourceOwner,
   lowering.addPass(detail::createAnalyzeRuleWritesPass());
   lowering.addPass(detail::createInferSourceBindingsPass(sourceOwner, headers));
   lowering.addPass(detail::createLowerPythonSourcePass(sourceOwner, headers));
-  auto simplify = acir::createSimplifyRecordWiresPass();
-  if (retainSourceImport)
-    lowering.addInstrumentation(std::make_unique<SourceImportInstrumentation>(
-        simplify.get(), body->getOperation(), capture));
-  lowering.addPass(std::move(simplify));
+  lowering.addPass(acir::createAnalyzeSourceMethodSummariesPass());
   if (failed(lowering.run(*body)))
     return failure();
+  bool transactions = false;
+  body->walk([&](Operation *operation) {
+    if (isa<ac::SourceStateOp, ac::SourceStateReadOp, ac::SourceStateWriteOp,
+            ac::SourceMethodOp, ac::SourceMethodCallOp,
+            ac::SourceTransactionOp>(operation))
+      transactions = true;
+    if (auto imported = dyn_cast<ac::ModuleImportOp>(operation))
+      transactions |= imported.getSemanticKind() == "transactions";
+  });
+  if (transactions && retainSourceImport)
+    return emitError()
+           << "source-import diagnostic requires lowered hardware; "
+              "source transaction effects are retained until link";
+  if (!transactions) {
+    PassManager hardware(transport.getContext());
+    auto simplify = acir::createSimplifyRecordWiresPass();
+    if (retainSourceImport)
+      hardware.addInstrumentation(std::make_unique<SourceImportInstrumentation>(
+          simplify.get(), body->getOperation(), capture));
+    hardware.addPass(std::move(simplify));
+    if (failed(hardware.run(*body)))
+      return failure();
+  }
   if (retainSourceImport && (capture.count != 1 || !capture.text))
     return emitError() << "source-import diagnostic boundary was not captured "
                           "exactly once";

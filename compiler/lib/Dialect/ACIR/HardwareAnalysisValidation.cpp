@@ -1,3 +1,4 @@
+#include "ACIRSourceContracts.h"
 #include "HardwareSourceChecks.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
@@ -106,6 +107,11 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
 }
 } // namespace
 LogicalResult HardwareAnalysis::verifyImport(ModuleImportOp imported) const {
+  if (failed(detail::verifyModuleImportSummarySelection(imported)))
+    return failure();
+  if (imported.getSemanticKind() != "hardware")
+    return imported.emitOpError()
+           << "hardware analysis cannot consume a transactions import";
   if (failed(primitiveSchema(*this, imported)))
     return failure();
   return success(succeeded(getImportDependencies(imported, {})));
@@ -114,6 +120,22 @@ LogicalResult
 detail::verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis) {
   auto package = analysis.getPackage();
   if (!package)
+    return failure();
+  auto layouts = package.walk([&](Operation *operation) {
+    if (!operation->hasAttr("ac.internal_ports"))
+      return WalkResult::advance();
+    if (!isa<ModuleOp>(operation)) {
+      operation->emitOpError()
+          << "ac.internal_ports is permitted only on a real module "
+             "in a final package";
+      return WalkResult::interrupt();
+    }
+    return failed(getModulePortLayout(operation)) ? WalkResult::interrupt()
+                                                  : WalkResult::advance();
+  });
+  if (layouts.wasInterrupted())
+    return failure();
+  if (failed(verifyNoUnloweredTransactions(package)))
     return failure();
   if (failed(collectFinalSourceUnits(package,
                                      [&] { return package.emitOpError(); })))
@@ -133,9 +155,7 @@ detail::verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis) {
                                     enumeration)))
       return failure();
   for (auto imported : package.getOps<ModuleImportOp>()) {
-    if (failed(primitiveSchema(analysis, imported)))
-      return failure();
-    if (failed(analysis.getImportDependencies(imported, {})))
+    if (failed(analysis.verifyImport(imported)))
       return failure();
     if (analysis.getPrimitiveKind(imported).empty())
       return imported.emitOpError() << "executable hardware package has "

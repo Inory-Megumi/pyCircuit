@@ -5,6 +5,8 @@
 #include <functional>
 
 namespace acir::ac::detail {
+class SourceCheckBudget;
+class SampledAdmissionValidation;
 mlir::LogicalResult
 verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis);
 mlir::LogicalResult verifySourceCheckDependencies(
@@ -14,7 +16,9 @@ mlir::LogicalResult verifySourceCheckDependencies(
         &debit);
 mlir::FailureOr<llvm::SmallVector<HardwareCheckBinding>>
 definitionSourceChecks(const HardwareAnalysis &analysis, ModuleOp definition,
-                       const HardwareBindings &bindings);
+                       const HardwareBindings &bindings,
+                       SampledAdmissionValidation &validation,
+                       SourceCheckBudget &budget);
 bool sameHardwareBindings(const HardwareBindings &lhs,
                           const HardwareBindings &rhs);
 mlir::LogicalResult

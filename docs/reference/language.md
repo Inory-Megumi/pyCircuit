@@ -424,12 +424,12 @@ contextual tuple/list fields, static defaults and recursive zero initialization.
 Imported nominal values retain their published identity; map does not broaden
 imported constructor/default admission inside callbacks.
 
-Map also accepts a same-source named `@rule` from the fixed scalar expression
-subset described below. Each Table element type must exactly match its formal
+Map also accepts a named ordinary typed `def` through the pure value-helper
+contract below. Each Table element type must exactly match its formal
 annotation, and the result is fixed Bits. The helper is typed once with generic
 row arguments and lowered through the existing map staging. Individual lane
 values do not supply range or constant authority for typing its body. These
-named callbacks may call other helpers in the same scalar subset.
+named callbacks may call other verified pure helpers within the callback operation limits.
 
 Captures are immutable call-time Bits/Enum/Struct snapshots. A captured Struct
 may contain Tables; explicitly indexed reads of captured Tables use the existing
@@ -503,8 +503,9 @@ loops. The body supports ordinary assignments, annotations, `pass`, existing
 `if`/conditional expressions, projections, proven Table indexing, fixed slices,
 `+`, `-`, `*`, `&`, `|`, `^`, supported unary/comparison/Boolean expressions,
 nominal Struct construction and contextual Table literals. Calls are limited to
-`concat`, `enum_to_bits` and existing same-source fixed scalar helpers. This does
-not broaden the fixed scalar helper or named Table callback expression subsets.
+`concat`, `enum_to_bits` and verified pure value helpers. This does not broaden
+the loop grammar or named Table callback restrictions; helper expansion is
+charged to the existing loop and source-wide budgets.
 Unary `not` and fixed-bit `~` retain their existing rules. Unary `+` and `-`
 are not implemented in this profile, including zero-trip bodies; binary
 subtraction such as `0 - 1` can produce a negative Integer.
@@ -598,9 +599,10 @@ they do not combine gated paths with an OR that would introduce spurious X.
 Predicates use the Boolean or authoritative fixed-one-bit boundary below.
 Check IDs, ordered obligations and condition/path result pairs are verified in
 the same source-unit and common hardware flow, including under Python `-O`.
-This is source/IR support: both emitters still reject `ac.expect` until the
-execution packet is complete. Compilation or linking does not establish runtime
-assertion checking. See source-check progress (historical local record).
+Both emitters consume verified source checks. C++ uses the shared whole-system
+check lifecycle; RTL assertions require the managed lifecycle described in
+[system execution](../architecture/system-execution.md). Compilation or linking
+alone does not establish runtime assertion checking.
 
 Statement `if` in behavioral rules and conditional expressions (`a if test else
 b`) share predicate and value-join rules. A condition must be Boolean or an
@@ -828,42 +830,63 @@ arguments for standard leaves. Source location differences do not change
 hardware type meaning. Bool literals become known width-appropriate bits;
 width/range mismatches remain errors.
 
-## Scalar rule expressions
+## Pure value helpers
 
-A same-source top-level bare `@rule` may also be called as a scalar expression
-when every parameter and the result declares unsigned fixed Bits and its body
-contains one final expression return. Optional docstrings and `pass` statements
-may precede that return. For example:
+Use an ordinary typed `def` for reusable combinational computation. A helper
+may be top-level or declared directly inside a Module/System. `@rule` identifies
+an autonomous registration and is not a helper decorator.
 
 ```python
-from pycircuit import rule, u8
+from pycircuit import u8
 
-@rule
 def bump(value: u8) -> u8:
-    return value + 1
+    result: u8 = value + 1
+    return result
 ```
 
-Signatures use existing fixed aliases or `bits[positive_integer_literal]`.
-Arguments must already have the exact declared fixed-bit type and authority;
-plain Integer literals and implicit widening are not admitted at this boundary.
-The expression body supports fixed addition, subtraction, multiplication,
-inversion, bitwise `&`, `|` and `^`, single comparisons and conditional
-expressions, using their existing width and four-state semantics. A direct
-nonnegative Integer literal may pair with a fixed operand. Literal-only
-arithmetic, shifts, indexing/slices and Table methods inside helper bodies
-remain unsupported. Conditions must be Boolean comparisons,
-Boolean literals or fixed one-bit values. Acyclic calls to helpers in this same
-subset are permitted, including finite nested arguments such as `bump(bump(x))`.
-Actual arguments are evaluated and bound once in source order.
+Helpers require typed ordinary positional parameters and an explicit zero/one
+result contract (`-> None` for no result). They reuse the existing hardware
+binding boundaries and logical types; physical width alone does not permit an
+Integer/Boolean/fixed-Bits conversion. Actual arguments are evaluated and bound
+once, in source order. Defaults, keywords, variadic and positional-only
+parameters are not admitted.
 
-These calls allocate no state and lower through the existing scalar operations.
-They share the source-wide resource budget with Table operations. Both branches
-are checked even when a condition is a literal. Recursion, effects, assignments,
-aggregate parameters/results, imported bodies and defaults/keywords remain
-unsupported. A helper can be supplied directly to a Table's `map` method;
-calls inside Table expression lambdas remain unsupported. Existing
-registered-rule calls retain their storage ownership, binding and source-check
-behavior.
+Bodies use existing typed expressions, local assignments and annotations,
+immutable Struct field updates, `if/else`, `pass` and one final return. Branches
+retain definite-assignment and four-state selection rules. Existing arithmetic,
+projection, constructor and Table restrictions still apply. Acyclic helper calls
+are allowed; loops, early returns, nested declarations inside helpers,
+allocation, Rule/Method calls, assertions and I/O are rejected even in dead
+paths. A helper cannot read a persistent owner implicitly; pass its ordinary
+payload explicitly.
+
+A nested helper captures ordinary SSA values at its declaration, including
+ordinary module-result wires. Later rebinding of the same name does not change
+the capture. Calls between nested helpers use each callee's declaration snapshot;
+local parameter/variable bindings retain normal lexical precedence. Helpers do
+not capture owner or instance handles, clocks or reset. Top-level helpers have
+no runtime captures; nested helpers remain private to their lexical module.
+
+Source units publish typed helper bodies through the existing interface owner.
+Consumers resolve that published closure without reading provider Python; link
+checks the owning body against the interface. Native validation checks purity,
+logical types, lexical ownership, recursion and bounded expansion before
+inlining or elimination. Source helper functions/calls do not survive in final
+hardware IR, and neither backend interprets Python helpers.
+
+Ordinary expressions, registered Rule/Method bodies, named Table callbacks and
+the existing bounded-loop caller share this helper implementation. Named Table
+callbacks retain their fixed-Bits and zero-capture restrictions; calls inside
+Table expression lambdas remain unsupported. Helper support does not establish
+Method final lowering or runtime execution. The transaction extension remains
+subject to its separate acceptance criteria.
+
+Each Rule declaration must be registered exactly once per Module/System
+instance, as a complete static statement call, assignment value or return value.
+Nested expression calls, callable-body calls, Table callbacks and loop/repeated
+registration are rejected. A pure autonomous Rule remains a Rule; its return
+type or absence of writes never silently converts it into a helper. Historical
+pure `@rule` helpers must be changed to typed `def` explicitly.
 
 ## Immutable local wires
 
@@ -994,7 +1017,90 @@ The first loop builds a native runner and executes the same IR as RTL against
 independent values. It does not add a shared-library port C ABI. Host Reset is
 not a clocked reset pulse or a promise to clear memory.
 
-## Remaining source capabilities
+## Method execution and remaining capabilities
+
+Native sampled-admission lowering and both backend lifecycles are implemented
+for straight-line, same-domain transactions over whole fixed-width Bits, with
+one outer writer per actual owner. The lowerer emits sampled-check metadata and
+complete transaction-wiring records. It authenticates the detached candidate
+against the original source plan, then invokes the canonical final hardware
+verifier before atomically replacing the input. Final-IR execution has focused
+C++ workers 1/2 and four-state RTL evidence. Public straight-line dynamic source
+tests cover independent transactions, cross-owner atomic calls and guard-entry
+candidate snapshots through the same final IR. They check committed state and
+clock history, including failure, Discard, Reset and frozen Work inputs.
+Method `@system` simulation closure remains unaccepted. The prior accepted
+checkpoint `44b888c5` remains historical evidence, not current verification.
+
+The compiler independently publishes a bounded subset of `@method` and nested
+transaction syntax as verified source units. Consumers use published interfaces
+without provider Python or method bodies. Shared IR analysis resolves receiver
+identities, checks the complete call/instance closure and proves conservative
+totality for valued Rules. Logical Boolean, Integer and fixed-bit contracts
+remain distinct across interfaces; ordinary typed-result modules retain their
+value-call behavior.
+
+This source-compilation subset retains fixed scalar state, sequential local
+assignments/calls, typed scalar/Struct results, lambda guards and static
+zero-argument Method-owner construction. It does not expand effectful branch,
+loop, aggregate-state or general static-parameter admission.
+
+A guarded nested Rule also selects typed transaction capture without requiring
+a dummy Method or state. A module such as `GuardOnly(enabled: u1)` may omit its
+module return annotation and register a zero-argument nested Rule with
+`-> None`. This does not admit module `-> None` or registration arguments.
+Source capture alone does not establish public dynamic-guard execution.
+Ordinary unguarded modules keep their existing source path.
+
+Native final link lowers whole scalar state represented by fixed-width Bits,
+repeated or nested Method calls through static ordinary instances in the same
+physical clock/reset domain, straight-line effects, and at most one outer Rule
+writer per actual owner.
+Calls share their outer transaction's candidate versions; saved ordinary values
+remain snapshots. Independent Rules read old Q, regardless of registration
+order. Separate structural instances retain independent state. Each state
+declaration uses one existing DFFE, preserving clock/reset, hold and discard;
+the same verified final artifact feeds C++ and Verilog.
+
+Every lowered transaction has explicit clock/reset captures, ordered guards,
+value-validity prefixes and a sampling-history binding. Literal true/false,
+state-free and read-only transactions follow the same route. Ordinary results
+escaping an outer Rule still require the conservative proof that all guards are true;
+sampling does not add a valid-result API or relax result escape restrictions.
+Each reached guard checks knownness at an active rising edge outside reset.
+A known false guard holds that transaction; an earlier reached X/Z guard
+causes whole-system zero commit even if a later guard is false. A false guard
+prevents checks for later, unreached guards. C++ and managed RTL freeze checks
+and physical pins during Work/PREPARE and commit history only after successful
+whole-system checks. Successful false-fire, held and falling samples maintain
+history; failure or Discard drops pending state and history.
+
+Cross-instance calls preserve original Module definitions and storage ownership.
+Ordinary internal ports carry old Q and lexical SSA to the caller and candidate
+D/E back to the owner; authors do not supply these connections. Original public
+root ports remain unchanged, including when the selected root definition is
+also used as a child elsewhere in the package. An occurrence without an
+external writer receives disabled proposals. Module-local expressions can
+save old Q as ordinary lexical SSA; later Method writes do not alter that
+snapshot. Aliases of one instance share candidates, while different instances
+of the same definition remain independent. Competing autonomous writers to
+one actual owner reject, including identity writes and unused definitions.
+
+The current routing subset rejects a definition requiring extra physical ports
+if that definition is also used by a Collection, and rejects transaction writer
+composition across a Collection. Unaffected existing Collections retain their
+original contracts; this does not add a source API for Method-owner collections.
+
+Partial or conditional effects, transaction resource operations and new
+transaction checks/observations still reject during lowering. Valid uncalled
+Method declarations remain fully published and checked before link removes
+them. This subset does not complete public dynamic-source admission,
+resource/causality handling, branch/partial state or Method `@system` simulation
+closure. Existing ordinary hardware and its system route
+retain their current contracts and limits.
+See the
+[extension specification](../rfcs/serial-rule-method/README.md) for its target
+semantics and explicit implementation boundaries.
 
 IR support for [Table/collections](spec-collections.md), packed structs and
 memory does not establish a Python authoring API for every operation. Beyond the

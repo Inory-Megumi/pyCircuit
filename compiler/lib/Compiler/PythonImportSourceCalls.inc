@@ -94,28 +94,7 @@ LogicalResult Importer::serializeSourceCall(ModuleDecl &decl) {
          b.getNamedAttr("ac.parameters", b.getArrayAttr(parameters)),
          b.getNamedAttr("ac.result_constraints", b.getArrayAttr({result}))});
   }
-  // Reuse the common declaration validator before any call is predeclared.
-  // The transient import uses the finalized physical signature and disappears
-  // before source body emission; it carries no alternate semantics or owner.
-  OpBuilder::InsertionGuard insertion(b);
-  b.setInsertionPointToEnd(body->getBody());
-  SmallVector<NamedAttribute> attrs{
-      b.getNamedAttr("sym_name", b.getStringAttr(decl.symbol.getValue())),
-      b.getNamedAttr("source_owner", owner),
-      b.getNamedAttr("parameters", b.getArrayAttr({})),
-      b.getNamedAttr("type_parameters", b.getArrayAttr({})),
-      b.getNamedAttr("function_type", TypeAttr::get(decl.type)),
-      b.getNamedAttr("input_names", portNames(b, decl.inputs)),
-      b.getNamedAttr("output_names", portNames(b, decl.outputs))};
-  if (decl.system)
-    attrs.push_back(b.getNamedAttr("ac.root_kind", b.getStringAttr("system")));
-  llvm::append_range(attrs, decl.sourceCallAttrs);
-  auto signature =
-      createOp(b, decl.node.location(b.getContext(), source.path),
-               ac::ModuleImportOp::getOperationName(), {}, {}, attrs);
-  auto valid = ac::detail::verifyModuleSourceCallContract(signature);
-  signature->erase();
-  return valid;
+  return success();
 }
 FailureOr<CallableDecl> Importer::callable(const AstNode &function) {
   auto binding = lookupBinding(function);
@@ -153,23 +132,51 @@ FailureOr<CallableDecl> Importer::callable(const AstNode &function) {
     constraints = view.sourceResultConstraints;
     domain = view.domainInputs;
   }
-  auto restore = [&](DictionaryAttr constraint, StringRef name) -> Port {
-    auto kind = constraint.getAs<StringAttr>("source_kind").getValue();
-    std::optional<ac::detail::ValueKind> sourceKind;
-    if (kind == "boolean")
-      sourceKind = ac::detail::ValueKind::Boolean;
-    if (kind == "integer")
-      sourceKind = ac::detail::ValueKind::Integer;
-    return {name.str(), constraint.getAs<TypeAttr>("type").getValue(), function,
-            sourceKind, kind == "fixed_bits"};
-  };
   for (Attribute raw : parameters) {
     auto parameter = cast<DictionaryAttr>(raw);
     result.inputs.push_back(
-        restore(parameter.getAs<DictionaryAttr>("constraint"),
-                parameter.getAs<StringAttr>("name").getValue()));
+        sourceCallPort(parameter.getAs<DictionaryAttr>("constraint"),
+                       parameter.getAs<StringAttr>("name").getValue(),
+                       function));
   }
-  result.result = restore(cast<DictionaryAttr>(constraints[0]), "");
+  result.result = sourceCallPort(cast<DictionaryAttr>(constraints[0]), "",
+                                 function);
   result.needsDomain = !domain.empty();
   return result;
+}
+
+Port Importer::sourceCallPort(DictionaryAttr constraint, StringRef name,
+                             const AstNode &callSite) const {
+  StringRef kind = constraint.getAs<StringAttr>("source_kind").getValue();
+  std::optional<ac::detail::ValueKind> sourceKind;
+  if (kind == "boolean")
+    sourceKind = ac::detail::ValueKind::Boolean;
+  if (kind == "integer")
+    sourceKind = ac::detail::ValueKind::Integer;
+  return {name.str(), constraint.getAs<TypeAttr>("type").getValue(), callSite,
+          sourceKind, kind == "fixed_bits"};
+}
+
+bool Importer::methodOwner(const AstNode &function) const {
+  if (function.kind() == "Name" &&
+      methodOwnerNames.contains(function.string("id")) &&
+      !lexicallyShadowed(function, function.string("id")))
+    return true;
+  auto binding = lookupBinding(function);
+  if (!binding || binding->category != BindingCategory::Module)
+    return false;
+  auto view = headers.lookupModule(binding->symbol);
+  auto methods = view && view.transactionSummary
+                     ? view.transactionSummary.getAs<ArrayAttr>("methods")
+                     : ArrayAttr();
+  // A transaction parent with ordinary inputs/results is a value module,
+  // even when its transitive closure requires transaction publication.
+  if (!methods || methods.empty() || !view.parameters.empty() ||
+      !view.typeParameters.empty() || !view.domainInputs ||
+      view.functionType.getNumResults() != 0 ||
+      view.functionType.getNumInputs() != view.domainInputs.size() ||
+      (view.sourceParameters && !view.sourceParameters.empty()) ||
+      (view.sourceResultConstraints && !view.sourceResultConstraints.empty()))
+    return false;
+  return !view.sourceReturnForm || view.sourceReturnForm.getValue() == "none";
 }

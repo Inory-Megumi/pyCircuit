@@ -4,6 +4,43 @@ LogicalResult Importer::inferModuleGraph() {
     for (size_t i = 0; i < decl.sourceInputCount; ++i)
       if (local.contains(decl.inputs[i].name))
         return error() << "module input shadows a source module";
+    llvm::StringMap<AstNode> nestedRules;
+    llvm::StringSet<> structuralInstances;
+    for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
+      auto statement = decl.node.item("body", i);
+      if (statement.kind() == "FunctionDef" && hasDecorator(statement, "rule"))
+        nestedRules[statement.string("name")] = statement;
+      if (statement.kind() == "Assign" && statement.array("targets").size() == 1 &&
+          statement.item("targets", 0).kind() == "Name" && moduleCall(statement.child("value"))) {
+        auto binding = lookupBinding(statement.child("value").child("func"));
+        bool direct = false;
+        if (binding && binding->category == BindingCategory::Module) {
+          if (auto found = local.find(statement.child("value").child("func").string("id")); found != local.end())
+            direct = modules[found->second].returnShape == ReturnShape::Struct || modules[found->second].sourceInputCount;
+          else {
+            auto view = headers.lookupModule(binding->symbol);
+            direct = view && view.hasSourceCallContract();
+          }
+          if (!direct) structuralInstances.insert(statement.item("targets", 0).string("id"));
+        }
+      }
+    }
+    auto structuralRule = [&](const AstNode &rule) {
+      bool behavior = false;
+      for (size_t i = 0; i < rule.array("body").size(); ++i) {
+        auto statement = rule.item("body", i);
+        if (docstring(statement) || statement.kind() == "Pass") continue;
+        if (statement.kind() == "Assert") { behavior = true; continue; }
+        auto call = statement.kind() == "Expr" ? statement.child("value") : AstNode();
+        if (call.kind() == "Call" &&
+            (intrinsic(call.child("func"), "log") || intrinsic(call.child("func"), "report") ||
+             (call.child("func").kind() == "Name" && structuralInstances.contains(call.child("func").string("id"))))) {
+          behavior = true; continue;
+        }
+        return false;
+      }
+      return behavior;
+    };
     auto walk = [&](auto &&self, const AstNode &node,
                     bool controlled) -> LogicalResult {
       if (node.kind() == "FunctionDef" || node.kind() == "Lambda")
@@ -25,6 +62,10 @@ LogicalResult Importer::inferModuleGraph() {
         auto binding = lookupBinding(function);
         if (binding && binding->category == BindingCategory::Enum)
           return error() << "nominal declaration is not a module constructor";
+        if (nestedRules.contains(name) && !structuralRule(nestedRules[name])) {
+          if (controlled) return error() << "Rule registration under runtime control is unsupported";
+          decl.behavioral = true;
+        }
         if (behavioralRules.contains(name)) {
           if (controlled)
             return error() << "behavioral rule calls under runtime control are "
@@ -36,6 +77,14 @@ LogicalResult Importer::inferModuleGraph() {
           auto view = headers.lookupModule(binding->symbol);
           if (view && view.domainInputs)
             decl.queueDomain |= !view.domainInputs.empty();
+          if (view && view.semanticKind &&
+              view.semanticKind.getValue() == "transactions") {
+            decl.transactionEffects = true;
+            decl.behavioral = true;
+            if (methodOwner(function) && controlled)
+              return error() << "Method owner construction under runtime "
+                                "control is unsupported";
+          }
           if (view && view.hasSourceCallContract()) {
             if (controlled)
               return error() << "direct module calls under runtime control are "
@@ -45,6 +94,12 @@ LogicalResult Importer::inferModuleGraph() {
         }
         if (auto found = local.find(name); found != local.end()) {
           edges[index].push_back(found->second);
+          if (modules[found->second].methodOwner) {
+            if (controlled)
+              return error() << "Method owner construction under runtime control is unsupported";
+            decl.transactionEffects = true;
+            decl.behavioral = true;
+          }
           if (modules[found->second].returnShape == ReturnShape::Struct ||
               !node.array("args").empty()) {
             if (controlled)
@@ -83,11 +138,13 @@ LogicalResult Importer::inferModuleGraph() {
       return success();
     marks[index] = 1;
     bool domain = modules[index].system || modules[index].persistent ||
-                  modules[index].queueDomain;
+                  modules[index].queueDomain || modules[index].transactionEffects;
     for (size_t child : edges[index]) {
       if (failed(self(self, child)))
         return failure();
       domain |= modules[child].needsDomain;
+      modules[index].transactionEffects |= modules[child].transactionEffects;
+      modules[index].behavioral |= modules[child].transactionEffects;
     }
     modules[index].needsDomain = domain;
     marks[index] = 2;
@@ -219,7 +276,7 @@ LogicalResult Importer::predeclareDirectCalls(ModuleDecl &decl, OpBuilder &at) {
       if (failed(
               declareQueue(found->second, decl, at, nextName("__pyc_queue_"))))
         return failure();
-    } else if (moduleCall(node) &&
+    } else if (moduleCall(node) && !methodOwner(node.child("func")) &&
                !structuralCallSites.contains(
                    sourceOccurrence(at, decl.symbol, node))) {
       auto callee = callable(node.child("func"));

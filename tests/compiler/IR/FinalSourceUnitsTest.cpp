@@ -23,7 +23,7 @@ const char *native = R"mlir(
   }) {sym_name = "top", source_owner = {package = "", path = "top.py"}, parameters = [], type_parameters = [], function_type = (!b1) -> !b1, input_names = ["input"], output_names = ["output"]} : () -> ()
   "ac.enum"() {sym_name = "shared.State", width = #ac.math_int<1>, encoding = "explicit", members = [{name = "OFF", code = #ac.math_int<0>}]} : () -> ()
   ac.struct "shared.Record" fields [{name = "value", type = !b1}]
-  "ac.module.import"() {sym_name = "storage", source_owner = {package = "gfsim", path = "dffe.py"}, parameters = [], type_parameters = ["T"], function_type = (!b1, !b1, !b1, !ac.type_param<@storage, "T">, !ac.type_param<@storage, "T">) -> !ac.type_param<@storage, "T">, input_names = ["clk", "rst", "en", "d", "init"], output_names = ["q"], primitive_kind = "dffe", dependency_summary = [{output = {port = 0 : i64, path = []}, inputs = []}]} : () -> ()
+  "ac.module.import"() {semantic_kind = "hardware", sym_name = "storage", source_owner = {package = "gfsim", path = "dffe.py"}, parameters = [], type_parameters = ["T"], function_type = (!b1, !b1, !b1, !ac.type_param<@storage, "T">, !ac.type_param<@storage, "T">) -> !ac.type_param<@storage, "T">, input_names = ["clk", "rst", "en", "d", "init"], output_names = ["q"], primitive_kind = "dffe", dependency_summary = [{output = {port = 0 : i64, path = []}, inputs = []}]} : () -> ()
 )mlir";
 class FinalSourceUnitsTest : public ::testing::Test {
 protected:
@@ -110,5 +110,33 @@ TEST_F(FinalSourceUnitsTest, ExactOwnerShapeOrderingAndSubsetFailClosed) {
   rejects([&](mlir::ModuleOp unit, Builder &b) {
     (*unit.getOps<ac::EnumOp>().begin())->setAttr("ac.source_owner", b.getDictionaryAttr({b.getNamedAttr("path", b.getStringAttr("types.py"))}));
   }, "SourceOwner");
+}
+TEST_F(FinalSourceUnitsTest, SampledTransactionMetadataIsFinalOnly) {
+  for (StringRef name : {"ac.sampled_admission", "ac.transaction_wiring"}) {
+    SCOPED_TRACE(name.str());
+    auto unit = parse();
+    ASSERT_TRUE(unit);
+    Builder b(&context);
+    auto module = *unit->getOps<ac::ModuleOp>().begin();
+    module->setAttr(name, b.getDictionaryAttr({}));
+    for (bool body : {false, true}) {
+      diagnostics.clear();
+      ScopedDiagnosticHandler handler(&context, [&](Diagnostic &diagnostic) {
+        llvm::raw_string_ostream out(diagnostics);
+        diagnostic.print(out);
+        return success();
+      });
+      auto emitError = [&] { return unit->emitError(); };
+      if (body)
+        EXPECT_TRUE(failed(ac::verifySourceBodyStructure(*unit, emitError)));
+      else
+        EXPECT_TRUE(
+            failed(ac::verifySourceInterfaceStructure(*unit, emitError)));
+      EXPECT_NE(diagnostics.find(name.str()), std::string::npos) << diagnostics;
+      EXPECT_NE(diagnostics.find("forbidden in source bodies and interfaces"),
+                std::string::npos)
+          << diagnostics;
+    }
+  }
 }
 } // namespace
