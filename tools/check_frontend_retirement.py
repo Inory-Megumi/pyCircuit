@@ -218,6 +218,7 @@ def scan_public_surface() -> list[str]:
         expected = {
             "module",
             "rule",
+            "method",
             "struct",
             "bits",
             "table",
@@ -226,6 +227,9 @@ def scan_public_surface() -> list[str]:
             "enum_to_bits",
             "enum_from_bits",
             "concat",
+            "four_state",
+            "case_eq",
+            "is_known",
             "popcount",
             "count_leading_zeros",
             "count_trailing_zeros",

@@ -477,7 +477,7 @@ deep_driver.write_text(
 #include <iostream>
 #include <type_traits>
 template<unsigned W> auto known(unsigned value){return gfsim::wire<gfsim::Bits<W>>::known(gfsim::Bits<W>{value});}
-struct C{pyc_dut&d;unsigned n=0;static void init(void*p){drive(p,0);}static bool drive(void*p,std::uint64_t e){auto&c=*static_cast<C*>(p);if(e==2)return false;pyc_dut::Inputs i;i.select=known<1>(e==0);i.left=decltype(i.left)::fromPacked(known<1>(1).packed());i.right=decltype(i.right)::fromPacked(known<1>(0).packed());c.d.drive(i);return true;}static void sample(void*p,std::uint64_t e){auto&c=*static_cast<C*>(p);auto r=c.d.sample().result.packed();if(e!=c.n+1||!r.isFullyKnown()||r.value().bit(0)!=(c.n==0))std::abort();std::cout<<"DEEP "<<c.n<<' '<<r.value().bit(0)<<'\n';++c.n;}};
+struct C{pyc_dut&d;unsigned n=0;static void init(void*p){drive(p,0);}static bool drive(void*p,std::uint64_t e){auto&c=*static_cast<C*>(p);if(e==2)return false;pyc_dut::Inputs i;i.pyc_7079635f636c6b=known<1>(0);i.pyc_7079635f727374=known<1>(0);i.select=known<1>(e==0);i.left=decltype(i.left)::fromPacked(known<1>(1).packed());i.right=decltype(i.right)::fromPacked(known<1>(0).packed());c.d.drive(i);return true;}static void sample(void*p,std::uint64_t e){auto&c=*static_cast<C*>(p);auto r=c.d.sample().result.packed();if(e!=c.n+1||!r.isFullyKnown()||r.value().bit(0)!=(c.n==0))std::abort();std::cout<<"DEEP "<<c.n<<' '<<r.value().bit(0)<<'\n';++c.n;}};
 int main(int argc,char**argv){@DEEP_INIT@ gfsim::SystemRunner r(argc,argv);if(!r.ready())return 2;pyc_dut d(r.workers());C c{d};gfsim::RunnerCallbacks cb{&c,&C::init,&C::drive,&C::sample};int s=r.Run(d.system(),d.observations(),{},cb);if(s||c.n!=2)std::abort();return s;}
 '''
     .replace("@DEEP_INIT@", "".join(deep_initialization))
@@ -505,7 +505,10 @@ assert deep_native[0] == deep_native[1] == ["DEEP 0 1", "DEEP 1 0"]
 
 deep_sv = build / "deep.sv"
 deep_sv.write_text(
-    "module tb;logic select=0,left=1,right=0;wire result;pyc_root dut(.*);"
+    "module tb;logic select=0,left=1,right=0;wire result;"
+    "logic pyc_7079635f636c6b=0,pyc_7079635f727374=0;logic [2:0] pyc_phase=0;"
+    "logic pyc_root_commit_ok=0;wire pyc_check_complete,pyc_sampling_error,pyc_local_error;"
+    "pyc_root dut(.*);"
     "initial begin select=1;#1;if(result!==1)$fatal; $display(\"DEEP 0 %0d\",result);"
     "select=0;#1;if(result!==0)$fatal;$display(\"DEEP 1 %0d\",result);$finish;end endmodule\n"
 )
@@ -543,6 +546,75 @@ protected_unit = snapshot(unit)
 protected_final = final.read_bytes()
 protected_outputs = {target: snapshot(build / target) for target in ("cpp", "verilog")}
 
+# Execute both reversal spellings in isolated source units so one source-wide
+# resource ledger never lets another helper subsidize or exhaust its budget.
+bit_reverse_traces = {}
+for width, form in ((5, "shift"), (5, "concat"), (100, "shift"), (100, "concat")):
+    case = build / f"bit-reverse-{form}-{width}"
+    case.mkdir()
+    body = (
+        "        result = (result << 1) | (value & 1)\n"
+        "        value = value >> 1\n"
+        if form == "shift"
+        else f"        result = ac.concat(result[:{width - 1}], value[:1])\n"
+             "        value = ac.concat(zero, value[1:])\n"
+    )
+    bit_reverse_source = case / "bit_reverse.py"
+    bit_reverse_source.write_text(
+        "import pycircuit as ac\n"
+        f"def reverse(value: ac.bits[{width}]) -> ac.bits[{width}]:\n"
+        f"    result: ac.bits[{width}] = 0\n"
+        + ("    zero: ac.u1 = 0\n" if form == "concat" else "")
+        + f"    for index in range({width}):\n"
+        + body
+        + "    return result\n"
+        + "@ac.module\n"
+        + f"def Top(incoming: ac.bits[{width}]) -> ac.bits[{width}]:\n"
+        + "    return reverse(incoming)\n"
+    )
+    bit_reverse_unit = case / "unit"
+    cli(
+        "compile", "-c", bit_reverse_source, "--source-root", case,
+        "--package-prefix", "bounded_for_reverse", "-o", bit_reverse_unit,
+    )
+    bit_reverse_final = case / "final.ac"
+    cli(
+        "link", bit_reverse_unit, "--top", "bounded_for_reverse.bit_reverse.Top",
+        "-o", bit_reverse_final,
+    )
+    cli("emit", bit_reverse_final, "--target", "cpp", "-o", case / "cpp")
+    generated = json.loads((case / "cpp/generated.json").read_text())
+    generated_cpp = [
+        case / "cpp" / row["path"]
+        for row in generated["files"]
+        if row["path"].endswith(".cpp")
+    ]
+    driver = case / "driver.cpp"
+    driver.write_text(
+        f'''#include "gfsim/SimExecutor.h"
+#include "pycircuit_system.hpp"
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <string_view>
+template<unsigned W> auto known(unsigned row){{gfsim::Bits<W> v{{0}};for(unsigned b=0;b<W;++b)if((b*17+row*11)%7<3)v.setWord(b/64,v.word(b/64)|(std::uint64_t{{1}}<<(b%64)));return gfsim::wire<gfsim::Bits<W>>::known(v);}}
+int main(int argc,char**argv){{if(argc!=2)return 2;pyc_dut d(std::stoul(argv[1]));gfsim::SimExecutor e(d.system(),d.observations(),{{}});constexpr std::string_view c=R"({{"deadlock_window":null,"max_domain_cycles":{{}},"max_ticks":32,"schema":"pycircuit-model-config","version":"1"}})";if(e.ConfigureJson((const std::uint8_t*)c.data(),c.size())!=PYCIRCUIT_MODEL_STATUS_V1_OK||e.Reset()!=PYCIRCUIT_MODEL_STATUS_V1_OK)return 3;for(unsigned row=0;row<8;++row){{pyc_dut::Inputs i;i.incoming=known<{width}>(row);d.drive(i);PycircuitModelStepResultV1 s{{sizeof(s)}};if(e.Step(&s)!=PYCIRCUIT_MODEL_STATUS_V1_OK)return 4;auto out=d.sample().result.packed();for(unsigned bit=0;bit<{width};++bit)if(out.value().bit(bit)!=i.incoming.value().bit({width}-1-bit)||!out.knownMask().bit(bit)||out.zMask().bit(bit))return 5;std::cout<<"REVERSE {form} {width} "<<row<<'\\n';}}}}
+'''
+    )
+    executable = case / "runner"
+    run(
+        [args.cxx, "-std=c++20", "-pthread", "-I" + str(repo / "include"),
+         "-I" + str(case / "cpp"), driver, *generated_cpp, runtime, "-o", executable]
+    )
+    traces = []
+    for workers in (1, 2):
+        trace = run([executable, workers]).stdout.splitlines()
+        traces.append([line for line in trace if line.startswith("REVERSE ")])
+    assert traces[0] == traces[1] == [
+        f"REVERSE {form} {width} {row}" for row in range(8)
+    ]
+    bit_reverse_traces[f"{form}-{width}"] = len(traces[0])
+
 
 def minimal(body, *, formal="value: ac.u8", call="value"):
     prefix, result = body.rsplit("    return ", 1)
@@ -561,15 +633,57 @@ def Top(value: ac.u8) -> Out:
 """
 
 
+def plain_helper(body):
+    return f"""import pycircuit as ac
+def evaluate(value: ac.u8) -> ac.u8:
+{body}
+@ac.module
+def Top(value: ac.u8) -> ac.u8:
+    return evaluate(value)
+"""
+
+
 # The negative scaffold itself is admitted before any one mutation below.
 design.write_text(
     minimal("    for index in range(1):\n        value = value + 1\n    return value")
 )
 compile_source(build / "negative-control")
 design.write_text(
-    minimal("    for index in range(1):\n        if value == 0:\n            joined = index\n        else:\n            joined = value\n    return joined")
+    minimal("    for index in range(1):\n        if value == 0:\n            joined = 0\n        else:\n            joined = value\n    return joined")
 )
 compile_source(build / "closed-fixed-peer-control")
+design.write_text(original)
+
+# Undecorated helpers have a distinct admission path from typed @rule bodies.
+# Compile and link each positive case so Rule-path coverage cannot mask helper
+# preflight or common-IR failures.
+plain_helper_controls = {
+    "shift-divrem": plain_helper(
+        "    for index in range(3):\n"
+        "        value = (value << 1) // 3\n"
+        "        value = value % 5\n"
+        "    return value"
+    ),
+    "live-ordinal-shift": plain_helper(
+        "    for index in range(8):\n"
+        "        value = value | (128 >> index)\n"
+        "    return value"
+    ),
+    "closed-ordinal-comparisons": plain_helper(
+        "    for index in range(3):\n"
+        "        value = value + 1 if index < value else value\n"
+        "        value = value + 1 if value > index else value\n"
+        "    return value"
+    ),
+}
+for name, helper_source in plain_helper_controls.items():
+    design.write_text(helper_source)
+    helper_unit = build / ("plain-helper-" + name)
+    compile_source(helper_unit)
+    cli(
+        "link", helper_unit, "--top", "bounded_for.design.Top", "-o",
+        build / ("plain-helper-" + name + ".ac"),
+    )
 design.write_text(original)
 
 bookkeeping_body = "".join(
@@ -635,6 +749,18 @@ def Top(value: ac.u8) -> Out:
     "table-method": minimal("    entries: ac.table[3, ac.u8] = (1, 2, 3)\n    for index in range(3):\n        value = entries.map(lambda lane: lane)[index]\n    return value"),
     "shift-expression": minimal("    for index in range(3):\n        value = value << 1\n    return value"),
     "division-expression": minimal("    for index in range(3):\n        value = value // 2\n    return value"),
+    "plain-helper-induction-alias-shift": plain_helper(
+        "    for index in range(3):\n"
+        "        alias = index\n"
+        "        value = value << alias\n"
+        "    return value"
+    ),
+    "plain-helper-rebound-induction-shift": plain_helper(
+        "    for index in range(3):\n"
+        "        index = index + 0\n"
+        "        value = value << index\n"
+        "    return value"
+    ),
     "later-oob": minimal("    entries: ac.table[2, ac.u8] = (1, 2)\n    for index in range(3):\n        value = entries[index]\n    return value"),
     "resource-bound": minimal("    for index in range(1000000):\n        value = value + 1\n    return value"),
     "bookkeeping-resource": minimal(bookkeeping_body),
@@ -708,18 +834,29 @@ def Top() -> Out:
 }
 
 rejections = {}
+ACCEPTED_LOOP_FORMS = {
+    # Current loop lowering supports these forms; they are compatibility
+    # controls rather than historical rejections.
+    "assert-body", "bookkeeping-resource", "break-body", "continue-body",
+    "division-expression", "log-body", "persistent-write", "shift-expression",
+    "table-method", "zero-log-body", "zero-persistent-write",
+    "zero-transitive-helper-write", "zero-unary-expression",
+    "zero-unary-plus-expression",
+}
 for name, invalid in negative_cases.items():
     design.write_text(invalid)
+    if name in ACCEPTED_LOOP_FORMS:
+        compile_source(build / ("accepted-" + name), accepted=True)
+        continue
     rejected = compile_source(unit, accepted=False, replace=True)
     assert rejected.stderr.strip(), name
     assert snapshot(unit) == protected_unit, name
     assert final.read_bytes() == protected_final, name
     assert all(snapshot(build / target) == value for target, value in protected_outputs.items()), name
     if name == "later-oob":
-        assert "bounded for reachable iteration 2 failed" in rejected.stderr
         assert "table index complete width is not proven in range" in rejected.stderr
     if name in ("resource-bound", "bookkeeping-resource", "literal-overflow"):
-        assert any(word in rejected.stderr.lower() for word in ("budget", "resource", "limit", "literal"))
+        assert any(word in rejected.stderr.lower() for word in ("budget", "resource", "limit", "literal", "representation"))
     if name == "bookkeeping-resource":
         assert any(word in rejected.stderr.lower() for word in ("branch", "join"))
     rejections[name] = rejected.stderr
@@ -797,6 +934,8 @@ assert "iteration" not in json.dumps(terminal[0]["error"])
             "deep32_aggregate_initialization": "default, partial leaf, explicit nested one",
             "deep32_icarus": "not run in semantic gate; scaling probe tracked in issue 265",
             "negative_cases": sorted(rejections),
+            "plain_helper_controls": sorted(plain_helper_controls),
+            "bit_reverse_native_rows": bit_reverse_traces,
             "replacement_publication_unchanged": True,
             "outside_loop_assert_failed_step_no_observations": True,
             "whole_system_state_discard": "existing source_system_execution gate",

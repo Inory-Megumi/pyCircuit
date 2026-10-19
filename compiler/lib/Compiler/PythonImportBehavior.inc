@@ -77,7 +77,9 @@ FailureOr<Value> Importer::materializeMatchKey(const MatchPatternKey &key,
 LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
                                        FlatSymbolRefAttr ownerSymbol,
                                        BranchEnvironment &environment,
-                                       llvm::StringSet<> &owners) {
+                                       llvm::StringSet<> &owners,
+    llvm::function_ref<LogicalResult(const AstNode &, OpBuilder &, BranchEnvironment &)> emitArm,
+    llvm::StringMap<Instance *> *sourceInstances) {
   using ac::detail::ValueKind;
   auto syntax = readMatchSyntax(statement, [&](const AstNode &site) {
     return mlir::emitError(site.location(b.getContext(), source.path));
@@ -105,11 +107,20 @@ LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
   }
   BranchEnvironment incoming = environment;
   llvm::StringMap<Instance *> noInstances;
-  auto &instances = activeRule && activeRule->instances ? *activeRule->instances
-                                                        : noInstances;
+  auto &instances = sourceInstances          ? *sourceInstances
+                    : activeModuleStatements ? activeModuleStatements->instances
+                    : activeRule && activeRule->instances
+                        ? *activeRule->instances
+                        : noInstances;
   auto subjectSite = statement.child("subject");
-  auto subject =
-      expression(subjectSite, at, ownerSymbol, incoming.values, instances);
+  auto subject = [&]() {
+    bool saved = activeSourceEffects && activeSourceEffects->pureExpression;
+    if (activeSourceEffects) activeSourceEffects->pureExpression = true;
+    auto restore = llvm::scope_exit([&] {
+      if (activeSourceEffects) activeSourceEffects->pureExpression = saved;
+    });
+    return expression(subjectSite, at, ownerSymbol, incoming.values, instances);
+  }();
   if (failed(subject))
     return failure();
   auto diagnostic = [&] {
@@ -251,7 +262,7 @@ LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
         predicate =
             createOp(at, key.site.location(b.getContext(), source.path),
                      ac::BitsBinaryOp::getOperationName(), {previous, *equal},
-                     TypeRange{bits(1, key.site, ownerSymbol)},
+                     TypeRange{internalBits(1, key.site, ownerSymbol)},
                      {at.getNamedAttr("opcode", at.getStringAttr("or"))})
                 ->getResult(0);
         remember(predicate, ValueKind::Boolean);
@@ -261,6 +272,37 @@ LogicalResult Importer::matchStatement(const AstNode &statement, OpBuilder &at,
       }
     }
     predicates.push_back(predicate);
+  }
+  if (emitArm) {
+    std::function<LogicalResult(size_t, OpBuilder &, BranchEnvironment &)> lower;
+    lower = [&](size_t index, OpBuilder &at, BranchEnvironment &environment) -> LogicalResult {
+      if (index == syntax->size()) return success();
+      const auto &arm = (*syntax)[index];
+      if (arm.catchAll) return emitArm(arm.originalSite, at, environment);
+      if (failed(chargeLoopDescriptorWork(arm.originalSite, "source match branch")) ||
+          failed(reserveSourceEnvironmentCopies(arm.originalSite, environment))) return failure();
+      auto predicate = predicateView(predicates[index], arm.originalSite, ownerSymbol);
+      if (failed(predicate)) return failure();
+      auto branch = cast<ac::SourceBranchOp>(createOp(at,
+          arm.originalSite.location(b.getContext(), source.path),
+          ac::SourceBranchOp::getOperationName(), {predicate->value}, {},
+          {at.getNamedAttr("occurrence", sourceOccurrence(at, ownerSymbol, arm.originalSite)),
+           at.getNamedAttr("ac.condition_location", sourceSpan(at, source.path, subjectSite))}, 2));
+      branch.getThenRegion().push_back(new Block());
+      branch.getElseRegion().push_back(new Block());
+      OpBuilder thenAt = OpBuilder::atBlockEnd(&branch.getThenRegion().front());
+      OpBuilder elseAt = OpBuilder::atBlockEnd(&branch.getElseRegion().front());
+      BranchEnvironment yes = environment, no = environment;
+      if (failed(emitArm(arm.originalSite, thenAt, yes)) ||
+          failed(lower(index + 1, elseAt, no))) return failure();
+      auto joined = joinBranches(*predicate, environment, yes, no, arm.originalSite,
+                                  at, ownerSymbol, branch);
+      if (failed(joined)) return failure();
+      environment = std::move(*joined);
+      return success();
+    };
+    environment = std::move(incoming);
+    return lower(0, at, environment);
   }
   SmallVector<BranchEnvironment> environments;
   Value remaining;
@@ -472,7 +514,8 @@ Importer::preflightForCapabilities(const AstNode &statement,
                                    operation.kind())
               : llvm::is_contained(ArrayRef<StringRef>{"Add", "Sub", "Mult",
                                                        "BitAnd", "BitOr",
-                                                       "BitXor"},
+                                                       "BitXor", "LShift",
+                                                       "RShift", "FloorDiv", "Mod"},
                                    operation.kind());
       if (!admitted)
         return diagnostic() << "bounded for binary operation is unsupported";
@@ -500,11 +543,16 @@ Importer::preflightForCapabilities(const AstNode &statement,
       if (failed(chargeSourceWalk(function, inspected)) ||
           !pureCheckedAdd(summary.nodes, 1))
         return failure();
+      if (intrinsic(function, "four_state")) {
+        auto pattern = fourStatePattern(node);
+        return success(succeeded(pattern));
+      }
       auto binding = lookupBinding(function);
       bool constructor =
           binding && binding->category == BindingCategory::Struct;
       if (!constructor && !concatCall(node) &&
-          !intrinsic(function, "enum_to_bits")) {
+          !intrinsic(function, "enum_to_bits") &&
+          !intrinsic(function, "case_eq") && !intrinsic(function, "is_known")) {
         auto helper = resolveValueHelper(function, activeBehavioralDecl ?
             activeBehavioralDecl->symbol : FlatSymbolRefAttr());
         if (failed(helper) || !*helper)
@@ -784,14 +832,29 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
         return failure();
       return scalar(base->precision);
     }
-    if (failed(visit(index)))
+    auto count = visit(index);
+    if (failed(count))
       return failure();
     auto table = dyn_cast_or_null<ac::TableType>(base->type);
-    if (!table)
-      return diagnostic() << "bounded for indexed value lacks a declared Table";
-    if (!operation(1))
+    if (table) {
+      if (!operation(1))
+        return failure();
+      return typed(table.getElementType());
+    }
+    if (base->type && !isa<ac::BitsType>(base->type))
+      return diagnostic()
+             << "bounded for indexed value requires fixed bits or a Table";
+    // The normalizer keeps max(data,index) precision for the shift. Reserve
+    // the index boundary, two operand width normalizations, shift, possible
+    // result narrowing and final bit extraction. Actual source-kind/range
+    // admission stays with expression(), as for ordinary scalar arithmetic.
+    if (!operation(6))
       return failure();
-    return typed(table.getElementType());
+    envelope.precision = std::max(envelope.precision,
+                                  std::max(base->precision, count->precision));
+    envelope.words =
+        std::max(envelope.words, std::max(base->words, count->words));
+    return scalar(1);
   }
   if (node.kind() == "UnaryOp") {
     auto input = visit(node.child("operand"));
@@ -813,6 +876,15 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     if (node.kind() == "BinOp" && node.child("op").kind() == "Mult") {
       width = left->precision;
       if (!pureCheckedAdd(width, right->precision))
+        return failure();
+    }
+    if (!comparison && (node.child("op").kind() == "FloorDiv" ||
+                        node.child("op").kind() == "Mod")) {
+      // The existing constant-divisor lowerer uses a reciprocal product of
+      // 2*inputWidth + ceil(log2(divisor)) bits. A fitting positive divisor
+      // bounds this by 3*inputWidth. Remainder emits seven operations; retain
+      // room for boundary identities without inventing a loop arithmetic path.
+      if (!pureCheckedProduct(3, width, width) || !operation(3))
         return failure();
     }
     if (!pureCheckedAdd(width, 2))
@@ -872,6 +944,21 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
   }
   if (node.kind() == "Call") {
     auto function = node.child("func");
+    if (intrinsic(function, "four_state")) {
+      auto pattern = fourStatePattern(node);
+      if (failed(pattern) || !operation(1) ||
+          !pureCheckedAdd(envelope.patternBytes, pattern->size()))
+        return failure();
+      return scalar(pattern->size());
+    }
+    if (intrinsic(function, "case_eq") || intrinsic(function, "is_known")) {
+      for (size_t i = 0; i < node.array("args").size(); ++i)
+        if (failed(visit(node.item("args", i))))
+          return failure();
+      if (!operation(3))
+        return failure();
+      return scalar(1);
+    }
     auto binding = lookupBinding(function);
     if (binding && binding->category == BindingCategory::Struct) {
       auto type = ac::StructType::get(
@@ -964,26 +1051,38 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
                                      copies, name.size()) &&
         TableQueryBudget::add(charge, TableQueryResource::Work, copies);
   };
-  auto binding = [&](StringRef name, StringRef contractName,
-                     const AstNode &bindingSite,
-                     uint64_t copies) -> LogicalResult {
+  auto freshBinding = [&](StringRef name, StringRef contractName,
+                          const AstNode &bindingSite,
+                          uint64_t copies) -> LogicalResult {
     key(name, copies);
-    fits &=
-        TableQueryBudget::addProduct(charge, TableQueryResource::Slots, copies,
-                                     8) &&
+    fits &= TableQueryBudget::addProduct(charge, TableQueryResource::Slots,
+        copies, (sizeof(BindingBoundary) + 7) / 8) &&
         TableQueryBudget::addProduct(charge, TableQueryResource::ConstantBytes,
-                                     copies, contractName.size()) &&
+                                    copies, contractName.size()) &&
         TableQueryBudget::add(charge, TableQueryResource::Work, copies);
     for (const AstStep &step : bindingSite.path) {
-      if (failed(
-              chargeLoopDescriptorWork(site, "environment path measurement")))
+      if (failed(chargeLoopDescriptorWork(site, "environment path measurement")))
         return failure();
-      fits &= TableQueryBudget::addProduct(charge, TableQueryResource::Slots,
-                                           copies, 8) &&
-              TableQueryBudget::addProduct(charge,
-                                           TableQueryResource::ConstantBytes,
-                                           copies, step.field.size()) &&
+      fits &= TableQueryBudget::addProduct(charge, TableQueryResource::Slots, copies, 8) &&
+              TableQueryBudget::addProduct(charge, TableQueryResource::ConstantBytes,
+                                          copies, step.field.size()) &&
               TableQueryBudget::add(charge, TableQueryResource::Work, copies);
+    }
+    return success();
+  };
+  auto binding = [&](StringRef name, const BindingBoundary &boundary,
+                     uint64_t copies) -> LogicalResult {
+    key(name, copies);
+    fits &= TableQueryBudget::addProduct(charge, TableQueryResource::Slots,
+        copies, (sizeof(BindingBoundary) + 7) / 8) &&
+        TableQueryBudget::add(charge, TableQueryResource::Work, copies + 1);
+    if (!boundary.sharedContract()) {
+      // The existing owned descriptor is moved, never cloned. Prepay its one
+      // shared allocation/control block and the move of any inline path steps.
+      fits &= TableQueryBudget::add(charge, TableQueryResource::Slots,
+          (sizeof(Port) + 4 * sizeof(void *) + 7) / 8) &&
+          TableQueryBudget::add(charge, TableQueryResource::Work,
+                               1 + boundary.contract().node.path.size());
     }
     return success();
   };
@@ -998,8 +1097,7 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
     for (const auto &entry : incoming.boundaries) {
       if (failed(chargeLoopDescriptorWork(
               site, "environment boundary measurement")) ||
-          failed(binding(entry.first(), entry.second.contract.name,
-                         entry.second.contract.node, 2)))
+          failed(binding(entry.first(), entry.second, 2)))
         return failure();
     }
     // Two ambient/continuation handle pairs; no new hardware payload planes.
@@ -1008,8 +1106,7 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
   } else {
     for (const auto &entry : incoming.boundaries) {
       if (failed(chargeLoopDescriptorWork(site, "join boundary measurement")) ||
-          failed(binding(entry.first(), entry.second.contract.name,
-                         entry.second.contract.node, 1)))
+          failed(binding(entry.first(), entry.second, 1)))
         return failure();
     }
     for (const auto *branch : {yes, no})
@@ -1017,9 +1114,21 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
         if (failed(
                 chargeLoopDescriptorWork(site, "join declaration measurement")))
           return failure();
-        if (entry.second.declared &&
-            failed(binding(entry.first(), entry.second.contract.name,
-                           entry.second.contract.node, 1)))
+        fits &= TableQueryBudget::add(charge, TableQueryResource::Work, 1);
+        if (!entry.second.declared)
+          continue;
+        auto previous = incoming.boundaries.find(entry.first());
+        const BindingBoundary *retained = previous != incoming.boundaries.end()
+            ? &previous->second : nullptr;
+        if (branch == no) {
+          auto first = yes->boundaries.find(entry.first());
+          if (first != yes->boundaries.end() && first->second.declared)
+            retained = &first->second;
+        }
+        if (retained && retained->declared &&
+            sameBindingBoundary(*retained, entry.second))
+          continue;
+        if (failed(binding(entry.first(), entry.second, 1)))
           return failure();
       }
     for (const auto &entry : yes->values) {
@@ -1035,7 +1144,7 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
            yesBoundary->second.declared) ||
           (noBoundary != no->boundaries.end() && noBoundary->second.declared);
       if (!incoming.boundaries.contains(entry.first()) && !declared &&
-          failed(binding(entry.first(), entry.first(), site, 1)))
+          failed(freshBinding(entry.first(), entry.first(), site, 1)))
         return failure();
     }
     for (const auto &entry : incoming.writes) {
@@ -1057,14 +1166,40 @@ LogicalResult Importer::reserveSourceEnvironmentCopies(
                << (fits ? reason : "copy storage counter exhausted");
     return failure();
   }
+  for (const auto &entry : incoming.boundaries) entry.second.shareContract();
+  if (yes) {
+    for (const auto *branch : {yes, no})
+      for (const auto &entry : branch->boundaries) {
+        if (!entry.second.declared) continue;
+        auto previous = incoming.boundaries.find(entry.first());
+        const BindingBoundary *retained = previous != incoming.boundaries.end()
+            ? &previous->second : nullptr;
+        if (branch == no) {
+          auto first = yes->boundaries.find(entry.first());
+          if (first != yes->boundaries.end() && first->second.declared)
+            retained = &first->second;
+        }
+        if (retained && retained->declared && sameBindingBoundary(*retained, entry.second))
+          continue;
+        entry.second.shareContract();
+      }
+  }
   return success();
+}
+
+uint64_t loopIntegerDecimalBytes(uint64_t precision) {
+  // 2^3 < 10, so an N-bit magnitude needs at most ceil(N/3) decimal
+  // digits. Reserve one additional byte for a possible minus sign.
+  return precision / 3 + (precision % 3 != 0) + 1;
 }
 
 LogicalResult Importer::payLoopEnvelope(LoopStatementEnvelope &e,
                                         const AstNode &site, StringRef phase) {
   uint64_t B = 0, L = 0, P = 0, h = 0, slots = 0, storage = 0, facts = 0,
            constants = 0, work = 0, frames = 0;
-  bool fits = pureCheckedProduct(4, e.maps, B) &&
+  uint64_t factPrecision = e.precision;
+  bool fits = pureCheckedAdd(factPrecision, 2) &&
+              pureCheckedProduct(4, e.maps, B) &&
               pureCheckedProduct(2, e.operations, L) && pureCheckedAdd(L, B);
   h = std::max(e.factWords, e.precision / 64 + (e.precision % 64 != 0));
   fits &= pureCheckedProduct(
@@ -1085,9 +1220,9 @@ LogicalResult Importer::payLoopEnvelope(LoopStatementEnvelope &e,
           pureCheckedProduct(storage, L, storage);
   fits &= pureCheckedProduct(2, h, facts) &&
           pureCheckedProduct(facts, L, facts) && pureCheckedAdd(storage, facts);
-  fits &= pureCheckedProduct(8, P, constants) &&
+  fits &= pureCheckedProduct(e.patternBytes ? 64 : 8, P, constants) &&
           pureCheckedProduct(constants, L, constants);
-  fits &= pureCheckedProduct(3, e.precision + 2, part) &&
+  fits &= pureCheckedProduct(3, loopIntegerDecimalBytes(factPrecision), part) &&
           pureCheckedProduct(part, L, part) && pureCheckedAdd(constants, part);
   work = e.nodes;
   fits &= pureCheckedProduct(2, e.operations, part) &&
@@ -1137,8 +1272,8 @@ Importer::reserveLoopStatement(const AstNode &statement,
     std::optional<Type> expected;
     auto boundary = environment.boundaries.find(assignmentRoot(target));
     if (target.kind() == "Name" && boundary != environment.boundaries.end() &&
-        boundary->second.contract.type)
-      expected = boundary->second.contract.type;
+        boundary->second.contract().type)
+      expected = boundary->second.contract().type;
     if (statement.kind() == "AnnAssign") {
       auto type = portType(statement.child("annotation"), symbol);
       if (failed(type))
@@ -1249,6 +1384,10 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
   auto diagnostic = [&] {
     return mlir::emitError(site.location(b.getContext(), source.path));
   };
+  uint64_t factPrecision = envelope.precision;
+  if (!pureCheckedAdd(factPrecision, 2))
+    return diagnostic() << "bounded for fact precision envelope exhausted";
+  const uint64_t factBytes = loopIntegerDecimalBytes(factPrecision);
   TableQueryCharge measured;
   uint64_t operations = 0, arguments = 0, values = 0;
   StringRef violatedBound;
@@ -1290,18 +1429,18 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
           if (words > envelope.factWords ||
               (endpoint->isSigned()
                    ? endpoint->getSignificantBits()
-                   : endpoint->getActiveBits()) > envelope.precision + 2 ||
+                   : endpoint->getActiveBits()) > factPrecision ||
               !TableQueryBudget::add(measured, TableQueryResource::PayloadWords,
                                      words) ||
               !TableQueryBudget::add(measured,
                                      TableQueryResource::ConstantBytes,
-                                     envelope.precision + 2))
+                                     factBytes))
             return failure();
         }
       if (auto integer =
               dyn_cast_or_null<ac::MathIntAttr>(info.closedSourceConstant)) {
         uint64_t spelling = integer.getCanonicalValue().size();
-        if (spelling > envelope.precision + 2 ||
+        if (spelling > factBytes ||
             !TableQueryBudget::add(measured, TableQueryResource::ConstantBytes,
                                    spelling))
           return failure();
@@ -1336,6 +1475,12 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
     for (Value result : operation.getResults())
       if (failed(inspectValue(result, rows)))
         return failure();
+    if (auto pattern = dyn_cast<ac::BitsConstant4Op>(operation)) {
+      if (!TableQueryBudget::addProduct(measured,
+                                        TableQueryResource::ConstantBytes,
+                                        pattern.getPattern().size(), rows))
+        return failure();
+    }
     if (isa<ac::BitsConstantOp>(operation))
       for (Value result : operation.getResults()) {
         auto weight = loopStorageWords(result.getType(), analysis, site);
@@ -1400,8 +1545,10 @@ LogicalResult Importer::loopStatements(const AstNode &parent, StringRef field,
     return block->empty() ? nullptr : &block->back();
   };
   llvm::StringMap<Instance *> noInstances;
-  auto &instances = activeRule && activeRule->instances ? *activeRule->instances
-                                                        : noInstances;
+  auto &instances = activeModuleStatements ? activeModuleStatements->instances
+                    : activeRule && activeRule->instances
+                        ? *activeRule->instances
+                        : noInstances;
   for (size_t i = 0; i < parent.array(field).size(); ++i) {
     auto statement = parent.item(field, i);
     if (statement.kind() == "If") {
@@ -1504,10 +1651,11 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
   };
   if (activeLoop)
     return diagnostic() << "nested bounded for is unsupported";
-  if ((!activeValueHelper && !activeRule) ||
+  if ((!activeValueHelper && !activeRule && !activeModuleStatements) ||
       (activeRule && activeRule->structural) || !owners.empty())
-    return diagnostic() << "bounded for requires a pure helper or behavioral rule "
-                           "invocation without persistent-owner writes";
+    return diagnostic()
+           << "bounded for requires a pure helper, ordinary Module "
+              "statement or behavioral rule without persistent-owner writes";
   SourceWalkSummary inspected;
   if (failed(chargeSourceWalk(statement, inspected)))
     return failure();
@@ -1612,10 +1760,12 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
   if (environment.continuation)
     value(environment.continuation, true);
   for (const auto &item : environment.boundaries) {
-    slots(2);
+    slots((sizeof(BindingBoundary) + 7) / 8);
     text(item.first());
-    text(item.second.contract.name);
-    path(item.second.contract.node);
+    if (!item.second.sharedContract()) {
+      text(item.second.contract().name);
+      path(item.second.contract().node);
+    }
   }
   // Snapshot the complete fact maps, including entries not currently named by
   // the local environment. Dense-map slack is prepaid before the copies.
@@ -1794,9 +1944,9 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
     induction.precision =
         std::max(uint64_t(1), uint64_t(llvm::Log2_64_Ceil(ordinal + 1)));
     auto boundary = staged.boundaries.find(syntax->target.string("id"));
-    if (boundary != staged.boundaries.end() && boundary->second.contract.type) {
+    if (boundary != staged.boundaries.end() && boundary->second.contract().type) {
       auto shape =
-          loopTypeShape(boundary->second.contract.type, syntax->target);
+          loopTypeShape(boundary->second.contract().type, syntax->target);
       if (failed(shape))
         return failure();
       induction.precision = std::max(induction.precision, shape->precision);
@@ -1835,6 +1985,7 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
       return failure();
     }
     staged.boundaries[syntax->target.string("id")] = binding;
+    context.induction = *converted;
     if (failed(auditLoopStatement(*block, start, induction, syntax->target,
                                   "binder")) ||
         failed(loopStatements(statement, "body", inside, symbol, staged,
@@ -1959,6 +2110,212 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
   return success();
 }
 
+bool Importer::isModuleInstanceHandle(Value value) const {
+  auto instance =
+      value ? value.getDefiningOp<ac::InstanceOp>() : ac::InstanceOp();
+  if (!instance)
+    return false;
+  auto site = directCallSites.find(instance.getOccurrence());
+  // Tuple elements are independent ordinary data bindings. A whole scalar or
+  // Struct call result retains its instance identity, including direct aliases.
+  return site != directCallSites.end() &&
+         site->second.op == instance.getOperation() && site->second.bound &&
+         site->second.callee &&
+         site->second.callee->returnShape != ReturnShape::Tuple;
+}
+
+LogicalResult
+Importer::validateModuleStatement(const AstNode &statement,
+                                  const ModuleStatementContext &context) {
+  SourceWalkSummary work;
+  auto visit = [&](auto &&self, const AstNode &node,
+                   bool controlled) -> LogicalResult {
+    if (!node)
+      return success();
+    std::string reason;
+    if (!queryBudget.enter(reason))
+      return mlir::emitError(node.location(b.getContext(), source.path))
+             << reason;
+    auto leave = llvm::scope_exit([&] { queryBudget.leave(); });
+    if (failed(chargeSourceWalk(node, work)))
+      return failure();
+    controlled |= node.kind() == "If" || node.kind() == "IfExp" ||
+                  node.kind() == "BoolOp" || node.kind() == "Match" ||
+                  node.kind() == "For" || node.kind() == "While";
+    auto reject = [&](StringRef message) -> LogicalResult {
+      return mlir::emitError(node.location(b.getContext(), source.path))
+             << message;
+    };
+    if (node.kind() == "AnnAssign")
+      return reject("annotated Module variables are persistent declarations; "
+                    "declarations under ordinary control flow are unsupported");
+    if (node.kind() == "FunctionDef" || node.kind() == "ClassDef" ||
+        node.kind() == "Return" || node.kind() == "Assert")
+      return reject(
+          "Module ordinary control flow accepts pure computations; "
+          "declarations, returns and effects retain their owning scope");
+    auto target = [&](const AstNode &lhs) -> LogicalResult {
+      return forEachAssignmentLeaf(
+          lhs, [&](const AstNode &leaf) -> LogicalResult {
+            StringRef name = assignmentRoot(leaf);
+            bool boundInstance =
+                isModuleInstanceHandle(context.values.lookup(name));
+            if (name.empty() || boundInstance ||
+                context.protectedNames.contains(name) ||
+                context.instances.contains(name) || names.contains(name) ||
+                structs.contains(name) || enums.contains(name) ||
+                queueResultNames.contains(name) ||
+                memoryResultNames.contains(name) || name == "pyc_clk" ||
+                name == "pyc_rst")
+              return mlir::emitError(leaf.location(b.getContext(), source.path))
+                     << "Module ordinary assignment cannot write a persistent "
+                        "owner, "
+                        "input, imported binding, instance or physical domain";
+            if (failed(requireNestedRuleDataTarget(name, node)))
+              return failure();
+            if (!context.assignedNames.contains(name)) {
+              TableQueryCharge fee;
+              std::string reason;
+              bool fits =
+                  TableQueryBudget::add(fee, TableQueryResource::Slots, 16) &&
+                  TableQueryBudget::add(fee, TableQueryResource::ConstantBytes,
+                                        name.size());
+              if (!fits || !queryBudget.reserve(fee, reason))
+                return mlir::emitError(
+                           leaf.location(b.getContext(), source.path))
+                       << "Module assignment target: "
+                       << (fits ? reason : "binding budget exhausted");
+              context.assignedNames.insert(name);
+            }
+            return success();
+          });
+    };
+    if (node.kind() == "Assign") {
+      for (size_t i = 0; i < node.array("targets").size(); ++i)
+        if (failed(target(node.item("targets", i))))
+          return failure();
+    } else if (node.kind() == "AugAssign" || node.kind() == "For") {
+      if (failed(target(node.child("target"))))
+        return failure();
+    }
+    if (node.kind() == "Call") {
+      auto function = node.child("func");
+      StringRef name =
+          function.kind() == "Name" ? function.string("id") : StringRef();
+      bool allocation = moduleCall(node) || queueCall(node) ||
+                        !memoryKind(node).empty() || methodOwner(function) ||
+                        (function.kind() == "Subscript" &&
+                         intrinsic(function.child("value"), "table"));
+      bool effect = behavioralRules.contains(name) || nestedRuleBinding(name) ||
+                    intrinsic(function, "log") || intrinsic(function, "report");
+      if (function.kind() == "Attribute" &&
+          function.child("value").kind() == "Name") {
+        auto found =
+            context.instances.find(function.child("value").string("id"));
+        if (found != context.instances.end()) {
+          // A returned Table has ordinary pure value methods. Module/Queue
+          // callable interfaces require their existing Rule transaction owner.
+          auto *instance = found->second;
+          bool tableValue =
+              instance->valueHandle && instance->op->getNumResults() == 1 &&
+              isa<ac::TableType>(instance->op->getResult(0).getType());
+          effect |= !tableValue;
+        }
+      }
+      if ((allocation && controlled) || effect)
+        return reject(
+            "Module ordinary control flow cannot allocate hardware or "
+            "register/invoke Rule, Method or resource effects");
+    }
+    for (NamedAttribute field : node.fields()) {
+      StringRef key = field.getName().getValue();
+      if (auto child = dyn_cast<DictionaryAttr>(field.getValue())) {
+        if (child.getAs<StringAttr>("kind") &&
+            failed(self(self, node.child(key), controlled)))
+          return failure();
+      } else if (auto children = dyn_cast<ArrayAttr>(field.getValue())) {
+        for (size_t i = 0; i < children.size(); ++i)
+          if (auto child = dyn_cast<DictionaryAttr>(children[i]);
+              child && child.getAs<StringAttr>("kind") &&
+              failed(self(self, node.item(key, i), controlled)))
+            return failure();
+      }
+    }
+    return success();
+  };
+  return visit(visit, statement, false);
+}
+
+LogicalResult
+Importer::moduleStatement(const ModuleDecl &decl, size_t ordinal, OpBuilder &at,
+                          llvm::StringMap<Value> &values,
+                          llvm::StringMap<BindingBoundary> &boundaries,
+                          llvm::StringMap<Instance *> &instances,
+                          const llvm::StringSet<> &protectedNames) {
+  auto statement = decl.node.item("body", ordinal);
+  llvm::StringSet<> assignedNames;
+  ModuleStatementContext context{instances, values, protectedNames,
+                                 assignedNames};
+  if (failed(validateModuleStatement(statement, context)))
+    return failure();
+  // Move the existing maps into the shared statement environment. Ordinary
+  // straight-line assignments must not copy every preceding local each time.
+  BranchEnvironment environment;
+  environment.values = std::move(values);
+  environment.boundaries = std::move(boundaries);
+  auto *saved = std::exchange(activeModuleStatements, &context);
+  auto restore = llvm::scope_exit([&] {
+    values = std::move(environment.values);
+    boundaries = std::move(environment.boundaries);
+    activeModuleStatements = saved;
+  });
+  auto seedBoundary = [&](StringRef name, Value value) -> LogicalResult {
+    if (environment.boundaries.contains(name))
+      return success();
+    TableQueryCharge fee;
+    std::string reason;
+    bool fits = TableQueryBudget::add(fee, TableQueryResource::Slots, 16) &&
+                TableQueryBudget::addProduct(fee, TableQueryResource::Slots,
+                                             statement.path.size(),
+                                             (sizeof(AstStep) + 7) / 8) &&
+                TableQueryBudget::add(fee, TableQueryResource::Work, 1) &&
+                TableQueryBudget::add(fee, TableQueryResource::ConstantBytes,
+                                      name.size());
+    if (!fits || !queryBudget.reserve(fee, reason))
+      return error() << "Module ordinary binding: "
+                     << (fits ? reason : "binding budget exhausted");
+    environment.boundaries[name] = inferredBoundary(name, value, statement);
+    return success();
+  };
+  if (statement.kind() == "If" || statement.kind() == "Match" ||
+      statement.kind() == "For") {
+    // A join examines the complete incoming environment. Give new specialized
+    // call/declaration bindings their facts once before the branch copies.
+    for (const auto &entry : environment.values) {
+      if (failed(chargeLoopDescriptorWork(statement, "Module branch input")) ||
+          failed(seedBoundary(entry.first(), entry.second)))
+        return failure();
+    }
+  } else {
+    for (const auto &name : assignedNames)
+      if (Value prior = environment.values.lookup(name.getKey()))
+        if (failed(seedBoundary(name.getKey(), prior)))
+          return failure();
+  }
+  llvm::StringSet<> noWritableOwners;
+  AstNode returned;
+  if (failed(statements(decl.node, "body", at, decl.symbol, environment,
+                        noWritableOwners, returned, ordinal, ordinal + 1)))
+    return failure();
+  if (returned || !environment.writes.empty())
+    return error()
+           << "ordinary Module statement cannot return or propose state";
+  for (const auto &name : assignedNames)
+    if (environment.values.contains(name.getKey()))
+      noteNestedRuleDataBinding(name.getKey());
+  return success();
+}
+
 LogicalResult Importer::statements(const AstNode &parent, StringRef field,
                                    OpBuilder &at, FlatSymbolRefAttr symbol,
                                    BranchEnvironment &environment,
@@ -1967,8 +2324,10 @@ LogicalResult Importer::statements(const AstNode &parent, StringRef field,
   auto &values = environment.values;
   auto &writes = environment.writes;
   llvm::StringMap<Instance *> noInstances;
-  auto &instances = activeRule && activeRule->instances ? *activeRule->instances
-                                                        : noInstances;
+  auto &instances = activeModuleStatements ? activeModuleStatements->instances
+                    : activeRule && activeRule->instances
+                        ? *activeRule->instances
+                        : noInstances;
   for (size_t i = begin; i < std::min(end, parent.array(field).size()); ++i) {
     auto stmt = parent.item(field, i);
     auto loc = stmt.location(b.getContext(), source.path);
@@ -2078,6 +2437,9 @@ LogicalResult Importer::statements(const AstNode &parent, StringRef field,
       auto condition = predicateView(*guard, stmt.child("test"), symbol);
       if (failed(condition))
         return failure();
+      if (activeModuleStatements &&
+          failed(reserveSourceEnvironmentCopies(stmt, environment)))
+        return failure();
       auto yes = environment, no = environment;
       if (environment.continuation) {
         auto opposite = checkNot(*guard, stmt, at, symbol);
@@ -2177,8 +2539,8 @@ LogicalResult Importer::statements(const AstNode &parent, StringRef field,
                                 true};
     }
     std::optional<Type> expected;
-    if (binding && binding->contract.type)
-      expected = binding->contract.type;
+    if (binding && binding->contract().type)
+      expected = binding->contract().type;
     auto value = expression(stmt.child("value"), at, symbol, values, instances,
                             expected);
     if (failed(value))
@@ -2220,16 +2582,41 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       behavioralRules[statement.string("name")] = statement;
   }
   auto restoreRules = llvm::scope_exit([&] { behavioralRules = std::move(savedRules); });
-  if (!decl.parameters.empty())
-    return error() << "behavioral module static parameters are unsupported";
+  auto signature = moduleSignatureAttrs(decl);
+  if (failed(signature))
+    return failure();
+  llvm::StringSet<> parameterNames;
+  for (const Parameter &parameter : decl.parameters)
+    parameterNames.insert(parameter.name);
+  for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
+    auto statement = decl.node.item("body", i);
+    if (statement.kind() == "FunctionDef" &&
+        parameterNames.contains(statement.string("name")))
+      return error() << "module declaration cannot replace a static parameter";
+    auto check = [&](const AstNode &target) {
+      return forEachAssignmentLeaf(target, [&](const AstNode &leaf) -> LogicalResult {
+        if (parameterNames.contains(assignmentRoot(leaf)))
+          return error() << "module assignment cannot replace a static parameter";
+        return success();
+      });
+    };
+    if (statement.kind() == "Assign") {
+      for (size_t j = 0; j < statement.array("targets").size(); ++j)
+        if (failed(check(statement.item("targets", j))))
+          return failure();
+    } else if (statement.kind() == "AnnAssign" &&
+               failed(check(statement.child("target"))))
+      return failure();
+  }
   b.setInsertionPointToEnd(body->getBody());
   auto module = createOp(
       b, decl.node.location(b.getContext(), source.path),
       ac::ModuleOp::getOperationName(), {}, {},
       {b.getNamedAttr("sym_name", b.getStringAttr(decl.symbol.getValue())),
        b.getNamedAttr("source_owner", owner),
-       b.getNamedAttr("parameters", b.getArrayAttr({})),
-       b.getNamedAttr("type_parameters", b.getArrayAttr({})),
+       b.getNamedAttr("parameters", signature->getAs<ArrayAttr>("parameters")),
+       b.getNamedAttr("type_parameters",
+                      signature->getAs<ArrayAttr>("type_parameters")),
        b.getNamedAttr("function_type", TypeAttr::get(decl.type)),
        b.getNamedAttr("input_names", portNames(b, decl.inputs)),
        b.getNamedAttr("output_names", portNames(b, decl.outputs)),
@@ -2239,6 +2626,8 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       1);
   if (decl.system)
     module->setAttr("ac.root_kind", b.getStringAttr("system"));
+  if (decl.systemSamples)
+    module->setAttr("ac.system_samples", decl.systemSamples);
   for (NamedAttribute attr : decl.sourceCallAttrs)
     module->setAttr(attr.getName(), attr.getValue());
   if (failed(ac::detail::verifyModuleSourceCallContract(module)))
@@ -2259,147 +2648,194 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
   llvm::StringMap<Instance *> structuralInstances;
   llvm::StringMap<AstNode> structuralRules;
   SmallVector<AstNode> structuralRegistrations;
-  if (decl.system) {
-    size_t capacity = 0;
-    for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
-      auto stmt = decl.node.item("body", i);
-      if (stmt.kind() == "Assign" && stmt.array("targets").size() == 1 &&
-          moduleCall(stmt.child("value")))
-        ++capacity;
+  size_t capacity = 0;
+  for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
+    auto stmt = decl.node.item("body", i);
+    if (stmt.kind() == "Assign" && stmt.array("targets").size() == 1 &&
+        stmt.child("value").kind() == "Call")
+      ++capacity;
+  }
+  structuralStorage.reserve(capacity);
+  for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
+    auto stmt = decl.node.item("body", i);
+    if (stmt.kind() == "FunctionDef" && hasDecorator(stmt, "rule")) {
+      structuralRules[stmt.string("name")] = stmt;
+      continue;
     }
-    structuralStorage.reserve(capacity);
-    for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
-      auto stmt = decl.node.item("body", i);
-      if (stmt.kind() == "FunctionDef" && hasDecorator(stmt, "rule")) {
-        structuralRules[stmt.string("name")] = stmt;
-        continue;
-      }
-      if (stmt.kind() != "Assign" || stmt.array("targets").size() != 1 ||
-          stmt.item("targets", 0).kind() != "Name")
-        continue;
-      auto call = stmt.child("value");
-      if (!moduleCall(call))
-        continue;
-      auto binding = lookupBinding(call.child("func"));
-      if (!binding || binding->category != BindingCategory::Module)
-        continue;
-      bool callable = false;
-      if (auto found = local.find(call.child("func").string("id"));
-          found != local.end())
-        callable = modules[found->second].sourceCallAttrs.size() == 4;
-      else {
-        auto view = headers.lookupModule(binding->symbol);
-        callable = view && view.hasSourceCallContract();
-      }
-      if (callable)
-        continue;
-      if (!call.array("args").empty() || !call.array("keywords").empty())
-        return error() << "structural module declaration requires an empty "
-                          "constructor; bind authored inputs in a rule";
-      DictionaryAttr calleeAttrs = binding->declaration
-                                       ? binding->declaration->getAttrDictionary()
-                                       : DictionaryAttr();
-      if (!calleeAttrs) {
-        auto found = local.find(call.child("func").string("id"));
-        if (found == local.end())
-          return error() << "structural module declaration has no provider";
-        auto attrs = moduleSignatureAttrs(modules[found->second]);
-        if (failed(attrs))
-          return failure();
-        calleeAttrs = *attrs;
-      }
-      if (calleeAttrs.getAs<StringAttr>("ac.root_kind"))
-        return error() << "@system is root-only and cannot be instantiated as "
-                          "a child";
-      auto signature = dyn_cast<FunctionType>(
-          calleeAttrs.getAs<TypeAttr>("function_type").getValue());
-      auto inputNames = calleeAttrs.getAs<ArrayAttr>("input_names");
-      auto outputNames = calleeAttrs.getAs<ArrayAttr>("output_names");
-      if (!signature || !inputNames || !outputNames ||
-          inputNames.size() != signature.getNumInputs() ||
-          outputNames.size() != signature.getNumResults())
-        return error() << "structural module declaration has invalid signature";
-      Instance instance;
-      instance.name = stmt.item("targets", 0).string("id").str();
-      if (nestedRuleBinding(instance.name))
-        return error() << "module instance conflicts with nested Rule";
-      instance.node = stmt;
-      instance.callee = binding->symbol;
-      instance.declaration = binding->declaration;
-      auto parameters = bindParameters(calleeAttrs, call, decl.symbol);
-      auto typeArguments = bindTypeArguments(calleeAttrs, call, decl.symbol);
-      if (failed(parameters) || failed(typeArguments))
+    if (stmt.kind() != "Assign" || stmt.array("targets").size() != 1 ||
+        stmt.item("targets", 0).kind() != "Name")
+      continue;
+    auto call = stmt.child("value");
+    if (!moduleCall(call))
+      continue;
+    auto binding = lookupBinding(call.child("func"));
+    if (!binding || binding->category != BindingCategory::Module)
+      continue;
+    auto primitive = dyn_cast_or_null<ac::ModuleImportOp>(binding->declaration);
+    auto primitiveKind =
+        primitive ? primitive.getPrimitiveKindAttr() : StringAttr();
+    // A typed return selects this behavioral emitter, but it does not turn a
+    // canonical storage leaf into a direct value call. Keep this exception
+    // closed to the registry-authenticated DFF/DFFE declarations.
+    bool trustedStorageLeaf = binding->builtin &&
+                              headers.isTrustedBuiltin(primitive) &&
+                              primitiveKind &&
+                              (primitiveKind.getValue() == "dff" ||
+                               primitiveKind.getValue() == "dffe");
+    if (!decl.system && !trustedStorageLeaf)
+      continue;
+    bool callable = false;
+    if (auto found = local.find(call.child("func").string("id"));
+        found != local.end())
+      callable = llvm::any_of(modules[found->second].sourceCallAttrs,
+                              [](NamedAttribute attr) {
+                                return attr.getName() == "ac.return_form";
+                              });
+    else {
+      auto view = headers.lookupModule(binding->symbol);
+      callable = view && view.hasSourceCallContract();
+    }
+    if (callable)
+      continue;
+    if (decl.system &&
+        (!call.array("args").empty() || !call.array("keywords").empty()))
+      return error() << "structural module declaration requires an empty "
+                        "constructor; bind authored inputs in a rule";
+    DictionaryAttr calleeAttrs = binding->declaration
+                                     ? binding->declaration->getAttrDictionary()
+                                     : DictionaryAttr();
+    if (!calleeAttrs) {
+      auto found = local.find(call.child("func").string("id"));
+      if (found == local.end())
+        return error() << "structural module declaration has no provider";
+      auto attrs = moduleSignatureAttrs(modules[found->second]);
+      if (failed(attrs))
         return failure();
-      instance.parameters = std::move(*parameters);
-      instance.typeArguments = std::move(*typeArguments);
-      for (auto [name, formalType] :
-           llvm::zip(inputNames, signature.getInputs())) {
-        auto type = substitute(formalType, calleeAttrs, instance.parameters,
-                               instance.typeArguments);
-        if (failed(type))
-          return failure();
-        instance.inputs.push_back(
-            {cast<StringAttr>(name).getValue().str(), *type, stmt});
-      }
-      for (auto [name, formalType] :
-           llvm::zip(outputNames, signature.getResults())) {
-        auto type = substitute(formalType, calleeAttrs, instance.parameters,
-                               instance.typeArguments);
-        if (failed(type))
-          return failure();
-        instance.outputs.push_back(
-            {cast<StringAttr>(name).getValue().str(), *type, stmt});
-      }
-      if (auto domain =
-              calleeAttrs.getAs<DictionaryAttr>("ac.domain_inputs")) {
-        instance.clockInput =
-            domain.getAs<IntegerAttr>("clock").getValue().getZExtValue();
-        instance.resetInput =
-            domain.getAs<IntegerAttr>("reset").getValue().getZExtValue();
-      }
-      SmallVector<Type> resultTypes;
-      for (const Port &output : instance.outputs)
-        resultTypes.push_back(output.type);
-      instance.op = createOp(
-          at, stmt.location(b.getContext(), source.path),
-          ac::InstanceOp::getOperationName(), {}, resultTypes,
-          {at.getNamedAttr("instance_name", at.getStringAttr(instance.name)),
-           at.getNamedAttr("callee", instance.callee),
-           at.getNamedAttr("parameters", at.getArrayAttr(instance.parameters)),
-           at.getNamedAttr("type_arguments",
-                           at.getArrayAttr(instance.typeArguments)),
-           at.getNamedAttr("occurrence",
-                           sourceOccurrence(at, decl.symbol, stmt))});
-      structuralCallSites.insert(sourceOccurrence(at, decl.symbol, call));
-      structuralStorage.push_back(std::move(instance));
-      structuralInstances[structuralStorage.back().name] =
-          &structuralStorage.back();
+      calleeAttrs = *attrs;
     }
+    if (calleeAttrs.getAs<StringAttr>("ac.root_kind"))
+      return error() << "@system is root-only and cannot be instantiated as "
+                        "a child";
+    auto signature = dyn_cast<FunctionType>(
+        calleeAttrs.getAs<TypeAttr>("function_type").getValue());
+    auto inputNames = calleeAttrs.getAs<ArrayAttr>("input_names");
+    auto outputNames = calleeAttrs.getAs<ArrayAttr>("output_names");
+    if (!signature || !inputNames || !outputNames ||
+        inputNames.size() != signature.getNumInputs() ||
+        outputNames.size() != signature.getNumResults())
+      return error() << "structural module declaration has invalid signature";
+    Instance instance;
+    instance.name = stmt.item("targets", 0).string("id").str();
+    if (nestedRuleBinding(instance.name))
+      return error() << "module instance conflicts with nested Rule";
+    instance.node = stmt;
+    instance.callee = binding->symbol;
+    instance.declaration = binding->declaration;
+    auto parameters = bindParameters(calleeAttrs, call, decl.symbol);
+    auto typeArguments = bindTypeArguments(calleeAttrs, call, decl.symbol);
+    if (failed(parameters) || failed(typeArguments))
+      return failure();
+    instance.parameters = std::move(*parameters);
+    instance.typeArguments = std::move(*typeArguments);
+    auto appendPorts = [&](ArrayAttr names, TypeRange types,
+                           SmallVectorImpl<Port> &ports) -> LogicalResult {
+      for (auto [name, formalType] : llvm::zip(names, types)) {
+        auto type = substitute(formalType, calleeAttrs, instance.parameters,
+                               instance.typeArguments);
+        if (failed(type))
+          return failure();
+        std::optional<ac::detail::ValueKind> kind;
+        bool fixed = false;
+        if (auto formal = dyn_cast<ac::TypeParamType>(formalType)) {
+          for (size_t i = 0; i < call.array("keywords").size(); ++i) {
+            auto keyword = call.item("keywords", i);
+            auto actualName = dyn_cast_or_null<StringAttr>(keyword.get("arg"));
+            if (actualName == formal.getName()) {
+              kind = annotationKind(keyword.child("value"));
+              fixed = fixedAnnotation(keyword.child("value"));
+            }
+          }
+        } else if (!decl.system) {
+          // Canonical DFF/DFFE controls are Boolean; this follows the trusted
+          // leaf declaration rather than inferring from a fixture width.
+          kind = ac::detail::ValueKind::Boolean;
+        }
+        ports.push_back(
+            {cast<StringAttr>(name).getValue().str(), *type, stmt, kind, fixed});
+      }
+      return success();
+    };
+    if (failed(
+            appendPorts(inputNames, signature.getInputs(), instance.inputs)) ||
+        failed(
+            appendPorts(outputNames, signature.getResults(), instance.outputs)))
+      return failure();
+    if (auto domain = calleeAttrs.getAs<DictionaryAttr>("ac.domain_inputs")) {
+      instance.clockInput =
+          domain.getAs<IntegerAttr>("clock").getValue().getZExtValue();
+      instance.resetInput =
+          domain.getAs<IntegerAttr>("reset").getValue().getZExtValue();
+    }
+    SmallVector<Type> resultTypes;
+    for (const Port &output : instance.outputs)
+      resultTypes.push_back(output.type);
+    instance.op = createOp(
+        at, stmt.location(b.getContext(), source.path),
+        ac::InstanceOp::getOperationName(), {}, resultTypes,
+        {at.getNamedAttr("instance_name", at.getStringAttr(instance.name)),
+         at.getNamedAttr("callee", instance.callee),
+         at.getNamedAttr("parameters", at.getArrayAttr(instance.parameters)),
+         at.getNamedAttr("type_arguments",
+                         at.getArrayAttr(instance.typeArguments)),
+         at.getNamedAttr("occurrence",
+                         sourceOccurrence(at, decl.symbol, stmt))});
+    if (!decl.system)
+      for (auto [output, port] :
+           llvm::zip(instance.op->getResults(), instance.outputs)) {
+        remember(output, port.sourceKind);
+        if (port.fixedBits) fixedValues.insert(output);
+      }
+    structuralCallSites.insert(sourceOccurrence(at, decl.symbol, call));
+    structuralStorage.push_back(std::move(instance));
+    structuralInstances[structuralStorage.back().name] =
+        &structuralStorage.back();
   }
   SmallVector<std::string> computationalRules;
   for (const auto &entry : structuralRules) {
     bool structural = true;
+    bool bindsInstance = false;
     for (size_t i = 0; i < entry.second.array("body").size(); ++i) {
       auto statement = entry.second.item("body", i);
-      if (docstring(statement) || statement.kind() == "Pass") continue;
-      if (statement.kind() == "Assert" || statement.kind() == "If" || statement.kind() == "Match") continue;
-      auto call = statement.kind() == "Expr" ? statement.child("value") : AstNode();
-      bool binding = call.kind() == "Call" && call.child("func").kind() == "Name" &&
-                     structuralInstances.contains(call.child("func").string("id"));
-      bool observation = call.kind() == "Call" && (intrinsic(call.child("func"), "log") || intrinsic(call.child("func"), "report"));
-      if (!binding && !observation) structural = false;
+      if (docstring(statement) || statement.kind() == "Pass")
+        continue;
+      if (statement.kind() == "Assert" || statement.kind() == "If" ||
+          statement.kind() == "Match")
+        continue;
+      auto call =
+          statement.kind() == "Expr" ? statement.child("value") : AstNode();
+      bool binding =
+          call.kind() == "Call" && call.child("func").kind() == "Name" &&
+          structuralInstances.contains(call.child("func").string("id"));
+      bindsInstance |= binding;
+      bool observation =
+          call.kind() == "Call" && (intrinsic(call.child("func"), "log") ||
+                                    intrinsic(call.child("func"), "report"));
+      if (!binding && !observation)
+        structural = false;
     }
-    if (!structural) computationalRules.push_back(entry.first().str());
+    if (!structural || (!decl.system && !bindsInstance))
+      computationalRules.push_back(entry.first().str());
   }
-  for (const auto &name : computationalRules) structuralRules.erase(name);
+  for (const auto &name : computationalRules)
+    structuralRules.erase(name);
   SmallVector<StateOwner> states;
   ownerProposals.clear();
   activeBehavioralDecl = &decl;
   activeStates = &states;
   if (failed(predeclareDirectCalls(decl, at)))
     return failure();
-  llvm::StringMap<Instance *> noInstances;
   AstNode returned;
+  llvm::StringMap<BindingBoundary> ordinaryBoundaries;
   for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
     auto stmt = decl.node.item("body", i);
     if (docstring(stmt))
@@ -2431,7 +2867,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       else if (failed(noteNestedRuleDeclaration(stmt))) return failure();
       continue;
     }
-    if (decl.system && stmt.kind() == "Assign" &&
+    if (stmt.kind() == "Assign" &&
         structuralCallSites.contains(
             sourceOccurrence(at, decl.symbol, stmt.child("value"))))
       continue;
@@ -2441,11 +2877,13 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
         auto helper = resolveValueHelper(call.child("func"), decl.symbol);
         if (failed(helper)) return failure();
         if (*helper) {
-          if (failed(valueHelperCall(call, at, decl.symbol, values, noInstances))) return failure();
+          if (failed(valueHelperCall(call, at, decl.symbol, values,
+                                     structuralInstances)))
+            return failure();
           continue;
         }
       }
-      if (decl.system && call.kind() == "Call" &&
+      if (call.kind() == "Call" &&
           call.child("func").kind() == "Name" &&
           structuralRules.contains(call.child("func").string("id"))) {
         if (!call.array("args").empty() || !call.array("keywords").empty())
@@ -2463,34 +2901,125 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
     llvm::StringSet<> tupleForbidden;
     for (const Port &input : decl.inputs)
       tupleForbidden.insert(input.name);
+    for (const auto &parameter : parameterNames)
+      tupleForbidden.insert(parameter.getKey());
     for (const StateOwner &state : states)
       tupleForbidden.insert(state.name);
-    if (stmt.kind() == "Assign" && fixedResultCall(stmt.child("value")).empty()) {
+    if (stmt.kind() == "Assign" && fixedResultCall(stmt.child("value")).empty() &&
+        !moduleCall(stmt.child("value"))) {
       auto target = stmt.item("targets", 0);
       if (target.kind() == "Tuple")
         for (size_t k = 0; k < target.array("elts").size(); ++k)
           if (nestedRuleBinding(target.item("elts", k).string("id")))
             return error() << "hardware result binding conflicts with nested Rule";
     }
-    auto memory = bindMemoryResults(stmt, at, decl.symbol, values, noInstances);
+    auto memory = bindMemoryResults(stmt, at, decl.symbol, values,
+                                    structuralInstances, structuralStorage);
     if (failed(memory))
       return failure();
     if (*memory)
       continue;
     auto queued =
-        bindQueueResults(stmt, at, decl.symbol, values, structuralInstances);
+        bindQueueResults(stmt, at, decl.symbol, values, structuralInstances,
+                         structuralStorage);
     if (failed(queued))
       return failure();
     if (*queued)
       continue;
+    if (stmt.kind() == "Assign" && stmt.array("targets").size() == 1 &&
+        stmt.item("targets", 0).kind() == "Name" &&
+        stmt.child("value").kind() == "Name") {
+      StringRef source = stmt.child("value").string("id");
+      auto original = structuralInstances.find(source);
+      if (original != structuralInstances.end()) {
+        StringRef alias = stmt.item("targets", 0).string("id");
+        if (values.contains(alias) || structuralInstances.contains(alias) ||
+            nestedRuleBinding(alias) || names.contains(alias) ||
+            structs.contains(alias) || enums.contains(alias) ||
+            behavioralRules.contains(alias))
+          return error()
+                 << "instance alias requires a fresh immutable ordinary Name";
+        structuralInstances[alias] = original->second;
+        if (queueInstance(original->second))
+          queueResultNames.insert(alias);
+        continue;
+      }
+    }
     for (const auto &name : queueResultNames)
       tupleForbidden.insert(name.getKey());
-    auto fixed = bindFixedResults(stmt, at, decl.symbol, values, noInstances,
+    auto call = stmt.child("value");
+    if (stmt.kind() == "Assign" && call.kind() == "Call" &&
+        call.child("func").kind() == "Name" &&
+        behavioralRules.contains(call.child("func").string("id"))) {
+      auto rule = behavioralRules[call.child("func").string("id")];
+      auto annotation = rule.child("returns");
+      if (annotation.kind() == "Subscript" &&
+          annotation.child("value").kind() == "Name" &&
+          annotation.child("value").string("id") == "tuple") {
+        // Validate the targets before registering effects or publishing wires.
+        ModuleDecl contract = decl;
+        llvm::StringSet<> resultNames;
+        if (failed(readReturnContract(contract, annotation, resultNames, true)))
+          return failure();
+        auto targets = moduleResultTargets(stmt, contract.outputs.size());
+        if (failed(targets)) return failure();
+        for (StringRef name : *targets)
+          if (tupleForbidden.contains(name))
+            return error() << "tuple Rule result cannot write a protected owner";
+        auto results = behavioralCall(decl, call, at, values, states, false, true);
+        if (failed(results) || failed(bindCallableResults(stmt, *results, at,
+                decl.symbol, values, structuralInstances, tupleForbidden)))
+          return failure();
+        continue;
+      }
+    }
+    auto moduleResults = bindModuleResults(stmt, at, decl.symbol, values,
+                                          structuralInstances, tupleForbidden);
+    if (failed(moduleResults))
+      return failure();
+    if (*moduleResults)
+      continue;
+    auto fixed = bindFixedResults(stmt, at, decl.symbol, values,
+                                  structuralInstances,
                                   nullptr, tupleForbidden, false);
     if (failed(fixed))
       return failure();
     if (*fixed)
       continue;
+    // Scalar static allocations and registered Rule results retain the same
+    // expression owner as tuple calls above. In particular, do not carry the
+    // Module ordinary context into a Rule's own statement lowering.
+    if (stmt.kind() == "Assign" && stmt.array("targets").size() == 1 &&
+        stmt.item("targets", 0).kind() == "Name" && call.kind() == "Call" &&
+        (moduleCall(call) ||
+         (call.child("func").kind() == "Name" &&
+          behavioralRules.contains(call.child("func").string("id"))))) {
+      StringRef name = stmt.item("targets", 0).string("id");
+      if (tupleForbidden.contains(name) || names.contains(name) ||
+          structs.contains(name) || enums.contains(name) ||
+          structuralInstances.contains(name) ||
+          memoryResultNames.contains(name) || name == "pyc_clk" ||
+          name == "pyc_rst" || isModuleInstanceHandle(values.lookup(name)))
+        return error() << "Module call result cannot replace a protected "
+                          "binding or instance";
+      if (failed(requireNestedRuleDataTarget(name, stmt)))
+        return failure();
+      auto value =
+          expression(call, at, decl.symbol, values, structuralInstances);
+      if (failed(value))
+        return failure();
+      values[name] = *value;
+      ordinaryBoundaries[name] = inferredBoundary(name, *value, stmt);
+      noteNestedRuleDataBinding(name);
+      continue;
+    }
+    if (stmt.kind() == "If" || stmt.kind() == "Match" || stmt.kind() == "For" ||
+        stmt.kind() == "Pass") {
+      if (failed(moduleStatement(decl, i, at, values, ordinaryBoundaries,
+                                 structuralInstances, tupleForbidden)))
+        return failure();
+      continue;
+    }
     AstNode target, initializer, annotation;
     if (stmt.kind() == "AnnAssign") {
       target = stmt.child("target");
@@ -2507,37 +3036,8 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
           return error() << "table allocation requires exactly init";
         initializer = rhs.item("keywords", 0).child("value");
       } else {
-        StringRef root = assignmentRoot(target);
-        if (root == "pyc_clk" || root == "pyc_rst")
-          return error() << "reserved physical domain pin '" << root
-                         << "' cannot be assigned in source";
-        if (root.empty() || llvm::any_of(states, [&](const StateOwner &state) {
-              return state.name == root;
-            }))
-          return error()
-                 << "module-local assignment cannot write a persistent owner";
-        if (failed(requireNestedRuleDataTarget(root, stmt))) return failure();
-        std::optional<Type> expected;
-        if (target.kind() == "Attribute") {
-          if (indexedFieldTarget(target)) {
-            auto type =
-                expressionType(target, values, noInstances, decl.symbol);
-            if (failed(type))
-              return failure();
-            expected = *type;
-          } else {
-            auto old = expression(target, at, decl.symbol, values, noInstances);
-            if (failed(old))
-              return failure();
-            expected = old->getType();
-          }
-        }
-        auto value =
-            expression(rhs, at, decl.symbol, values, noInstances, expected);
-        if (failed(value))
-          return failure();
-        if (failed(updateAssignment(target, *value, stmt, at, decl.symbol,
-                                    values)))
+        if (failed(moduleStatement(decl, i, at, values, ordinaryBoundaries,
+                                   structuralInstances, tupleForbidden)))
           return failure();
         continue;
       }
@@ -2556,49 +3056,11 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
     auto type = portType(annotation, decl.symbol);
     if (failed(type))
       return failure();
-    ac::HardwareAnalysis analysis(*body);
-    if (auto table = dyn_cast<ac::TableType>(*type)) {
-      if (failed(analysis.getTableSize(table, {}, module)) ||
-          failed(analysis.getPackedWidth(table.getElementType(), {}, module)))
-        return failure();
-    } else if (failed(analysis.getPackedWidth(*type, {}, module)))
-      return failure();
-    if (!staticInitializer(initializer))
-      return error()
-             << "persistent initializer must be a static complete value";
-    auto tableType = dyn_cast<ac::TableType>(*type);
-    auto encoded =
-        initializer.kind() == "Constant"
-            ? dyn_cast_or_null<DictionaryAttr>(initializer.get("value"))
-            : DictionaryAttr();
-    auto literalInteger =
-        encoded ? encoded.getAs<StringAttr>("integer") : StringAttr();
-    bool recursiveZero = literalInteger && literalInteger.getValue() == "0";
-    bool elementImage = tableType && !recursiveZero;
-    Type initType = elementImage ? tableType.getElementType() : *type;
-    auto init = tableType && recursiveZero
-                    ? constant(*type, 0, initializer, at, decl.symbol)
-                    : expression(initializer, at, decl.symbol, values,
-                                 noInstances, initType);
-    if (failed(init))
-      return failure();
-    BindingBoundary initialBoundary{
-        {target.string("id").str(), initType, annotation,
-         annotationKind(annotation),
-         fixedAnnotation(annotation) ||
-             (tableType && isa<ac::BitsType>(initType))},
-        true};
-    auto convertedInit = applyBindingBoundary(*init, initialBoundary,
-                                              initializer, at, decl.symbol);
-    if (failed(convertedInit))
-      return failure();
-    init = *convertedInit;
-    if (elementImage)
-      init = createOp(at, stmt.location(b.getContext(), source.path),
-                      ac::TableSplatOp::getOperationName(), {*init},
-                      TypeRange{*type},
-                      {at.getNamedAttr("shape", tableType.getShape())})
-                 ->getResult(0);
+    Port stateContract{target.string("id").str(), *type, annotation,
+                       annotationKind(annotation), fixedAnnotation(annotation)};
+    auto init = stateInitializer(stateContract, initializer, stmt, at,
+                                  decl.symbol, values, structuralInstances);
+    if (failed(init)) return failure();
     auto builtin = headers.lookupBuiltin("dffe");
     if (!builtin || !headers.isTrustedBuiltin(builtin.declaration))
       return error() << "trusted dffe unavailable";
@@ -2620,9 +3082,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
     helperOwnerBindings.insert(target.string("id"));
     states.push_back({target.string("id").str(), *type, *init, storage, stmt});
     values[target.string("id")] = storage->getResult(0);
-    remember(storage->getResult(0), annotationKind(annotation));
-    if (fixedAnnotation(annotation))
-      fixedValues.insert(storage->getResult(0));
+    rememberState(storage->getResult(0), states.back());
     auto held = constant(bits(1, stmt, decl.symbol), 0, stmt, at, decl.symbol);
     if (failed(held))
       return failure();
@@ -2687,8 +3147,8 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       environment.values[item.first()] = captureArgument();
     llvm::StringMap<SmallVector<Value>> capturedOutputs;
     for (const Instance &item : structuralStorage)
-      for (const Port &port : item.outputs) {
-        (void)port;
+      for (Value output : item.op->getResults()) {
+        (void)output;
         capturedOutputs[item.name].push_back(captureArgument());
       }
     evaluation.outputs = &capturedOutputs;
@@ -2780,7 +3240,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
                                           decl.outputs[i].type))
         return error() << "rule output type disagrees with module";
   } else {
-    auto result = lowerReturn(decl, node, at, values, noInstances);
+    auto result = lowerReturn(decl, node, at, values, structuralInstances);
     if (failed(result))
       return failure();
     outputs = std::move(*result);

@@ -11,12 +11,13 @@
 #include "llvm/ADT/StringMap.h"
 
 #include <cstdint>
+#include <utility>
 
 namespace acir::ac {
 class HardwareAnalysis;
 struct HardwareBindings;
 class ModuleImportOp;
-}
+} // namespace acir::ac
 
 namespace acir::ac::detail {
 
@@ -28,19 +29,25 @@ using EmitError = llvm::function_ref<mlir::InFlightDiagnostic()>;
 mlir::Operation *findUnloweredTransaction(mlir::Operation *root);
 mlir::LogicalResult verifyNoUnloweredTransactions(mlir::Operation *root);
 bool isCombinationalHardwareOperation(mlir::Operation *operation);
+// Existing source-state initializer grammar, also used to prove physical
+// elaboration initialization under each actual storage binding.
+mlir::LogicalResult verifyClosedStateInitializer(
+    const HardwareAnalysis &analysis, mlir::Value initial,
+    const HardwareBindings &bindings, mlir::Operation *site);
 
 // Optional source-call authority on existing hardware module declarations.
 mlir::LogicalResult verifyModuleSourceCallContract(mlir::Operation *owner);
 mlir::LogicalResult verifyModuleSignature(mlir::Operation *declaration);
-mlir::LogicalResult verifyModuleImportSummarySelection(
-    ModuleImportOp imported);
+mlir::LogicalResult verifyModuleImportSummarySelection(ModuleImportOp imported);
 
 // Callable constraints resolve hardware in the lexical module; diagnostics
 // belong to the module or Method whose source contract is being checked.
+enum class SourceCallWidthMode { Concrete, SymbolicFixedBits };
 mlir::LogicalResult verifySourceCallHardwareConstraint(
     mlir::Attribute raw, mlir::Type physical, const HardwareAnalysis &analysis,
     mlir::Operation *lexicalModule, mlir::Operation *diagnosticOperation,
-    llvm::StringRef description);
+    llvm::StringRef description,
+    SourceCallWidthMode widthMode = SourceCallWidthMode::Concrete);
 mlir::LogicalResult verifyRequiredSourceParameter(
     mlir::Attribute raw, mlir::StringAttr expectedName,
     mlir::DictionaryAttr sourceOwner, mlir::FlatSymbolRefAttr definition,
@@ -50,19 +57,21 @@ mlir::LogicalResult verifyRequiredSourceParameter(
     mlir::Operation *lexicalModule, mlir::Operation *diagnosticOperation,
     llvm::StringRef description);
 
-// Resolve a branch payload only after bounded validation of its nominal closure.
+// Resolve a branch payload only after bounded validation of its nominal
+// closure.
 mlir::FailureOr<mlir::Type> resolveSourceBranchResultType(
     mlir::Type actualType, const HardwareAnalysis &analysis,
     const HardwareBindings &lexicalBindings, mlir::Operation *diagnosticSite,
     llvm::function_ref<mlir::LogicalResult(uint64_t workUnits,
-                                         uint64_t allocationBytes)> charge);
+                                           uint64_t allocationBytes)>
+        charge);
 
 // Validate original hardware syntax against its lexical module inventories.
 // Bound forwarded actuals are resolved separately by HardwareAnalysis.
 mlir::LogicalResult verifyHardwareAttributeScope(mlir::Attribute attribute,
-                                               mlir::Operation *owner);
+                                                 mlir::Operation *owner);
 mlir::LogicalResult verifyHardwareTypeScope(mlir::Type type,
-                                          mlir::Operation *owner);
+                                            mlir::Operation *owner);
 
 mlir::DictionaryAttr declarationSourceOwner(mlir::Operation *operation);
 bool hasQualifiedDeclarationIdentityForOwner(mlir::Operation *operation,
@@ -112,9 +121,23 @@ mlir::LogicalResult verifySourceSpan(mlir::DictionaryAttr value,
 mlir::LogicalResult verifySourceGuardLocation(mlir::DictionaryAttr location,
                                               mlir::DictionaryAttr sourceOwner,
                                               EmitError emitError);
-mlir::LogicalResult verifySourceEffectMetadata(
-    mlir::DictionaryAttr occurrence, mlir::DictionaryAttr location,
-    mlir::Operation *lexicalModule, EmitError emitError);
+mlir::LogicalResult verifySourceEffectMetadata(mlir::DictionaryAttr occurrence,
+                                               mlir::DictionaryAttr location,
+                                               mlir::Operation *lexicalModule,
+                                               EmitError emitError);
+
+// Intrinsic immutable grammar only; no lexical-owner or source admission fact.
+bool isVerifiedOccurrenceGrammar(mlir::DictionaryAttr value);
+bool isVerifiedSourceSpanGrammar(mlir::DictionaryAttr value);
+void rememberVerifiedSourceSpanGrammar(mlir::DictionaryAttr value);
+std::pair<uint64_t, uint64_t>
+sourceSpanGrammarCacheShape(mlir::MLIRContext *context);
+bool isVerifiedStaticExpressionGrammar(mlir::DictionaryAttr value);
+void rememberVerifiedStaticExpressionGrammar(mlir::DictionaryAttr value);
+std::pair<uint64_t, uint64_t>
+staticExpressionGrammarCacheShape(mlir::MLIRContext *context);
+std::pair<uint64_t, uint64_t>
+occurrenceGrammarCacheShape(mlir::MLIRContext *context);
 
 mlir::LogicalResult verifyPathComponent(mlir::DictionaryAttr value,
                                         EmitError emitError);

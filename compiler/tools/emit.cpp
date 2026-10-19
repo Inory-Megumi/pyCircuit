@@ -1,6 +1,7 @@
 // Emit source-owned modules from verified final ACIR. Publication is
 // transactional in the Python driver; this transport writes nothing before
 // complete success.
+#include "Compiler/FinalCppNames.h"
 #include "Compiler/FinalCppSourceParts.h"
 #include "Compiler/FinalSourceMap.h"
 #include "Compiler/FinalVerilogSourceParts.h"
@@ -10,6 +11,8 @@
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -51,21 +54,28 @@ int main(int argc, char **argv) {
         "{0}\n", llvm::json::Value(llvm::json::Object{{"path", path}}));
     return 0;
   }
-  StringRef target, format = "json";
-  if (argc == 4 || argc == 6) {
-    if (StringRef(argv[2]) == "--target")
-      target = argv[3];
-    if (argc == 6 && StringRef(argv[4]) == "--format")
-      format = argv[5];
-    else if (argc == 6)
-      format = "";
+  StringRef target, format = "json", rtlMode = "managed";
+  bool optionsValid = argc >= 4 && (argc % 2 == 0);
+  for (int i = 2; optionsValid && i + 1 < argc; i += 2) {
+    StringRef option(argv[i]);
+    if (option == "--target" && target.empty())
+      target = argv[i + 1];
+    else if (option == "--format")
+      format = argv[i + 1];
+    else if (option == "--rtl-mode")
+      rtlMode = argv[i + 1];
+    else
+      optionsValid = false;
   }
-  if ((target != "cpp" && target != "verilog") ||
-      (format != "json" && format != "source")) {
+  if (!optionsValid || (target != "cpp" && target != "verilog") ||
+      (format != "json" && format != "source") ||
+      (rtlMode != "managed" && rtlMode != "physical") ||
+      (target != "verilog" && rtlMode != "managed")) {
     llvm::errs() << "usage: pycircuit-emit FINAL.ac --target cpp|verilog "
-                    "[--format json|source]\n";
+                    "[--format json|source] [--rtl-mode managed|physical]\n";
     return 2;
   }
+  bool physical = rtlMode == "physical";
   auto package = parseSourceFile<ModuleOp>(argv[1], &context);
   if (!package || failed(mlir::verify(*package)))
     return 1;
@@ -78,7 +88,7 @@ int main(int argc, char **argv) {
     LogicalResult status =
         target == "cpp"
             ? acir::compiler::emitCpp(*package, analysis, stream)
-            : acir::compiler::emitVerilog(*package, analysis, stream);
+            : acir::compiler::emitVerilog(*package, analysis, stream, physical);
     if (failed(status))
       return 1;
     llvm::outs() << text;
@@ -100,6 +110,83 @@ int main(int argc, char **argv) {
                                     "@\"" + callee.getValue().str() + "\""},
                                    {"arguments", std::move(arguments)}}},
       {"entry_source", sourceOwner(root.getSourceOwner())}};
+  auto resetPolicy = acir::ac::getHardwareResetSemantics(*package);
+  if (failed(resetPolicy))
+    return 1;
+  result["reset_semantics"] =
+      *resetPolicy == acir::ac::HardwareResetSemantics::IfOne ? "if_one"
+                                                              : "strict";
+  auto samples = acir::ac::getSystemSamples(root);
+  if (failed(samples))
+    return 1;
+  llvm::json::Array sampleRows;
+  bool needsFourState = false;
+  for (Attribute raw : *samples) {
+    StringRef row = cast<StringAttr>(raw).getValue();
+    sampleRows.emplace_back(row);
+    needsFourState |= row.contains('x') || row.contains('z');
+  }
+  // Only direct known, nonzero literals discharge division's X-on-zero
+  // behavior. Do not invent a runtime knownness/range proof in this driver.
+  auto knownNonzeroLiteral = [](Value value) {
+    if (auto constant = value.getDefiningOp<acir::ac::BitsConstantOp>()) {
+      auto tree = constant.getValue().getTree();
+      auto kind = tree.getAs<StringAttr>("kind");
+      auto literal = tree.getAs<DictionaryAttr>("value");
+      auto number = literal ? literal.getAs<acir::ac::MathIntAttr>("value")
+                            : acir::ac::MathIntAttr();
+      return kind && kind.getValue() == "literal" && number &&
+             number.getCanonicalValue() != "0";
+    }
+    if (auto constant = value.getDefiningOp<acir::ac::BitsConstant4Op>()) {
+      StringRef pattern = constant.getPattern();
+      return !pattern.contains('x') && !pattern.contains('z') &&
+             pattern.contains('1');
+    }
+    return false;
+  };
+  // Select the simulator from the executable instance closure. Unselected
+  // declarations from the same published source unit do not change the mode.
+  // Initialized DFF/DFFE and known-preserving arithmetic retain the binary
+  // route. Observers and operations/resources with runtime X results require
+  // a real four-state engine even without an explicit X/Z constant.
+  llvm::DenseSet<Operation *> reached;
+  llvm::SmallVector<acir::ac::ModuleOp> pending{root};
+  while (!pending.empty()) {
+    auto definition = pending.pop_back_val();
+    if (!reached.insert(definition).second)
+      continue;
+    definition.walk([&](Operation *operation) {
+      if (auto constant = dyn_cast<acir::ac::BitsConstant4Op>(operation)) {
+        StringRef pattern = constant.getPattern();
+        needsFourState |= pattern.contains('x') || pattern.contains('z');
+      }
+      if (operation->hasAttr("ac.verification_observer"))
+        needsFourState = true;
+      if (auto compare = dyn_cast<acir::ac::BitsCompareOp>(operation))
+        needsFourState |= compare.getPredicate() == "case_eq";
+      if (auto binary = dyn_cast<acir::ac::BitsBinaryOp>(operation))
+        if ((binary.getOpcode() == "udiv" || binary.getOpcode() == "urem") &&
+            !knownNonzeroLiteral(binary.getRhs()))
+          needsFourState = true;
+      if (isa<acir::ac::TableGetOp>(operation))
+        needsFourState = true;
+      Operation *callee = nullptr;
+      if (auto instance = dyn_cast<acir::ac::InstanceOp>(operation))
+        callee = analysis.resolveCallee(instance);
+      else if (auto collection = dyn_cast<acir::ac::CollectionOp>(operation))
+        callee = analysis.resolveCallee(collection);
+      if (auto child = dyn_cast_or_null<acir::ac::ModuleOp>(callee))
+        pending.push_back(child);
+      else if (callee) {
+        StringRef primitive = analysis.getPrimitiveKind(callee);
+        if (!primitive.empty() && primitive != "dff" && primitive != "dffe")
+          needsFourState = true;
+      }
+    });
+  }
+  result["system_samples"] = std::move(sampleRows);
+  result["needs_four_state"] = needsFourState;
   auto units = acir::ac::collectFinalSourceUnits(*package, emitError);
   if (failed(units))
     return 1;
@@ -141,9 +228,17 @@ int main(int argc, char **argv) {
     result["simulation_config"] = parts->simulationConfig;
     result["source_check_count"] = parts->sourceCheckCount;
     result["root_cpp_name"] = parts->rootCppName;
+    auto ports = llvm::json::parse(parts->portMap);
+    if (!ports) {
+      llvm::consumeError(ports.takeError());
+      emitError() << "invalid generated root port map";
+      return 1;
+    }
+    result["port_availability"] = std::move(*ports);
     result["source_groups"] = std::move(groups);
   } else {
-    auto parts = acir::compiler::emitVerilogSourceParts(*package, analysis);
+    auto parts =
+        acir::compiler::emitVerilogSourceParts(*package, analysis, physical);
     if (failed(parts))
       return 1;
     llvm::json::Array groups, standard;
@@ -164,9 +259,17 @@ int main(int argc, char **argv) {
     result["rtl_source_groups"] = std::move(groups);
     result["rtl_standard_sources"] = std::move(standard);
     result["rtl_core"] = parts->core;
+    result["rtl_mode"] = rtlMode;
     result["simulation_top"] = parts->simulationTop;
     result["source_check_count"] = parts->sourceCheckCount;
     result["root_rtl_name"] = parts->rootRtlName;
+    auto ports = llvm::json::parse(parts->portMap);
+    if (!ports) {
+      llvm::consumeError(ports.takeError());
+      emitError() << "invalid generated root port map";
+      return 1;
+    }
+    result["port_availability"] = std::move(*ports);
   }
   auto maps =
       acir::compiler::emitFinalSourceMaps(*package, memberships, emitError);

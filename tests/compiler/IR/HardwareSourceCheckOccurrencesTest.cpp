@@ -1,6 +1,8 @@
+#include "Compiler/SourceUnit.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
@@ -11,6 +13,7 @@
 
 namespace {
 namespace ac = acir::ac;
+namespace compiler = acir::compiler;
 using namespace mlir;
 
 class HardwareSourceCheckOccurrencesTest : public ::testing::Test {
@@ -502,14 +505,14 @@ protected:
     if (kind == "sync_mem") {
       pins = {"clk",    "rst",   "ren",   "raddr",
               "wvalid", "waddr", "wdata", "wstrb"};
-      outputs = {"rdata"};
+      outputs = {"rdata", "rlive"};
     }
     if (kind == "sync_mem_dp") {
       pins = {"clk",    "rst",    "ren0",  "raddr0", "ren1",
               "raddr1", "wvalid", "waddr", "wdata",  "wstrb"};
-      outputs = {"rdata0", "rdata1"};
+      outputs = {"rdata0", "rdata1", "rlive0", "rlive1"};
     }
-    SmallVector<Type> types;
+    SmallVector<Type> types, resultTypes;
     SmallVector<Attribute> names, outputNames, params, dependencies;
     bool memory = kind.contains("mem");
     for (StringRef pin : pins) {
@@ -520,6 +523,7 @@ protected:
     }
     for (auto [i, name] : llvm::enumerate(outputs)) {
       outputNames.push_back(b.getStringAttr(name));
+      resultTypes.push_back(name.starts_with("rlive") ? bits(1) : payload);
       dependencies.push_back(ac::getOutputDependencyAttr(
           b, i,
           kind == "byte_mem" ? ArrayRef<unsigned>{2} : ArrayRef<unsigned>{}));
@@ -536,8 +540,7 @@ protected:
          f("parameters", b.getArrayAttr(params)),
          f("type_parameters", b.getArrayAttr({b.getStringAttr("T")})),
          f("function_type",
-           TypeAttr::get(b.getFunctionType(
-               types, SmallVector<Type>(outputs.size(), payload)))),
+           TypeAttr::get(b.getFunctionType(types, resultTypes))),
          f("input_names", b.getArrayAttr(names)),
          f("output_names", b.getArrayAttr(outputNames)),
          f("primitive_kind", b.getStringAttr(kind)),
@@ -555,9 +558,12 @@ protected:
         bool data = name == "d" || name == "init" || name == "wdata";
         inputs.push_back(constant(0, data ? 8 : 1));
       }
+      SmallVector<Type> outputs;
+      for (Attribute raw : imported.getOutputNames())
+        outputs.push_back(cast<StringAttr>(raw).getValue().starts_with("rlive")
+                              ? bits(1) : bits(8));
       storage.push_back(op(
-          ac::InstanceOp::getOperationName(), inputs,
-          SmallVector<Type>(imported.getOutputNames().size(), bits(8)),
+          ac::InstanceOp::getOperationName(), inputs, outputs,
           {f("callee", FlatSymbolRefAttr::get(&context, imported.getSymName())),
            f("instance_name", b.getStringAttr(kind)),
            f("parameters", kind.contains("mem")
@@ -567,19 +573,25 @@ protected:
            f("occurrence",
              occurrence(owner.getSymName(), 40 + storage.size()))}));
     }
+    auto registry = compiler::SourceHeaderRegistry::create(
+        &context, {}, [&] { return emitError(loc()); });
+    ASSERT_TRUE(succeeded(registry));
+    auto fifo = registry->lookupBuiltin("fifo_local");
+    ASSERT_TRUE(fifo);
+    if (!SymbolTable::lookupSymbolIn(*package, fifo.symbol)) {
+      b.setInsertionPointToEnd(package->getBody());
+      b.insert(fifo.declaration->clone());
+    }
     b.setInsertionPoint(owner.getBody().front().getTerminator());
     auto zero = constant(0), data = constant(0, 8);
     storage.push_back(op(
-        ac::QueueOp::getOperationName(), {zero, zero, zero, data, zero},
-        {bits(1), bits(1), bits(8)},
-        {f("instance_name", b.getStringAttr("queue")), f("depth", literal(3)),
-         f("ready_policy", b.getStringAttr("local_occupancy")),
-         f("availability_latency", literal(2)),
-         f("head_read_latency", literal(0)),
-         f("empty_flow", b.getBoolAttr(false)),
-         f("read_during_write", b.getStringAttr("old")),
-         f("reset_policy", b.getStringAttr("sync_high_empty")),
-         f("empty_data", b.getStringAttr("zero")),
+        ac::InstanceOp::getOperationName(), {zero, zero, zero, data, zero},
+        {bits(1), bits(1), bits(8), bits(1)},
+        {f("instance_name", b.getStringAttr("queue")),
+         f("callee", FlatSymbolRefAttr::get(
+                         &context, "pycircuit.__builtins__.fifo_local")),
+         f("parameters", b.getArrayAttr({literal(3), literal(2)})),
+         f("type_arguments", b.getArrayAttr({TypeAttr::get(data.getType())})),
          f("occurrence", occurrence(owner.getSymName(), 49))}));
   }
   FailureOr<ac::HardwareSourceCheckPlan> plan() {

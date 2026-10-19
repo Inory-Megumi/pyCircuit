@@ -1,5 +1,6 @@
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "SourceValueSemantics.h"
+#include "ACIRSourceContracts.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringSet.h"
@@ -38,8 +39,28 @@ Attribute substitute(Attribute attr, const HardwareBindings &bindings) {
         }
       }
     }
-    return StaticExprAttr::get(
-        attr.getContext(), cast<DictionaryAttr>(substitute(tree, bindings)));
+    // Provenance is immutable source evidence, not part of the static
+    // computation. Literal and type-width nodes have no expression children
+    // to substitute; keep their complete authored metadata by identity.
+    if (!kind || kind.getValue() == "literal" ||
+        kind.getValue() == "type_width" || kind.getValue() == "reference")
+      return expr;
+    SmallVector<StringRef, 3> children;
+    if (kind.getValue() == "unary") children.push_back("operand");
+    else if (kind.getValue() == "binary") children.append({"lhs", "rhs"});
+    else if (kind.getValue() == "select") children.append({"condition", "yes", "no"});
+    else return expr; // Existing grammar/evaluation checks reject unknown kinds.
+    SmallVector<std::pair<StringRef, Attribute>, 3> changed;
+    for (StringRef name : children) {
+      Attribute child = tree.get(name);
+      Attribute rewritten = substitute(child, bindings);
+      if (rewritten != child) changed.push_back({name, rewritten});
+    }
+    if (changed.empty()) return expr;
+    NamedAttrList rewritten(tree);
+    for (auto [name, value] : changed) rewritten.set(name, value);
+    return StaticExprAttr::get(attr.getContext(),
+                               rewritten.getDictionary(attr.getContext()));
   }
   if (auto dict = dyn_cast_or_null<DictionaryAttr>(attr)) {
     NamedAttrList fields;
@@ -464,9 +485,9 @@ FailureOr<Type> HardwareAnalysis::resolveType(Type type,
       auto found = bindings.types.find(formal.getName().getValue());
       if (found == bindings.types.end())
         return type;
-      if (!isa<BitsType, StructType, EnumType, TypeParamType>(found->second))
+      if (!isa<BitsType, StructType, EnumType, TableType, TypeParamType>(found->second))
         return site->emitOpError()
-               << "hardware type parameter requires a scalar hardware binding";
+               << "hardware type parameter requires a finite hardware binding";
       type = found->second;
     }
     if (auto enumeration = dyn_cast<EnumType>(type))
@@ -623,7 +644,31 @@ FailureOr<HardwareBindings> HardwareAnalysis::bindCallee(
 LogicalResult
 HardwareAnalysis::verifyInstance(InstanceOp instance,
                                  const HardwareBindings &parent) const {
-  return verifyOccurrence(instance, parent);
+  if (failed(verifyOccurrence(instance, parent)))
+    return failure();
+  if (isQueueInstance(instance))
+    return verifyQueueOperation(instance, parent);
+  if (instance->hasAttr("ac.source_memory")) {
+    if (!isa<UnitAttr>(instance->getAttr("ac.source_memory")))
+      return instance.emitOpError() << "ac.source_memory requires a unit marker";
+    auto layout = getMemoryPrimitiveLayout(instance, parent);
+    if (failed(layout)) return failure();
+    auto constraint = instance->getAttr("ac.payload_constraint");
+    if (!constraint || failed(detail::verifySourceCallHardwareConstraint(
+            constraint, layout->payloadType, *this, instance->getParentOp(),
+            instance, "source Memory payload")))
+      return failure();
+    for (StringRef flag : {"ac.source_unbound_push", "ac.source_unbound_pop"})
+      if (instance->hasAttr(flag))
+        return instance.emitOpError() << "Queue binding flag is invalid on Memory";
+    return success();
+  }
+  for (StringRef name : {"ac.payload_constraint", "ac.source_unbound_push",
+                         "ac.source_unbound_pop"})
+    if (instance->hasAttr(name))
+      return instance.emitOpError()
+             << name << " requires a canonical FIFO instance";
+  return success();
 }
 LogicalResult
 HardwareAnalysis::verifyInstance(CollectionOp collection,
@@ -636,6 +681,12 @@ HardwareAnalysis::verifyOccurrence(Operation *instance,
   auto bindings = bindOccurrence(instance, parent);
   if (failed(bindings))
     return failure();
+  auto primitive = getPrimitiveKind(bindings->owner);
+  if (!primitive.empty() && primitive != "fifo_local" &&
+      primitive != "fifo_downstream_pop" &&
+      isa_and_nonnull<TableType>(bindings->types.lookup("T")))
+    return instance->emitOpError()
+           << "storage and memory primitives require a scalar payload binding";
   auto sig = cast<FunctionType>(
       bindings->owner->getAttrOfType<TypeAttr>("function_type").getValue());
   if (instance->getNumOperands() != sig.getNumInputs() ||
@@ -677,8 +728,10 @@ LogicalResult verifyHardwarePackage(mlir::ModuleOp package) {
 namespace acir::ac {
 LogicalResult HardwareAnalysis::verifyResolvedOperation(
     Operation *op, const HardwareBindings &bindings) const {
-  if (auto queue = dyn_cast<QueueOp>(op))
-    return verifyQueueOperation(queue, bindings, true);
+  if (isa<QueueOp>(op))
+    return op->emitOpError() << "ac.queue is retired; use a canonical FIFO instance";
+  if (auto instance = dyn_cast<InstanceOp>(op); isQueueInstance(instance))
+    return verifyQueueOperation(instance, bindings, true);
   if (isa<EnumCreateOp, EnumToBitsOp, EnumFromBitsOp>(op))
     return verifyEnumValueOperation(op, bindings, true);
   if (isa<CollectionOp, TableCreateOp, TableSplatOp, TableMapOp, TableViewOp,
@@ -699,6 +752,9 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
       return failure();
     outputs.push_back(*width);
   }
+  if (auto observe = dyn_cast<SourceObserveOp>(op))
+    if (observe.getKind() == "report" && inputs.size() == 2 && inputs[1] > 64)
+      return op->emitOpError() << "numeric report requires at most 64 bits";
   if (auto constant = dyn_cast<BitsConstantOp>(op)) {
     auto value = evaluateStatic(constant.getValue(), bindings, op);
     if (failed(value))
@@ -711,6 +767,10 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
       return op->emitOpError()
              << "bits constant does not fit bound result width";
   }
+  if (auto constant = dyn_cast<BitsConstant4Op>(op))
+    if (constant.getPattern().size() != outputs[0])
+      return op->emitOpError()
+             << "four-state pattern does not match bound width";
   if (isa<BitsUnaryOp, BitsBinaryOp, BitsSelectOp>(op)) {
     unsigned first = isa<BitsSelectOp>(op) ? 1 : 0;
     if (first && inputs[0] != 1)
@@ -723,6 +783,10 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
   if (isa<BitsCompareOp>(op) && (inputs[0] != inputs[1] || outputs[0] != 1))
     return op->emitOpError()
            << "bound comparison requires equal operands and width-one result";
+  if (isa<ValueRequireOp>(op) &&
+      (inputs[1] != 1 || inputs[2] != 1 || outputs[0] != 1))
+    return op->emitOpError()
+           << "bound required availability and path require width-one result";
   if (isa<BitsConcatOp>(op)) {
     uint64_t total = 0;
     for (auto width : inputs) {
@@ -797,5 +861,59 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
     }
   }
   return success();
+}
+bool isMemoryInstance(InstanceOp instance) {
+  if (!instance) return false;
+  auto callee = instance.getCallee();
+  return callee == "pycircuit.__builtins__.sync_mem" ||
+         callee == "pycircuit.__builtins__.sync_mem_dp" ||
+         callee == "pycircuit.__builtins__.byte_mem";
+}
+
+FailureOr<MemoryPrimitiveLayout>
+getMemoryPrimitiveLayout(InstanceOp instance,
+                         const HardwareBindings &parentBindings) {
+  if (!isMemoryInstance(instance))
+    return instance.emitOpError() << "Memory requires an actual canonical primitive allocation";
+  auto package = instance->getParentOfType<mlir::ModuleOp>();
+  HardwareAnalysis analysis(package);
+  auto bound = analysis.bindInstance(instance, parentBindings);
+  if (failed(bound)) return failure();
+  auto primitive = dyn_cast_or_null<ModuleImportOp>(bound->owner);
+  StringRef kind = analysis.getPrimitiveKind(primitive);
+  if (!primitive || (kind != "sync_mem" && kind != "sync_mem_dp" && kind != "byte_mem") ||
+      failed(analysis.verifyImport(primitive)))
+    return instance.emitOpError() << "Memory requires its checked canonical primitive declaration";
+  MemoryPrimitiveLayout result;
+  result.allocation = instance;
+  result.primitive = primitive;
+  result.kind = kind;
+  result.bindings = *bound;
+  result.readPorts = kind == "sync_mem_dp" ? 2 : 1;
+  result.readAddressOperands = kind == "byte_mem" ? SmallVector<unsigned, 2>{2}
+                              : kind == "sync_mem_dp" ? SmallVector<unsigned, 2>{3, 5}
+                                                       : SmallVector<unsigned, 2>{3};
+  if (kind != "byte_mem")
+    result.readEnableOperands = kind == "sync_mem_dp" ? SmallVector<unsigned, 2>{2, 4}
+                                                       : SmallVector<unsigned, 2>{2};
+  result.writeEnableOperand = kind == "byte_mem" ? 3 : kind == "sync_mem_dp" ? 6 : 4;
+  result.writeAddressOperand = result.writeEnableOperand + 1;
+  result.writeDataOperand = result.writeEnableOperand + 2;
+  result.writeMaskOperand = result.writeEnableOperand + 3;
+  unsigned outputs = kind == "byte_mem" ? 1 : 2 * result.readPorts;
+  if (instance.getNumOperands() != result.writeMaskOperand + 1 ||
+      instance.getNumResults() != outputs)
+    return instance.emitOpError() << "Memory pin layout differs from canonical signature";
+  auto resolve = [&](Type type) { return analysis.resolveType(type, parentBindings, instance); };
+  auto payload = resolve(instance.getResult(0).getType());
+  auto address = resolve(instance.getOperand(result.readAddressOperands[0]).getType());
+  auto mask = resolve(instance.getOperand(result.writeMaskOperand).getType());
+  auto bit = resolve(instance.getOperand(0).getType());
+  if (failed(payload) || failed(address) || failed(mask) || failed(bit)) return failure();
+  result.payloadType = *payload;
+  result.addressType = *address;
+  result.maskType = *mask;
+  result.predicateType = *bit;
+  return result;
 }
 } // namespace acir::ac

@@ -16,7 +16,94 @@ the raw nominal carrier and separate Boolean membership to two ordinary local
 names. Declaration-only, empty and facade files use the ordinary independent
 compile/link flow. See [nominal enums](spec-enums.md) for exact boundaries.
 
+## Rule authoring requirements and current admission
+
+The [four-state/System supplement](../rfcs/four-state-system.md) defines explicit
+X/Z literals, verification predicates, a shared root reset policy and generated
+finite stimuli. The source and execution boundaries are described below.
+
+The [Rule authoring contract](../development/agent-frontend-guide.md#rule-authoring-contract)
+requires simple, cohesive, stateless Rules, Module-style typed inputs and
+heterogeneous multi-output calls, Struct grouping by interface, and compiler-owned
+resource/proposal guards. Independent functions belong in separate Rules;
+effects that require atomic commit stay together. These requirements are tracked
+in [issue #319](https://github.com/PTO-ISA/pyCircuit/issues/319).
+
+Modules, Rules and Methods share admitted finite typed scalar, nominal payload
+and fixed nonempty tuple signatures. A Module-scope Rule call registers an autonomous transaction; calls
+inside a Rule or Method execute within that outer transaction. Unannotated
+executable Rules specialize from actual SSA types, ownership and closed facts.
+The compiler carries output availability for guarded valued Rules; authors do
+not add a valid field or a holding register to make their results usable.
+
+Module and Rule connections use typed parameters and returned values. There is
+no separate Signal resource or set/get interface in the language design. The
+compiler owns value availability and dependency checks; persistent state and
+Queue provide cross-cycle storage.
+
+Scalar fixed-Bits Modules and their tuple results may declare keyword-only
+static Integer parameters, for example
+`def Identity(value: ac.bits[W], *, W: int = 8) -> ac.bits[W]`.
+Direct same-source and imported calls separate static keywords from hardware
+arguments and substitute each instance's actual widths. A caller may forward
+its own declared parameter. Root overrides use the existing link command's
+`--parameters` JSON file. Actual width, constant-fit and hardware-argument checks
+still run at the bound instance; defaults are not proof for every instance.
+This support does not add generic state initialization, typed-transaction static
+parameters, type parameters, symbolic Integer domains or `range(W)` expansion.
+
+The profiles below retain their shape, indexing, purity and control restrictions.
+General queue/resource admission and complex SCF loop-control combinations remain
+implementation and runtime acceptance work. Preserve explicit protocol checks
+until equivalent inferred guards pass the original oracles; algorithmic
+conditions remain part of authored behavior.
+
+## Four-state values and verification
+
+`ac.four_state("10xz")` constructs an exact-width `bits[4]` value, most significant
+symbol first. Its argument must be a nonempty literal containing only ASCII
+`0`, `1`, `x`, `X`, `z`, or `Z`. Uppercase is normalized. Prefixes, separators,
+whitespace and runtime strings reject. Widening zero-extends; narrowing requires
+an explicit slice. All-known patterns still have fixed-Bits source provenance,
+not mathematical Integer/static-parameter authority. Struct and Table Bits fields
+and closed state initializers preserve the same masks.
+
+`ac.case_eq(a, b)` compares equal-width Bits including X/Z symbols exactly.
+`ac.is_known(value)` tests whether all bits are 0/1. Both return a known Boolean
+at runtime; neither supplies a compile-time fact. Ordinary `==` retains its
+four-state behavior. These observer predicates are for assertions, logs and
+known-Boolean reports. Diagnostic branches and helper/alias transport are
+permitted; functional outputs, state writes, indices, Rule admission and hardware
+call arguments cannot depend on them. The compiler checks data and control uses.
+Availability is checked independently: an available X payload is legal, and an
+unavailable result cannot be consumed even just to inspect its knownness.
+
+These APIs describe deterministic simulation symbols. They do not establish
+synthesis support for X detection or introduce multi-driver resolution.
+
 ## Behavioral variables and rules
+
+Ordinary Module computations use the same assignment, `if`, `match` and admitted
+literal-`for` value lowering as pure helpers. For example:
+
+```python
+@ac.module
+def Adjust(value: ac.u8, enabled: ac.u1) -> ac.u8:
+    result = value
+    if enabled:
+        result = result + 1
+    return result
+```
+
+These unannotated locals are combinational values. Pure branches retain four-state
+value merging; they do not implicitly allocate registers or require a known
+selector. A name first defined inside a branch must be defined on every arm
+before use. Module-top annotations retain their persistent declaration meaning;
+updates to persistent owners belong in Rules. Hardware allocation, Rule
+registration and annotated declarations remain outside runtime-controlled Module
+branches. Protected ports, imports and instance bindings cannot be reassigned.
+An existing child or Rule does not select a different ordinary statement language.
+The current terminal-return and loop-admission restrictions still apply.
 
 The behavioral slice uses `import pycircuit as ac`, unsigned `ac.bits[W]`
 and `ac.u1` through `ac.u64`, and same-source `@ac.struct` declarations.
@@ -47,20 +134,38 @@ nested constructors. Provider defaults are not published and cannot supply
 omitted fields. Imported static initializers and Table-query constructor
 callbacks retain their existing narrower admission.
 
-Module-scope annotated variables allocate persistent storage.
+Module-scope annotated variables allocate persistent storage. Each admitted
+scalar or structured state declaration lowers to a standard typed DFF/DFFE
+storage child of its Module, using the same `ac.instance` input/output model as
+other child modules. The frontend infers its storage connections; the author
+does not supply a separate register instance. This classification depends on
+the declaration, not on using a `uN` type name. Ordinary expression locals and
+module-result bindings remain value/wire connections.
+
+The [state-declaration authoring contract](../development/agent-frontend-guide.md#module-state-declarations-and-storage-children)
+requires finite storage representations beyond Bits. The common transaction
+path retains admitted Bits, Enum, Struct, Table, Boolean and bounded Integer
+state, including Bits wider than a host integer. Existing shape, initialization
+and nested-index restrictions remain; this does not admit every MLIR arithmetic
+type or arbitrary Python value.
+
 `entries = ac.table[N, Entry](init=0)` allocates a fixed one-dimensional table
 of persistent entries. Contextual zero initializes each field recursively,
 ignoring nonzero constructor defaults. `init=Entry()` instead constructs an
 element using its defaults and broadcasts that value to independent owners.
 Initializers must be compile-time values; inputs and existing state are not
 initialization expressions in this slice.
+An annotated Table may use a complete tuple/list image, such as
+`entries: ac.table[2, ac.u8] = (1, 2)`. Its length and every element are checked
+against the Table type. A scalar/Struct element initializer still broadcasts;
+recursive zero keeps its existing behavior.
 
 A same-source top-level `@ac.rule` takes these variables as ordinary parameters.
 Assignments inside the rule follow sequential local value semantics; a read
 after an assignment sees that rule's computed value. Rebinding a parameter
 connected to a module-owned variable proposes an update to that owner. Rebinding
 a pure input or local changes only the local value. The module can return the
-rule's typed struct result or existing named result mapping directly. A local
+rule's scalar, Struct or fixed-tuple result (legacy named result mappings remain admitted) directly. A local
 `result = Result()` allocates no storage; `result.field = value` reconstructs
 its SSA value, including nested field paths. Previously saved values remain
 snapshots. Persistent field updates participate in the root owner's write set
@@ -126,6 +231,23 @@ This analysis does not change the comparison or selection hardware, declare
 unknown bits known, or turn a singleton result range into a source constant.
 It does not recursively analyze compound guards or imply an implicit narrowing
 conversion.
+
+`value[index]` reads one bit from an authoritative fixed-Bits value; index zero
+is the least significant bit and the result is fixed `bits[1]`. Literal and
+runtime selectors reuse the Table index rule: the complete nonnegative known
+range must fit the actual resolved width. A wider selector is never truncated
+before checking or shifting. A selector containing X/Z yields X, while a known
+selector reading a Z bit preserves Z. Known out-of-range, negative and unproved
+ranges reject. Boolean and bounded Integer selectors cross the existing fresh
+unsigned boundary; this does not change their saved aliases' source kinds.
+Boolean/Integer *data carriers* do not become indexable Bits implicitly.
+Dynamic-width slices and bit/slice assignment are not admitted by this read API.
+
+Closed power-of-two Integer port bounds may use equivalent static expressions,
+for example `Annotated[int, range(8)]`, `range(4 + 4)` or `range(1 << 3)`.
+The existing evaluator derives the exact width; symbolic `1 << WIDTH` retains
+its original parameter binding. Bounds must yield a positive hardware width;
+Boolean, non-power-of-two, zero, negative and singleton bounds remain rejected.
 
 `ac.concat(first, second, ...)` joins one or more unsigned fixed-bit values,
 with the first operand in the most significant positions. A singleton preserves
@@ -233,8 +355,9 @@ IR graph is O(log² W), with compact scalar literals and no new IR or Runtime
 primitive. Existing backend capacity and observation-emission limits still apply;
 huge-width compile/link support is not a runtime allocation guarantee.
 
-Unsigned fixed bits also support `value << count` and `value >> count` with a
-proven static, nonnegative Integer count. Both results retain the input width.
+Unsigned fixed bits support `value << count` and `value >> count` with either a
+proven static, nonnegative Integer count or an authoritative fixed Bits count.
+Both results retain the input width.
 Retained value/known/Z bits move unchanged and vacated positions become known
 zero. A zero count is identity; a count at least the input width produces known
 zero. Counts are compared at their full precision, including beyond 64 bits,
@@ -242,10 +365,14 @@ before lowering; they never wrap modulo the input width.
 
 Destination conversion happens after the shift. For `a: ac.u8` equal to 128,
 `wide: ac.u16 = a << 1` yields zero. Explicitly widening `a` to a u16 local
-before shifting yields 256. Boolean inputs/counts, negative or runtime counts,
+before shifting yields 256. A runtime Bits count retains all its bits, including
+when wider than the data. An X/Z count produces a wholly unknown result.
+Boolean inputs/counts, negative or runtime mathematical Integer counts,
 unproved input widths and missing unsigned source authority diagnose. A local
 alias, singleton runtime interval or unresolved parameter default is not static
-count proof. Mathematical Integer right shift keeps its separate exact-value
+count proof. The live induction binder of an expanded pure-helper loop is a
+closed Integer for that iteration; aliases or rebound values do not acquire
+this static-count authority. Mathematical Integer right shift keeps its separate exact-value
 contract below; runtime mathematical left shift remains unsupported.
 
 For an unsigned fixed `bits[W]` numerator, `value // divisor` and
@@ -289,8 +416,14 @@ DUT interface. One Step remains one sampling epoch, not a complete clock period.
 A behavioral module may register multiple state-writing rules when their write
 sets are proven disjoint: different persistent declarations, different nested
 Struct fields, different direct-literal elements of one Table, or disjoint fields
-of a one-dimensional Table element even when its indices are dynamic. All rules read the same old state; call
-order does not introduce state forwarding or write priority. Ordinary local
+of a one-dimensional Table element even when its indices are dynamic. The
+unified callable path currently rejects separate-Rule dynamic disjoint-address
+writes to one Table; restoration of the address-grant behavior described below
+remains unfinished. Independent Rules read committed state; ordinary call
+order does not introduce state forwarding or write priority. An explicit
+`@ac.rule(after=(earlier,))` may establish predecessor-candidate visibility;
+each predecessor must identify one unique local outer registration. Missing or
+ambiguous registrations, cycles and conflicting writers reject. Ordinary local
 assignments, if/else, struct defaults/construction/projection and proven table
 indices retain their existing semantics. Overlapping writable parameter aliases
 reject; read-only duplicate bindings are permitted. Unproved index ranges,
@@ -339,8 +472,9 @@ X for unknown input and retains the existing unknown-enable failure behavior.
 A rule that conditionally writes one field but unconditionally writes another
 has an enabled owner; its inner field condition is not a whole-owner grant.
 
-For overlapping indexed paths, ordinary source expressions can permit both
-writers when their addresses separate:
+The address-grant contract permits overlapping indexed paths when ordinary
+source expressions prove their addresses separate. This behavior is not yet
+restored for separate Rules on the unified callable path:
 
 ```python
 grant_a = request_a
@@ -388,8 +522,11 @@ Module-scope statement calls can register rules without dummy result values.
 Fallthrough, final bare return and `-> None` rules have no source outputs; a
 `-> None` rule cannot return a non-None value. A typed return may be ignored without
 dropping its updates/checks. Void rules reject in value contexts. Existing
-unannotated value-return rules retain their contract; early or conditional
-returns and nested rule registration are not added by this support.
+unannotated value-return Rules specialize from actual SSA rather than a guessed
+first-registration signature. An assigned or nested call infers its returned
+scalar or tuple; a direct Module-return call retains the declared output context.
+Early or branch-local returns remain rejected. A nested Rule call invokes the
+callee in the current transaction rather than registering another transaction.
 
 Within one rule, assignment order and its effective owner enable are unchanged.
 Across rules, a known-enabled writer must not mask an unknown-enabled sibling
@@ -502,7 +639,8 @@ state snapshots and immutable local Struct/Table updates are permitted. This is
 a current coverage boundary, not a permanent restriction on hardware language
 loops. The body supports ordinary assignments, annotations, `pass`, existing
 `if`/conditional expressions, projections, proven Table indexing, fixed slices,
-`+`, `-`, `*`, `&`, `|`, `^`, supported unary/comparison/Boolean expressions,
+`+`, `-`, `*`, `&`, `|`, `^`, fixed shifts, unsigned division/remainder,
+supported unary/comparison/Boolean expressions,
 nominal Struct construction and contextual Table literals. Calls are limited to
 `concat`, `enum_to_bits` and verified pure value helpers. This does not broaden
 the loop grammar or named Table callback restrictions; helper expansion is
@@ -510,8 +648,16 @@ charged to the existing loop and source-wide budgets.
 Unary `not` and fixed-bit `~` retain their existing rules. Unary `+` and `-`
 are not implemented in this profile, including zero-trip bodies; binary
 subtraction such as `0 - 1` can produce a negative Integer.
-Shifts, division/remainder, Table methods, other intrinsics, allocations, rule
+Arithmetic reuses the ordinary expression type and range rules, including
+full-width shift counts and positive fitting static divisors. Table methods,
+other intrinsics, allocations, rule
 registration, assertions and observations inside loops remain unsupported.
+
+The restrictions above describe the pure-helper expansion path. Typed Rule
+loops use the existing SCF/transaction producer and additionally admit supported
+state writes, assertions, observations and loop control. Passing a Rule-loop
+test does not establish support in a pure helper. Nested loops and `for`/`else`
+remain rejected in both paths.
 
 Expansion uses the existing source-wide resource limits. The compiler checks
 trip counts, work, operations, storage and constant sizes before expanding paid
@@ -536,9 +682,16 @@ issue_index, issue_valid = entries.argmin(
 
 Both calls require exactly two distinct ordinary result names. `where` and `key`
 are required keyword arguments; callbacks are one-argument expression lambdas,
-without defaults or variadic arguments. Existing scalar expressions and pure
+without defaults or variadic arguments. The same tuple binding is admitted at
+module scope over an existing closed Table; both results become ordinary module
+values that later Rules may capture. Module-scope queries cannot target a
+persistent owner, input, Method or Rule registration. Existing scalar expressions and pure
 intrinsics retain their ordinary type rules. Captures are immutable SSA snapshots;
-row-dependent reads of captured Tables retain normal index-admission checks.
+an owner-bound state name is read once at the query statement, after earlier
+proposals in that Rule. A saved local retains its earlier value. Lambda parameters
+shadow outer bindings. These reads occur outside the pure per-row template;
+callbacks do not acquire state or introduce another transaction.
+Row-dependent reads of captured Tables retain normal index-admission checks.
 Named-def callbacks, nested queries, allocation, module/rule calls, instrumentation
 and mutation are unsupported, including inside a callback's dead branch. General
 lambda values or tuple results are not introduced.
@@ -553,6 +706,31 @@ range proof does not establish that a physical value is known.
 
 ## Queues
 
+Prefer a named Queue with typed calls inside Rules:
+
+```python
+tokens = ac.queue[Packet](depth=2, latency=1)
+
+@ac.rule
+def put(packet: Packet) -> None:
+    tokens.push(packet)
+
+@ac.rule
+def get() -> Packet:
+    return tokens.pop()
+```
+
+The named form defaults to `ready_policy="downstream_pop"`. `push(value)`
+proposes one enqueue; `pop()` returns the committed head and proposes one dequeue;
+`peek()` returns the committed head without consuming it. The compiler derives
+resource admission and result availability. A blocked required access prevents
+the entire outer Rule from committing, including writes in other child Modules.
+Calls add no independent commit frame. Queue construction remains module-scoped;
+aliases identify the same allocation, while separate constructions own separate
+state. Declared logical payload types are preserved across calls.
+
+Explicit protocol boundaries may use the three-output raw form:
+
 ```python
 ready, available, value = ac.queue[ac.u8](
     valid, data, take, depth=2, ready_policy="downstream_pop"
@@ -565,7 +743,7 @@ or authoritative fixed one-bit values through the existing predicate rules;
 mathematical Integer `0/1` does not become a predicate. Payloads use existing
 fixed-bit, nominal and admitted one-dimensional table types.
 
-The allocation must be one direct module-body assignment to three distinct,
+The raw allocation must be one direct module-body assignment to three distinct,
 fresh names. Result bindings cannot be reassigned or mutated through fields or
 indices. A future queue result can supply a connection: each result keeps its
 own ordinal, while input expressions bind once at the lexical call position.
@@ -589,6 +767,87 @@ Clock/reset and transaction proposals remain compiler-owned. Queue presence
 propagates a hidden physical domain through ordinary module calls, including
 imported stateless parents. This does not add behavioral static parameters or
 general source collection allocation.
+
+Both source forms produce ordinary `ac.instance` nodes referring to canonical
+native FIFO Modules. Typed accesses use `ac.method.call`; the existing transaction
+lowerer supplies their pins and verifies the final instance wiring. The physical
+FIFO also has a compiler-only committed-capacity output, independent of current
+requests. It is not a fourth Python output. C++ and Verilog retain the existing
+FIFO kernels; retired `ac.queue` and `ac.queue.push/pop/peek` IR operations reject.
+Python `ac.queue[T]` remains the public constructor syntax.
+
+The named form may bind raw `in_valid`/`in_data` together or raw `out_ready` at
+construction. A raw-bound direction cannot also be driven transactionally, even
+when the authored raw request is constant zero. Read-only `peek` does not claim
+the dequeue port.
+
+## Memory operations
+
+Allocate a named Memory in its Module and call it from Rules:
+
+```python
+memory = ac.sync_mem[ac.u16](depth=16)
+
+@ac.rule
+def request_read(address: ac.u4) -> None:
+    memory.request(address)
+
+@ac.rule
+def read_response() -> ac.u16:
+    return memory.result()
+
+@ac.rule
+def store(address: ac.u4, value: ac.u16) -> None:
+    memory.write(address, value)
+```
+
+`sync_mem[T]`, `sync_mem_dp[T]` and `byte_mem[T]` reuse the existing native
+Memory Modules. `T` is fixed Bits or an admitted Struct/Enum; byte memory requires
+a whole-byte payload. Depth is a positive closed static Integer. Allocation
+handles are immutable; aliases retain the same physical memory. Clock, reset,
+read/write enables, response validity and commit wiring are compiler-owned.
+
+Synchronous `request(address, port=0)` proposes a read. `result(port=0)` returns
+the committed response snapshot without consuming or refreshing it. The port
+is a closed static Integer: zero for `sync_mem`, zero or one for `sync_mem_dp`.
+A request becomes visible after a successful rising-edge Xfer. Concurrent reads
+and writes to one address return the old data. The first idle rising edge retains
+the response; the second invalidates it at Xfer. Work on that second edge still
+observes the previous snapshot. Low, held, falling and discarded epochs do not
+age responses. Reset invalidates responses and retains RAM.
+
+A reached unavailable `result()` inhibits its entire outer Rule, including
+previous requests, writes and child calls. An untaken access does not inhibit
+it. Request and result in one Rule observe the previous response; they cannot
+bootstrap an initially empty response. Use separate producer/consumer Rules or
+an explicit controller phase. Save a returned value in Module state when the
+algorithm must retain it beyond the response lifetime. Availability comes from
+the primitive's live state, independently of payload knownness.
+
+`byte_mem.read(address)` is an asynchronous read of committed storage. It may
+feed later computation and a write in the same Rule. It has no request/result
+pair. The compiler derives its reached read demand, drives a safe idle address
+when inactive, and preserves reached selector diagnostics. A genuine
+read-data-to-read-address combinational cycle remains invalid.
+
+`write(address, value, mask=...)` uses the single write port shared by each
+Memory's read ports. The default mask enables all byte lanes; low packed byte
+lanes come first, including the partial last byte of a synchronous payload.
+Enabled write data and masks retain the existing knownness requirements.
+Known out-of-range synchronous reads return zero and writes do nothing; source
+address widths still match the depth-derived signature. Memory addresses do
+not acquire Table indexing's source in-range requirement.
+
+Multiple potentially simultaneous requests or writes to one physical port
+require an exclusivity proof or reject at link. Statement order and `after`
+do not create ports. Repeated byte reads may share a proven-equal full-width
+address; a dominating read supplies a later equivalent access without adding
+a feedback dependency. Multiple snapshot readers do not claim a request port.
+The compiler checks these properties through actual owners and aliases.
+
+The raw pin-oriented Memory calls remain available to primitive conformance
+tests with their original payload arity. Ordinary examples use named operations.
+Both targets consume the same verified final IR and existing storage kernels.
 
 ## Branches and binding boundaries
 
@@ -732,9 +991,11 @@ assignment can also initialize an unused partial local. Joins retain existing
 ordered binary typing rather than inferring a new type from all arms together.
 
 Nested `if`/`match`, ordinary field/table updates and admitted two-name Enum
-conversion bindings reuse their existing rules. Returns within arms, allocation,
-module/rule calls and external effects remain unsupported. Capture/as, class,
-sequence, mapping, starred and guarded patterns reject. Whole struct/table
+conversion bindings reuse their existing rules. The transaction profile below
+adds statement-arm Rule/Method calls and body effects; that does not extend this
+pure match profile. Returns within arms and allocation remain unsupported.
+Capture/as, class, sequence, mapping, starred and guarded patterns reject.
+Whole struct/table
 selectors, masked patterns, unbound widths/type parameters and signed or
 mathematical comparison selectors remain outside this profile; struct/table
 payloads and updates are supported.
@@ -744,17 +1005,54 @@ successful diagnostics do not change stdout or source-unit artifacts.
 
 ## Direct module composition
 
-Same-source modules with typed struct returns can be called directly in module
-scope: `first = Child(request)` followed by `second = Child(first)`. The returned
-values connect through existing SSA and whole-struct ports. Each static call
-occurrence owns a separate instance; reusing `first` only fans out its value.
+Modules with one admitted scalar, Enum, Struct or fixed Table result, or a fixed,
+nonempty tuple return annotation, can be called directly in module scope. Use `-> tuple[T0, T1, ...]` and an explicit
+`return value0, value1, ...` for independent outputs, then bind them with
+`first, second, valid = Child(request)`. Each element uses the existing port type
+and source-kind rules and becomes a separate SSA result of one `ac.instance`.
+A Struct element remains one whole-Struct result. No tuple hardware operation,
+packing wrapper, state or additional cycle is introduced. A single result uses `first = Child(request)` and can connect directly to
+`second = Child(first)`. For example, `-> ac.u8` returns one Bits value;
+`-> tuple[ac.u8]` remains a singleton tuple and requires unpacking. Scalar
+results retain the same Boolean/Integer distinction, declared bounds and fixed
+bit widening rules as input and tuple-result boundaries.
+Each static call occurrence owns a separate instance; reusing its results only
+fans out existing values.
+
+For authoring, prefer one named Struct when several fields are normally consumed
+together by one downstream module. Pass it as one typed result/input instead of
+flattening its fields into parallel ports. Use tuple results for independent
+interfaces or separately routed outputs; a tuple element may itself carry a
+Struct. This keeps field evolution within the shared payload definition and its
+users without changing the connection's argument/result count. It does not change
+state, timing or scheduling semantics.
+
+Tuple arity must be fixed and match both return and unpacking; `tuple[T]` uses
+`return (value,)` and `value, = Child(...)`. Unpacking requires one flat Tuple of
+distinct ordinary Names. Starred, list, nested, field and index targets, scalar
+use of a tuple-return call as an ordinary payload, nested/variadic tuple
+annotations, and writes into persistent or protected bindings reject. Ordinary
+local rebinding is preserved.
+Modules, Rules and Methods use the same fixed output-signature convention;
+there is no general tuple-valued hardware expression. See the
+[authoring guide](../development/agent-frontend-guide.md#module-hierarchy-and-independent-outputs)
+for a complete example.
 Nested calls in one expression are sibling instances in the enclosing module;
 calls in a callee's body establish child hierarchy. Source order does not add
 cycles, registers or commit priority.
 
+A named Module result retains its immutable instance identity as well as its
+output value. `child = Child(request)` can supply the single result and serve as
+the receiver of `child.update(...)` in a Rule. A multiple-result binding holds an
+output bundle that can later be unpacked with `first, second = child`; a
+zero-result Module still supplies an instance handle. Immutable aliases retain
+the same allocation and candidate state. Unpacked outputs are ordinary values
+and do not acquire the instance handle.
+
 A direct call may read a later module result or its fields. The later name must
-have exactly one unannotated simple assignment whose right-hand side is a direct
-module call, with no other assignment, field/index mutation or shadow. This
+have exactly one unannotated assignment whose right-hand side is a direct module
+call: a simple name for a single result, or one of a tuple call's unpacked names.
+It must have no other assignment, field/index mutation or shadow. This
 restriction applies when looking up a name before its declaration; ordinary
 sequential local rebinding and field updates remain available without forward
 lookup. Inputs, state and already-bound locals take precedence over future names.
@@ -785,10 +1083,13 @@ graphs, dynamic or rule-local instance creation, and annotated module-call resul
 bindings diagnose. Use an unannotated result local; its type comes from the
 callee, avoiding ambiguity with persistent variable declarations.
 
-Typed struct results use one existing physical output, normally named `result`;
-the compiler resolves a collision with an input name deterministically. Python
-does not name that physical output or repeat a dictionary of field names.
-Direct typed-struct calls also accept independently published module declarations
+A single typed Struct result uses one physical output, normally named `result`.
+Tuple results use ordered physical outputs named `result_0`, `result_1`, and so
+on. The compiler resolves name collisions deterministically; caller names do
+not rename these ports. Source interfaces retain `ac.return_form = "tuple"` and
+one ordered result constraint per source output; every constraint is verified
+against the corresponding physical signature entry.
+Both direct call forms also accept independently published module declarations
 through from-imports, aliases and facade reexports. Their interfaces explicitly
 carry source argument kinds, result form and hidden-domain mapping. Consumer
 compilation uses those validated interfaces; link compares the complete contract
@@ -808,6 +1109,14 @@ same-source declarations. Existing cross-source structural modules retain their
 current flow when no ordinary source-call contract is declared.
 
 ## Structural modules, instances and rules
+
+This retained structural profile supports existing named output mappings.
+For new and migrated examples, use the scalar, Struct and tuple Module results
+and direct calls described above. Explicit canonical `dff(T=...)` and
+`dffe(T=...)` binding is also supported inside those typed Modules; preserve
+physical pins when the design specifically exercises independent clock domains
+or primitive reset/enable behavior. Ordinary design state uses annotated
+Module-owned variables.
 
 - `@module` declares a reusable definition, typed positional inputs and a named
   output-type mapping. The selected root may have explicit ports.
@@ -884,16 +1193,16 @@ hardware IR, and neither backend interprets Python helpers.
 Ordinary expressions, registered Rule/Method bodies, named Table callbacks and
 the existing bounded-loop caller share this helper implementation. Named Table
 callbacks retain their fixed-Bits and zero-capture restrictions; calls inside
-Table expression lambdas remain unsupported. Helper support does not establish
-Method final lowering or runtime execution. The transaction extension remains
-subject to its separate acceptance criteria.
+Table expression lambdas remain unsupported. Helper purity is separate from the
+transaction execution and resource boundaries described below.
 
-Each Rule declaration must be registered exactly once per Module/System
-instance, as a complete static statement call, assignment value or return value.
-Nested expression calls, callable-body calls, Table callbacks and loop/repeated
-registration are rejected. A pure autonomous Rule remains a Rule; its return
-type or absence of writes never silently converts it into a helper. Historical
-pure `@rule` helpers must be changed to typed `def` explicitly.
+Defining a Rule does not execute it. Each Module/System-scope Rule call creates
+a distinct registration, including repeated calls to one declaration. A call
+inside a Rule or Method invokes the callable in the existing outer transaction;
+a Method never registers autonomous work. General calls in Table callbacks,
+selectors, guards and pure helpers remain rejected. A pure autonomous Rule
+remains a Rule; its return type or absence of writes does not silently convert
+it into a helper. Use a typed `def` for a pure expression helper.
 
 ## Immutable local wires
 
@@ -923,16 +1232,18 @@ cannot capture the retired data spelling; capture an earlier alias instead.
 
 This exception does not permit data assignment after an earlier registration,
 calling a name while it denotes data, Rule-to-data rebinding, or collisions with
-storage and instance names. It preserves the existing exactly-once and
-forward-registration rules, structural local immutability, and whole-scope
+storage and instance names. It preserves the structural profile's binding and
+forward-registration rules, local immutability, and whole-scope
 import/type/intrinsic shadow checks. Fixed-result bindings retain their existing
 shape and freshness restrictions. Typed transaction and Method-owner binding
 rules are not extended by this exception.
 
 Only a Call resolved to an existing module or trusted leaf declares an instance;
 a lexical shadow cannot redirect constructor lookup to an outer definition.
-Rebinding, tuple/attribute/subscript targets, AnnAssign, rule-local assignments,
-general forward references and arbitrary calls remain unsupported.
+In this structural instance-declaration form, rebinding, tuple/attribute/subscript
+targets, AnnAssign, rule-local instance allocation, general forward references
+and arbitrary calls remain unsupported. The direct typed-result composition and
+transaction profiles have their separate binding rules above and below.
 
 Naming does not add static-alias evaluation for counts, widths or parameters.
 A captured singleton interval is not proof of a literal mask. Compute a complete
@@ -1043,16 +1354,20 @@ not a clocked reset pulse or a promise to clear memory.
 
 ## Method execution and remaining capabilities
 
-The conditional-call/effect and local nominal-join candidate extends the bounded
-route described here to statement-arm Method calls, assertions, observations and
-immutable Struct/Enum locals. That candidate is still awaiting acceptance:
-these semantics and the retained fixtures are not a claim that its compile,
-execution or gate checks passed. See the
-[conditional-effect acceptance checklist](../rfcs/serial-rule-method/conditional-effects.md#acceptance-checklist).
+The common callable route supports statement-arm Rule/Method calls, assertions,
+observations, finite state and nominal local joins. Focused generated C++
+workers 1/2 and four-state RTL tests exercise this bounded route. This evidence
+does not establish general queue/resource admission, arbitrary SCF control or a
+complete example/nightly gate. See the
+[conditional-effect acceptance checklist](../rfcs/serial-rule-method/conditional-effects.md#acceptance-checklist)
+for the broader obligations.
 
-Native sampled-admission lowering and both backend lifecycles are implemented
-for same-domain transactions over whole fixed-width Bits, with one outer writer
-per actual owner. Transaction bodies may be straight-line or use bounded
+Native sampled-admission lowering and both backend lifecycles support same-domain
+transactions over admitted finite Bits, Enum, Struct, Table, Boolean and bounded
+Integer state, with unordered writers admitted only when their actual write
+footprints are disjoint or their grants are proven mutually exclusive. Local
+ordered groups retain their documented precedence. Transaction bodies may be
+straight-line or use bounded
 statement `if`/`elif`/`else`/`pass` branches with finite nesting. The lowerer
 emits sampled-check metadata and
 complete transaction-wiring records. It authenticates the detached candidate
@@ -1071,28 +1386,32 @@ tested candidate; prior checkpoints do not certify later changes.
 The compiler independently publishes a bounded subset of `@method` and nested
 transaction syntax as verified source units. Consumers use published interfaces
 without provider Python or method bodies. Shared IR analysis resolves receiver
-identities, checks the complete call/instance closure and proves conservative
-totality for valued Rules. Logical Boolean, Integer and fixed-bit contracts
+identities, checks the complete call/instance closure and records conservative
+totality together with compiler-managed output availability. Logical Boolean,
+Integer and fixed-bit contracts
 remain distinct across interfaces; ordinary typed-result modules retain their
 value-call behavior.
 
-This source-compilation subset retains fixed scalar state, sequential local
-assignments/calls, typed scalar/Struct results, lambda guards and static
-zero-argument Method-owner construction. A branch may update whole fixed-width
-Bits owners and may join changed scalar locals, nominal Enums and finite acyclic
-nominal Structs containing fixed-width Bits, Enums and nested admitted Structs.
+This source-compilation subset retains finite state, sequential local
+assignments/calls, typed scalar/Struct/fixed-tuple results, lambda guards and
+static zero-authored-argument Method-owner construction with no ordinary result.
+Rule-only value Modules retain their ordinary typed inputs and results. A branch
+may update admitted owners and join changed scalar locals, nominal Enums,
+finite acyclic nominal Structs and admitted fixed Table payloads.
 Changed nominal values on both arms must have the same nominal type; equal
 packed layouts do not make different declarations interchangeable. Existing
 locals inherit the branch-entry value on an unassigned arm; new locals used
 after the join must be defined on both arms. An omitted owner assignment inherits
 the candidate and write intent that entered the branch. Unconditional Method
-calls may appear before or after a branch. In the conditional candidate, arms may
-also call Methods and contain ordinary `assert`, `log` and `report`, including
+calls may appear before or after a branch. Arms may also call Rules/Methods and
+contain ordinary `assert`, `log` and `report`, including
 nested `if`/`elif`/`else`. A conditional observation alone selects this route;
-authors need no dummy Method, guard or state. Effectful loops, early or
-branch-local returns, partial or aggregate state updates, transaction resources
-and changed Table-containing locals escaping the join remain outside this subset.
-Unchanged Table-containing captures retain their existing admission.
+authors need no dummy Method, guard or state. Early or branch-local returns,
+general transaction resources and complex loop-control combinations remain
+outside this execution claim. Existing Table shape, initialization and nested
+indexing restrictions still apply to partial updates and joins. Dynamic
+disjoint-address writes from separate Rules to one Table currently reject on
+the unified path; restoring that existing address-grant behavior is unfinished.
 Calls and effects in selectors, guards, pure helpers, collection callbacks and
 conditional expressions remain rejected. Static dead arms still undergo type,
 closure, recursion, domain and potential-writer checks.
@@ -1103,8 +1422,9 @@ subtree. The root must be a currently bound ordinary payload; a captured or
 returned payload remains a snapshot, and saved aliases keep their earlier value.
 The declared field type checks the replacement while the root keeps its original
 nominal binding. This does not write persistent state or mutate the producer.
-Table-containing roots, annotated field targets, indexed/slice targets and
-augmented assignments remain rejected in transaction bodies. Scalar binding
+Admitted indexed state and Table updates preserve their current root candidate
+and untouched fields. This does not add arbitrary nested indexing, slice writes,
+annotated field targets or new augmented-assignment forms. Scalar binding
 conversions and four-state joins retain their existing rules.
 
 Nominal joins lower through the same verified common IR: Struct fields are
@@ -1119,34 +1439,40 @@ costs are prepaid against existing budgets. The inherited arbitrary-precision
 arithmetic evaluator capacity policy remains OPEN; this slice does not establish
 a fully bounded compiler or close `METHOD-ANALYSIS-BOUNDS`.
 
-A guarded nested Rule also selects typed transaction capture without requiring
-a dummy Method or state. A module such as `GuardOnly(enabled: u1)` may omit its
-module return annotation and register a zero-argument nested Rule with
-`-> None`. This does not admit module `-> None` or registration arguments.
-Source capture alone does not establish public dynamic-guard execution.
-Ordinary unguarded modules keep their existing source path.
+A guarded nested Rule uses the same callable path without requiring a dummy
+Method or state. Registration arguments bind the callable's formal contract;
+typed Rules publish their signatures, while executable unannotated Rules use
+actual-SSA specialization. Source-global Rules do not implicitly capture state
+or locals from an unrelated calling Module. Capture alone does not establish
+execution support beyond the bounded generated tests described here.
 
-Native final link lowers whole scalar state represented by fixed-width Bits,
-repeated or nested Method calls through static ordinary instances in the same
-physical clock/reset domain, bounded whole-Bits branches, straight-line effects,
-and, in the conditional candidate, statement-arm calls/effects. It retains at
-most one outer Rule writer per actual owner.
+Native final link lowers admitted finite state, repeated or nested Rule/Method
+calls through static ordinary instances in the same physical clock/reset domain,
+bounded branches and straight-line or statement-arm effects. Unordered writers
+of one actual owner are admitted only through independent write-footprint
+disjointness or grant-exclusivity proofs; an ancestor partial lane is composed
+with its captured Q before crossing a hierarchy port.
 Calls share their outer transaction's candidate versions; saved ordinary values
 remain snapshots. Independent Rules read old Q, regardless of registration
-order. Separate structural instances retain independent state. Each state
-declaration uses one existing DFFE, preserving clock/reset, hold and discard;
+order unless explicitly ordered with `after`. Separate structural instances
+retain independent state. Scalar storage leaves use a plain DFF only for a
+single local Rule candidate whose materialized commit enable folds to constant
+one. Composed ordered/unordered or incoming candidates retain DFFE until their
+pin-free enable proof is supported; Table collections retain element DFFE leaves. Both preserve clock/reset, hold and discard;
 the same verified final artifact feeds C++ and Verilog.
 
 Every lowered transaction has explicit clock/reset captures, ordered admission
 controls, value-validity prefixes and a sampling-history binding. A control is a
 callable guard or an effect-branch selection. Literal true/false,
 state-free and read-only transactions follow the same route. Ordinary results
-escaping an outer Rule require conservative proof of total admission. Statically
-unreachable guards or selections do not prevent totality, but every reachable
-effect selector must be proven known and every reachable guard proven true.
-Known selectors of either polarity pass selection. Otherwise the outer Rule
-must return `None`; Method results remain usable within that transaction.
-Sampling adds no valid-result API.
+escaping an outer Rule carry compiler-managed availability. Conservative totality
+still requires every reachable effect selector to be known and every reachable
+guard to be true; statically unreachable paths do not prevent that proof. Known
+selectors of either polarity pass selection. A may-block Rule can return a
+value: MLIR retains its availability through downstream use and emission.
+Authors do not supply a valid field, implicit zero or holding register. A valid
+payload may itself contain X/Z; availability does not turn unknown data into an
+admission failure.
 Both branch arms start from the same incoming candidate data and raw write
 intent. The join uses the original four-state selector for both components.
 Missing writes inherit the branch-entry pair rather than returning to old Q;
@@ -1187,8 +1513,27 @@ also used as a child elsewhere in the package. An occurrence without an
 external writer receives disabled proposals. Module-local expressions can
 save old Q as ordinary lexical SSA; later Method writes do not alter that
 snapshot. Aliases of one instance share candidates, while different instances
-of the same definition remain independent. Competing autonomous writers to
-one actual owner reject, including identity writes and unused definitions.
+of the same definition remain independent. Ancestor and descendant autonomous
+registrations may perform whole-owner updates to one actual state when their
+grants are proven mutually exclusive through the real instance wiring. Unordered
+field/index writers are also admitted when their footprints are disjoint; an
+ancestor partial lane is composed with its captured old Q before routing, and
+the receiver composes its own domains over that complete lane. Incoming
+proposals are closed against old Q and combined with local proposals before
+storage; an inactive incoming value cannot replace old Q. Each registration
+retains its own atomic boundary. Independent cross-hierarchy `after=` ordering
+and mixed ordered/unordered groups remain unsupported. Unproved writer
+conflicts reject, including identity writes and conflicts in unused
+definitions.
+
+A writable owner passed as an actual argument retains that owner through nested
+formal calls. Rebinding the formal proposes a new candidate to that owner;
+passing an ordinary saved SSA value only rebinds the callee's local value.
+Saved aliases never gain ownership merely from equal types or provenance from a
+state read. Ordinary actual expressions evaluate once in source order, including
+keyword actuals. Reads of writable owner references occur at call entry after
+those expressions complete. Reached proposal payload and address obligations
+remain live even if a later proposal overwrites their candidate.
 
 The current routing subset rejects a definition requiring extra physical ports
 if that definition is also used by a Collection, and rejects transaction writer
@@ -1196,8 +1541,8 @@ composition across a Collection. Unaffected existing Collections retain their
 original contracts; this does not add a source API for Method-owner collections.
 
 Source compilation and independent interfaces retain Method/Rule body `assert`,
-`log` and `report` as ordered typed effects, with statement-arm effects in the
-conditional candidate. A log evaluates its
+`log` and `report` as ordered typed effects, including statement-arm effects.
+A log evaluates its
 payload expressions once in order; an assert does not gate later Method calls.
 State analysis retains their statement-time values and invocation identities;
 false or unknown assertion conditions do not become guards or alter candidates.
@@ -1213,15 +1558,15 @@ guard-known sampling binding. Observations publish only after successful
 whole-system checking and precommit; failure preserves previous gauges/events
 and the committed epoch. Repeated report names for the same logical owner still
 conflict even in mutually exclusive arms; report once after the join instead.
-Transaction resource operations remain unsupported. Valid uncalled
-Method declarations remain fully published and checked before link removes
-them. This subset does not complete partial or aggregate state,
-resource/conflict/causality handling or effect-safe optimization. Cross-domain
-transactions and multiple autonomous writers remain rejected.
+General transaction resource admission remains unfinished. Valid uncalled
+typed Rule and Method declarations remain fully published and checked before
+link removes them. This subset does not complete cross-Rule dynamic Table address
+grants, general resource/conflict/causality handling or effect-safe optimization. Cross-domain
+transactions and unproved conflicts between autonomous writers remain rejected.
 Existing ordinary hardware and its system route
 retain their current contracts and limits.
 See the
-[whole-Bits branch contract](../rfcs/serial-rule-method/branch-state-ssa.md),
+[branch-state contract](../rfcs/serial-rule-method/branch-state-ssa.md),
 [conditional-call/effect contract](../rfcs/serial-rule-method/conditional-effects.md) and
 [extension specification](../rfcs/serial-rule-method/README.md) for exact
 semantics, rejection boundaries and acceptance obligations. These documents do
@@ -1235,7 +1580,7 @@ additional queue flow/head-read policies, automatic clock-domain scheduling and 
 and evidence. Closed systems execute reachable source assertions and publish
 supported source observations after successful epochs. A registered nested rule
 in a closed system may contain only supported `log` or `report` calls, including
-statement-arm observations in the conditional candidate and systems with
+statement-arm observations and systems with
 persistent state. No dummy assertion or instance binding is required; empty
 rules and unsupported observation forms
 still diagnose. Ordinary modules with

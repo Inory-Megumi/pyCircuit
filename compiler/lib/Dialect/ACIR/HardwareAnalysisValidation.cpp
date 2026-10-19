@@ -1,5 +1,6 @@
 #include "ACIRSourceContracts.h"
 #include "HardwareSourceChecks.h"
+#include "HardwareValueAvailability.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 using namespace mlir;
@@ -10,6 +11,9 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
   StringRef kind = analysis.getPrimitiveKind(op);
   if (kind.empty())
     return success();
+  bool fifo = kind == "fifo_local" || kind == "fifo_downstream_pop";
+  if (fifo && op.getSymName() != (Twine("pycircuit.__builtins__.") + kind).str())
+    return op.emitOpError() << "trusted FIFO requires its canonical builtin symbol";
   SmallVector<StringRef> inputs, outputs;
   if (kind == "dff") {
     inputs = {"clk", "rst", "d", "init"};
@@ -20,14 +24,17 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
   } else if (kind == "sync_mem") {
     inputs = {"clk",    "rst",   "ren",   "raddr",
               "wvalid", "waddr", "wdata", "wstrb"};
-    outputs = {"rdata"};
+    outputs = {"rdata", "rlive"};
   } else if (kind == "sync_mem_dp") {
     inputs = {"clk",    "rst",    "ren0",  "raddr0", "ren1",
               "raddr1", "wvalid", "waddr", "wdata",  "wstrb"};
-    outputs = {"rdata0", "rdata1"};
+    outputs = {"rdata0", "rdata1", "rlive0", "rlive1"};
   } else if (kind == "byte_mem") {
     inputs = {"clk", "rst", "raddr", "wvalid", "waddr", "wdata", "wstrb"};
     outputs = {"rdata"};
+  } else if (fifo) {
+    inputs = {"clk", "rst", "in_valid", "in_data", "out_ready"};
+    outputs = {"ready", "valid", "data", "local_capacity"};
   } else
     return op.emitOpError() << "unknown trusted primitive kind";
   if (op.getInputNames().size() != inputs.size() ||
@@ -43,8 +50,8 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
       cast<StringAttr>(op.getTypeParameters()[0]).getValue() != "T")
     return op.emitOpError()
            << "trusted primitive requires payload type formal T";
-  bool memory = kind != "dff" && kind != "dffe";
-  if (op.getParameters().size() != (memory ? 2 : 0))
+  bool memory = kind == "sync_mem" || kind == "sync_mem_dp" || kind == "byte_mem";
+  if (op.getParameters().size() != (memory || fifo ? 2 : 0))
     return op.emitOpError()
            << "trusted primitive integer parameter schema mismatch";
   constexpr StringLiteral memoryParameters[] = {"ADDR_WIDTH", "DEPTH"};
@@ -54,13 +61,19 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
           name)
         return op.emitOpError()
                << "trusted memory requires ADDR_WIDTH, DEPTH parameters";
+  constexpr StringLiteral fifoParameters[] = {"DEPTH", "AVAILABILITY_LATENCY"};
+  if (fifo)
+    for (auto [raw, name] : llvm::zip(op.getParameters(), fifoParameters))
+      if (cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue() != name)
+        return op.emitOpError()
+               << "trusted FIFO requires DEPTH, AVAILABILITY_LATENCY parameters";
   auto sig = op.getFunctionType();
   auto payload = TypeParamType::get(
       op.getContext(), FlatSymbolRefAttr::get(op.getContext(), op.getSymName()),
       StringAttr::get(op.getContext(), "T"));
   for (auto [index, name] : llvm::enumerate(inputs)) {
     Type type = sig.getInput(index);
-    if (name == "d" || name == "init" || name == "wdata") {
+    if (name == "d" || name == "init" || name == "wdata" || name == "in_data") {
       if (type != payload)
         return op.emitOpError()
                << "trusted primitive data pins require payload T";
@@ -88,14 +101,32 @@ LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
                << "trusted primitive control pin must be one bit";
     }
   }
-  for (Type type : sig.getResults())
-    if (type != payload)
+  for (auto [index, type] : llvm::enumerate(sig.getResults())) {
+    bool memoryLive = (kind == "sync_mem" && index == 1) ||
+                      (kind == "sync_mem_dp" && index >= 2);
+    if ((fifo && index != 2) || memoryLive) {
+      auto bits = dyn_cast<BitsType>(type);
+      StringRef message = memoryLive
+          ? "trusted synchronous memory live output must be one bit"
+          : "trusted FIFO status output must be one bit";
+      if (!bits)
+        return op.emitOpError() << message;
+      auto width = analysis.evaluateStatic(bits.getWidth(), {}, op);
+      auto integer = succeeded(width) ? dyn_cast<MathIntAttr>(*width) : MathIntAttr();
+      if (!integer || integer.getCanonicalValue() != "1")
+        return op.emitOpError() << message;
+    } else if (type != payload)
       return op.emitOpError() << "trusted primitive output requires payload T";
+  }
   auto deps = analysis.getImportDependencies(op, {});
   if (failed(deps))
     return failure();
-  for (auto &dep : *deps) {
-    if (kind == "byte_mem") {
+  for (auto [index, dep] : llvm::enumerate(*deps)) {
+    if (kind == "fifo_downstream_pop" && index == 0) {
+      if (dep.inputs.size() != 1 || dep.inputs[0].port != 4 ||
+          !dep.inputs[0].path.empty())
+        return op.emitOpError() << "FIFO ready must depend only on out_ready";
+    } else if (kind == "byte_mem") {
       if (dep.inputs.size() != 1 || dep.inputs[0].port != 2 ||
           !dep.inputs[0].path.empty())
         return op.emitOpError() << "byte_mem output must depend only on raddr";
@@ -122,7 +153,10 @@ detail::verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis) {
   if (!package)
     return failure();
   auto layouts = package.walk([&](Operation *operation) {
-    if (!operation->hasAttr("ac.internal_ports"))
+    if (!operation->hasAttr("ac.internal_ports") &&
+        !operation->hasAttr("ac.input_validity") &&
+        !operation->hasAttr("ac.output_validity") &&
+        !operation->hasAttr("ac.routed_output_validity"))
       return WalkResult::advance();
     if (!isa<ModuleOp>(operation)) {
       operation->emitOpError()
@@ -161,7 +195,7 @@ detail::verifyHardwarePackageEnvelope(const HardwareAnalysis &analysis) {
       return imported.emitOpError() << "executable hardware package has "
                                        "unresolved ordinary module import";
   }
-  return success();
+  return verifyHardwareValueAvailability(analysis);
 }
 LogicalResult HardwareAnalysis::verify() const {
   // The shared builder orders raw budget preflight, structural verification,

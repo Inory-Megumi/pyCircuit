@@ -53,8 +53,9 @@ FailureOr<DictionaryAttr> Importer::sourceConstraint(const Port &port) {
   return b.getDictionaryAttr(fields);
 }
 LogicalResult Importer::serializeSourceCall(ModuleDecl &decl) {
-  bool callable = !decl.system && decl.returnShape == ReturnShape::Struct &&
-                  decl.parameters.empty();
+  bool callable = !decl.system &&
+      (decl.returnShape != ReturnShape::Mapping ||
+       (decl.transactionEffects && decl.outputs.empty()));
   SmallVector<NamedAttribute> domain;
   if (decl.needsDomain) {
     domain.push_back(
@@ -62,8 +63,12 @@ LogicalResult Importer::serializeSourceCall(ModuleDecl &decl) {
     domain.push_back(b.getNamedAttr(
         "reset", b.getI64IntegerAttr(decl.sourceInputCount + 1)));
   }
-  if (!callable && !decl.needsDomain)
+  SmallVector<Attribute> availability(decl.outputs.size(), b.getStringAttr("compiler"));
+  auto policy = b.getNamedAttr("ac.result_availability", b.getArrayAttr(availability));
+  if (!callable && !decl.needsDomain) {
+    decl.sourceCallAttrs = {policy};
     return success();
+  }
   SmallVector<Attribute> parameters;
   for (size_t i = 0; callable && i < decl.sourceInputCount; ++i) {
     const auto &port = decl.inputs[i];
@@ -78,21 +83,24 @@ LogicalResult Importer::serializeSourceCall(ModuleDecl &decl) {
          b.getNamedAttr("origin", sourceOccurrence(b, decl.symbol, port.node)),
          b.getNamedAttr("location", sourceSpan(b, source.path, port.node))}));
   }
-  DictionaryAttr result;
-  if (callable) {
-    auto encoded = sourceConstraint(decl.outputs.front());
-    if (failed(encoded))
-      return failure();
-    result = *encoded;
-  }
+  SmallVector<Attribute> results;
+  if (callable)
+    for (const Port &output : decl.outputs) {
+      auto encoded = sourceConstraint(output);
+      if (failed(encoded))
+        return failure();
+      results.push_back(*encoded);
+    }
   decl.sourceCallAttrs = {
-      b.getNamedAttr("ac.domain_inputs", b.getDictionaryAttr(domain))};
+      b.getNamedAttr("ac.domain_inputs", b.getDictionaryAttr(domain)), policy};
   if (callable) {
     decl.sourceCallAttrs.insert(
         decl.sourceCallAttrs.begin(),
-        {b.getNamedAttr("ac.return_form", b.getStringAttr("single")),
+        {b.getNamedAttr("ac.return_form", b.getStringAttr(
+             decl.outputs.empty() ? "none" :
+             decl.returnShape == ReturnShape::Tuple ? "tuple" : "single")),
          b.getNamedAttr("ac.parameters", b.getArrayAttr(parameters)),
-         b.getNamedAttr("ac.result_constraints", b.getArrayAttr({result}))});
+         b.getNamedAttr("ac.result_constraints", b.getArrayAttr(results))});
   }
   return success();
 }
@@ -112,9 +120,16 @@ FailureOr<CallableDecl> Importer::callable(const AstNode &function) {
   DictionaryAttr domain;
   if (auto found = local.find(function.string("id")); found != local.end()) {
     const ModuleDecl &decl = modules[found->second];
-    if (decl.sourceCallAttrs.size() != 4)
-      return error() << "direct module value calls require a typed struct "
-                        "return and no static parameters";
+    if (!llvm::any_of(decl.sourceCallAttrs, [](NamedAttribute attr) {
+          return attr.getName() == "ac.return_form";
+        }))
+      return error() << "direct module value calls require a typed scalar, "
+                        "Struct or tuple return";
+    auto signature = moduleSignatureAttrs(decl);
+    if (failed(signature))
+      return failure();
+    result.signature = *signature;
+    result.returnShape = decl.returnShape;
     for (auto attr : decl.sourceCallAttrs) {
       if (attr.getName() == "ac.parameters")
         parameters = cast<ArrayAttr>(attr.getValue());
@@ -128,9 +143,13 @@ FailureOr<CallableDecl> Importer::callable(const AstNode &function) {
     if (!view || !view.hasSourceCallContract())
       return error() << "direct module call requires complete validated "
                         "source-call metadata";
+    result.signature = view.declaration->getAttrDictionary();
     parameters = view.sourceParameters;
     constraints = view.sourceResultConstraints;
     domain = view.domainInputs;
+    result.returnShape = view.sourceReturnForm.getValue() == "tuple"
+        ? ReturnShape::Tuple : view.sourceReturnForm.getValue() == "none"
+        ? ReturnShape::None : ReturnShape::Struct;
   }
   for (Attribute raw : parameters) {
     auto parameter = cast<DictionaryAttr>(raw);
@@ -139,9 +158,33 @@ FailureOr<CallableDecl> Importer::callable(const AstNode &function) {
                        parameter.getAs<StringAttr>("name").getValue(),
                        function));
   }
-  result.result = sourceCallPort(cast<DictionaryAttr>(constraints[0]), "",
-                                 function);
+  for (Attribute raw : constraints)
+    result.results.push_back(
+        sourceCallPort(cast<DictionaryAttr>(raw), "", function));
   result.needsDomain = !domain.empty();
+  return result;
+}
+
+FailureOr<CallableDecl> Importer::resolveModuleCall(
+    const AstNode &call, FlatSymbolRefAttr parent) {
+  auto result = callable(call.child("func"));
+  if (failed(result))
+    return failure();
+  auto parameters = bindParameters(result->signature, call, parent,
+                                    /*directCall=*/true);
+  auto types = bindTypeArguments(result->signature, call, parent);
+  if (failed(parameters) || failed(types))
+    return failure();
+  result->parameters = std::move(*parameters);
+  result->typeArguments = std::move(*types);
+  for (auto *ports : {&result->inputs, &result->results})
+    for (Port &port : *ports) {
+      auto resolved = substitute(port.type, result->signature,
+                                  result->parameters, result->typeArguments);
+      if (failed(resolved))
+        return failure();
+      port.type = *resolved;
+    }
   return result;
 }
 
@@ -162,6 +205,18 @@ bool Importer::methodOwner(const AstNode &function) const {
       methodOwnerNames.contains(function.string("id")) &&
       !lexicallyShadowed(function, function.string("id")))
     return true;
+  if (function.kind() == "Name" &&
+      !lexicallyShadowed(function, function.string("id"))) {
+    auto target = local.find(function.string("id"));
+    auto rules = callableRuleNames.find(function.string("id"));
+    if (target != local.end() && rules != callableRuleNames.end() &&
+        !rules->second.empty()) {
+      const ModuleDecl &decl = modules[target->second];
+      if (decl.transactionEffects && decl.sourceInputCount == 0 &&
+          decl.outputs.empty() && decl.parameters.empty() && !decl.system)
+        return true;
+    }
+  }
   auto binding = lookupBinding(function);
   if (!binding || binding->category != BindingCategory::Module)
     return false;

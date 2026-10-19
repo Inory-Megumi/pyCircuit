@@ -4,11 +4,24 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "pycircuit/Dialect/ACIR/ACIROps.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include <cstdint>
+#include <functional>
 #include <optional>
+#include <utility>
 
 namespace acir::ac {
+
+/// Validated raw clock/reset rows on a System Module/ModuleImport declaration.
+/// The empty array means no authored sequence; present sequences are nonempty.
+mlir::FailureOr<mlir::ArrayAttr> getSystemSamples(mlir::Operation *declaration);
+
+enum class HardwareResetSemantics { Strict, IfOne };
+/// Read the closed policy on the single root selection and reject overrides.
+/// A saved package without the attribute means strict; this never mutates IR.
+mlir::FailureOr<HardwareResetSemantics>
+getHardwareResetSemantics(mlir::ModuleOp package);
 
 /// Compare hardware payload types without source origin/location provenance.
 /// Nominal struct/enum and type-parameter owner identities remain significant.
@@ -21,6 +34,11 @@ struct ModulePortLayout {
   unsigned sourceInputCount;
   unsigned sourceOutputCount;
   mlir::ArrayAttr rootInputDefaults;
+  /// Source-port ordinal -> physical Bits1 companion, or -1 when total.
+  llvm::SmallVector<int64_t> inputValidity;
+  llvm::SmallVector<int64_t> outputValidity;
+  /// Private lexical payload export -> physical availability companion.
+  llvm::SmallVector<std::pair<int64_t, int64_t>> routedOutputValidity;
 };
 /// Validate the closed ac.internal_ports contract. Without it, every physical
 /// port belongs to the source boundary and rootInputDefaults is an empty array.
@@ -39,6 +57,18 @@ struct EnumDefinitionView {
 };
 
 enum class QueueReadyPolicy { LocalOccupancy, DownstreamPop };
+/// Recognize the canonical FIFO allocation; schema and bindings are verified
+/// by the same instance and primitive checks used for other native leaves.
+bool isQueueInstance(InstanceOp instance);
+/// Derive the existing FIFO configuration from its canonical callee and
+/// ordinary static arguments. No duplicated configuration is stored on the IR.
+mlir::FailureOr<mlir::DictionaryAttr>
+getQueueConfiguration(InstanceOp instance);
+/// The same derivation for authenticated declaration-only instance rows.
+mlir::FailureOr<mlir::DictionaryAttr>
+getQueueConfiguration(mlir::FlatSymbolRefAttr callee,
+                      mlir::ArrayAttr parameters,
+                      mlir::Operation *diagnosticSite);
 struct ResolvedQueueConfig {
   mlir::Type payloadType;
   mlir::Type tokenElementType;
@@ -69,6 +99,27 @@ struct HardwareBindings {
   llvm::StringMap<mlir::Attribute> integers;
   llvm::StringMap<mlir::Type> types;
 };
+
+/// Checked pin roles for the existing canonical Memory primitive. Payloads
+/// precede committed live outputs; no runtime state or source alias is stored.
+struct MemoryPrimitiveLayout {
+  InstanceOp allocation;
+  ModuleImportOp primitive;
+  llvm::StringRef kind;
+  HardwareBindings bindings;
+  mlir::Type payloadType, addressType, maskType, predicateType;
+  unsigned readPorts = 0;
+  llvm::SmallVector<unsigned, 2> readEnableOperands, readAddressOperands;
+  unsigned writeEnableOperand = 0, writeAddressOperand = 0;
+  unsigned writeDataOperand = 0, writeMaskOperand = 0;
+  bool isSynchronous() const { return kind != "byte_mem"; }
+  unsigned dataResult(unsigned port) const { return port; }
+  unsigned liveResult(unsigned port) const { return readPorts + port; }
+};
+bool isMemoryInstance(InstanceOp instance);
+mlir::FailureOr<MemoryPrimitiveLayout>
+getMemoryPrimitiveLayout(InstanceOp instance,
+                         const HardwareBindings &parentBindings = {});
 
 struct HardwareCheckSamplingBinding {
   ModuleOp definition;
@@ -126,6 +177,7 @@ struct HardwareSourceCheckLimits {
   uint64_t maxWorkUnits = 4 * 1024 * 1024;
 };
 struct HardwareSourceCheckPlan {
+  HardwareResetSemantics resetSemantics = HardwareResetSemantics::Strict;
   llvm::SmallVector<HardwareCheckBinding> bindings;
   llvm::SmallVector<HardwareCheckOwnerOccurrence> owners;
   llvm::SmallVector<HardwareResolvedSourceCheck> checks;
@@ -133,6 +185,11 @@ struct HardwareSourceCheckPlan {
   llvm::SmallVector<HardwareCheckSamplingBinding> samplingBindings;
   llvm::SmallVector<HardwareCheckSamplingOccurrence> samplingOccurrences;
   bool hasChecks() const { return !checks.empty(); }
+};
+/// Read-only physical-edge admission over the authenticated check inventory.
+struct HardwarePhysicalProjection {
+  ModuleOp root;
+  unsigned clockInput = 0, resetInput = 0;
 };
 using FieldPath = llvm::SmallVector<mlir::StringAttr>;
 struct PackedLeaf {
@@ -218,9 +275,10 @@ public:
                                            const HardwareBindings &bindings,
                                            mlir::Operation *site) const;
   /// Shape-only paths retain opaque type formals and symbolic bit widths.
-  mlir::FailureOr<llvm::SmallVector<FieldPath>>
-  getFieldPaths(mlir::Type type, const HardwareBindings &bindings,
-                mlir::Operation *site) const;
+  mlir::FailureOr<llvm::SmallVector<FieldPath>> getFieldPaths(
+      mlir::Type type, const HardwareBindings &bindings, mlir::Operation *site,
+      const std::function<mlir::LogicalResult(uint64_t, mlir::Operation *)>
+          &debit = {}) const;
   mlir::FailureOr<llvm::SmallVector<OutputDependency>>
   getImportDependencies(ModuleImportOp imported,
                         const HardwareBindings &bindings = {}) const;
@@ -240,9 +298,11 @@ public:
   mlir::FailureOr<ModuleAnalysis>
   analyzeModule(ModuleOp definition,
                 const HardwareBindings &bindings = {}) const;
-  mlir::FailureOr<llvm::SmallVector<WireEndpoint>>
-  getDependencies(mlir::Value value, llvm::ArrayRef<mlir::StringAttr> path,
-                  const HardwareBindings &bindings = {}) const;
+  mlir::FailureOr<llvm::SmallVector<WireEndpoint>> getDependencies(
+      mlir::Value value, llvm::ArrayRef<mlir::StringAttr> path,
+      const HardwareBindings &bindings = {},
+      const std::function<mlir::LogicalResult(uint64_t, mlir::Operation *)>
+          &debit = {}) const;
   mlir::LogicalResult
   verifyResolvedOperation(mlir::Operation *operation,
                           const HardwareBindings &bindings) const;
@@ -251,11 +311,11 @@ public:
   verifyEnumValueOperation(mlir::Operation *operation,
                            const HardwareBindings &bindings,
                            bool requireResolved = false) const;
-  mlir::LogicalResult verifyQueueOperation(QueueOp operation,
+  mlir::LogicalResult verifyQueueOperation(InstanceOp operation,
                                            const HardwareBindings &bindings,
                                            bool requireResolved = false) const;
   mlir::FailureOr<ResolvedQueueConfig>
-  resolveQueue(QueueOp operation, const HardwareBindings &bindings) const;
+  resolveQueue(InstanceOp operation, const HardwareBindings &bindings) const;
   mlir::LogicalResult verifyInstance(InstanceOp instance,
                                      const HardwareBindings &parent = {}) const;
   mlir::LogicalResult verifyInstance(CollectionOp collection,
@@ -278,6 +338,9 @@ public:
   getSourceCheckPlan(HardwareSourceCheckLimits limits = {}) const;
   mlir::LogicalResult
   verifySourceCheckPlan(const HardwareSourceCheckPlan &plan,
+                        HardwareSourceCheckLimits limits = {}) const;
+  mlir::FailureOr<HardwarePhysicalProjection>
+  getPhysicalProjection(const HardwareSourceCheckPlan &plan,
                         HardwareSourceCheckLimits limits = {}) const;
   mlir::LogicalResult verifyDefinitionSourceChecks(ModuleOp definition) const;
   mlir::LogicalResult verify() const;

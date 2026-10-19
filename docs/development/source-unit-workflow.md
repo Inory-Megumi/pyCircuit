@@ -32,6 +32,57 @@ example, admitting a Table-valued Struct field requires a matching declaration,
 shared packed-layout analysis, source construction and projection, and transport
 through both emitters. A verifier change alone does not establish support.
 
+Verilog emission preserves the native root module name in
+`generated.json` as `root_rtl_name`. External tools may use this identity instead
+of guessing it from source function names. This metadata does not rename the
+root or change internal identifier encoding. Older receipts remain readable for
+managed replacement.
+
+Both targets emit `ports.json` from the same verified root bindings and layout.
+Schema version 1 records `target` and lists exported `inputs` and source `outputs` with logical name,
+legalized `wire`, signature `ordinal`, resolved packed `width`, and packed leaf
+`fields` (`path`, `low`, `width`). Outputs retain their `availability` companion
+wire or null. `domains.clock/reset` identify input ordinals or null; the input
+list includes compiler-generated physical domain ports. `controls` lists extra
+public availability and, for managed Verilog only, lifecycle ports with direction,
+role, wire and width. C++ does not advertise RTL lifecycle ports. Internal
+defaulted/routed ports and `pyc_reset_active` are not external
+ports. For a System, this describes the generated DUT wrapper, not the separate
+zero-port simulation harness. The metadata does not itself select export policy
+or assign external aliases.
+
+Root integer parameters use `pycircuit link --parameters bindings.json`, where
+the file is an array such as `[{"name":"W","value":"65"}]`. Values are canonical
+signed decimal strings, not JSON numbers or expressions. Names must be unique
+declared integer parameters. The compiler binds in declaration order; omitted
+parameters retain provider defaults, including defaults referring to earlier
+parameters. A required parameter without a binding fails. Duplicate JSON keys,
+extra fields, unknown names and noncanonical decimals fail before publication.
+The driver snapshots the input once and forwards only that snapshot to the
+native linker; final IR records the selected actual bindings.
+
+`pycircuit link --reset-semantics strict|if_one` selects one root policy in the
+final artifact. Default `strict` rejects X/Z reset on a rising sample. `if_one`
+activates reset only for known 1; 0/X/Z enter normal operation. Both targets,
+all primitive reset inputs and all reset-masked source checks use this policy.
+Unknown clock, effective enable and reached guard/effect selectors still fault.
+No source unit, per-instance setting or emission option overrides the final policy.
+Generated receipts and simulation results record `reset_semantics`; legacy final
+artifacts without the attribute have strict semantics.
+
+For ordinary single-domain register hierarchies, `emit --target verilog
+--rtl-mode physical` selects physical-edge execution. The default remains
+managed execution. Physical mode keeps data and compiler domain ports public;
+checks aggregate internally before any edge commits. It preserves declared
+closed startup values and synchronous reset, and reports
+`PYCIRCUIT_PHYSICAL_FAULT` on invalid controls or clock transitions. Simulation
+then freezes state; a physical reset does not clear the fault. Runners must reject
+that diagnostic even if a testbench later prints success. This is not a host
+Work/Discard interface. Residual non-guard checks, observations, non-register
+resources, multiple domains, clock-data use and dynamic initializers require
+managed execution. See [physical export](physical-rtl-export.md) for the precise
+timing and verification policy.
+
 Likewise, a pure region's admitted operations must be supported by both target
 emitters. Nested Table construction and mapping inside an existing TableMap
 use that operation's checked region and field-sensitive emission. TableMatch
@@ -112,8 +163,8 @@ for the preceding straight-line slice.
 Consumer compilation reads the interfaces, without loading provider
 Python or Method bodies. Native final link lowers calls through ordinary
 static instances with bounded whole-Bits branches and statement-arm calls/effects,
-a shared actual clock/reset domain and one outer writer per physical scalar
-owner. Ordinary results escaping an outer Rule require total admission over
+a shared actual clock/reset domain and unordered writers admitted only through
+disjoint footprints or proven grant exclusivity. Ordinary results escaping an outer Rule require total admission over
 reachable controls; statically unreachable controls do not prevent totality.
 All arms still undergo structural/type/closure checks. A reachable effect
 selector whose knownness is unproved requires an outer `-> None` Rule; this
@@ -141,6 +192,21 @@ published module and rejects missing provider bodies. See the
 [summary contract](../rfcs/serial-rule-method/publication-summary.md) for fields,
 scopes and authority obligations.
 
+Receiver resolution shares fully verified declaration headers and direct-instance
+inventories within one immutable analysis invocation. Each actual call still
+checks its path, provider, parameter/type bindings and resource direction. The
+independent lowering proof constructs its own receiver context and SSA identity
+index from the original IR; it never accepts the producer's cached result as
+proof. Contexts do not survive IR mutation or cross analysis/proof invocations.
+
+Before transaction planning, link removes exact-type identity extracts and
+pools equal literal constants used exclusively by same-block aggregate
+constructors. Source units are authenticated before this normalization and are
+not modified. Local pure helper completion uses the same predicates; imported
+helper snapshots retain their published authority. Physical domain connections,
+state initializers, direct observations and effectful operations are outside
+this compaction boundary.
+
 Native module imports require an explicit `semantic_kind`. Hardware imports
 carry `dependency_summary`; transaction imports carry `transaction_summary`.
 The two summaries are mutually exclusive, and transaction imports cannot claim
@@ -149,14 +215,24 @@ rejects transaction imports throughout the actual instance closure, including
 result-free children; final package checking also rejects unused transaction
 imports. Publication alone does not establish hardware execution.
 
+FIFO Modules use canonical hardware imports and ordinary `ac.instance`
+allocations. Their native `push`/`pop`/`peek` contracts terminate ordinary Method
+resolution without an invented body or invocation frame. Published instance rows
+retain logical payload and raw-direction binding facts; configuration is derived
+from the canonical callee and ordinary parameters. The existing Queue access
+plan, source replay and final wiring proof use that same actual instance identity.
+Final hardware contains native FIFO instances, not dedicated Queue operations.
+Both emitters continue to use the existing FIFO kernels.
+
 Source compilation defers the hardware-only record simplifier for packages
 retaining transaction semantics. The existing `--source-import-out` diagnostic
 still denotes lowered hardware and rejects these packages; published source
 bodies retain their actual typed IR. Link checks complete source-unit authority,
 then applies the common transaction lowerer. It rechecks canonical primitive
 imports with the admitted registry; native transformation separately validates
-their hardware schema. Each admitted state becomes one DFFE with original
-clock/reset/init, and candidate D values come from isolated pure Rules. All
+their hardware schema. Each admitted scalar state becomes one compiler-selected
+DFF or DFFE with original clock/reset/init; Table states remain element
+Collections. Candidate D values come from isolated pure Rules. All
 staged hardware checks succeed before the package becomes final.
 
 The explicit `pycircuit-opt --ac-analyze-transaction-state-ssa` pass preserves

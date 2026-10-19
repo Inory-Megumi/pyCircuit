@@ -14,6 +14,277 @@
 using namespace mlir;
 namespace acir::ac {
 namespace {
+// Author observers are distinguished from compiler-internal case equality by
+// retained body provenance. Helpers are expanded into this definition before
+// publication; the source-unit contract authenticates their actual bodies.
+// Follow every use, including branch control, before any generic folding can
+// remove a diagnostic/functional mixed use. Field paths and ordinary operation
+// dependencies come from the same analysis as hardware scheduling.
+LogicalResult verifyObserverUses(const HardwareAnalysis &analysis,
+                                 ModuleOp definition,
+                                 const HardwareBindings &bindings,
+                                 detail::SourceCheckBudget &budget) {
+  using Budget = detail::SourceCheckBudget;
+  llvm::DenseMap<Value, SmallVector<FieldPath, 0>> seen;
+  SmallVector<WireEndpoint, 0> pending;
+  auto debit = [&](uint64_t units, Operation *site) {
+    return budget.debit(units, site);
+  };
+  auto push = [&](Value value, ArrayRef<StringAttr> path,
+                  Operation *site) -> LogicalResult {
+    if (failed(debit(Budget::add(1, path.size()), site)))
+      return failure();
+    auto &paths = seen[value];
+    for (const auto &prior : paths) {
+      if (failed(debit(Budget::add(1, path.size()), site)))
+        return failure();
+      if (ArrayRef<StringAttr>(prior) == path)
+        return success();
+    }
+    if (failed(
+            debit(Budget::bytes(Budget::add(
+                      4 * sizeof(WireEndpoint),
+                      Budget::multiply(4 * sizeof(StringAttr), path.size()))),
+                  site)))
+      return failure();
+    paths.emplace_back(path.begin(), path.end());
+    pending.push_back({value, FieldPath(path.begin(), path.end())});
+    return success();
+  };
+  auto results = [&](Operation *operation) -> LogicalResult {
+    for (Value result : operation->getResults()) {
+      auto paths =
+          analysis.getFieldPaths(result.getType(), bindings, operation, debit);
+      if (failed(paths))
+        return failure();
+      for (const auto &path : *paths)
+        if (failed(push(result, path, operation)))
+          return failure();
+    }
+    return success();
+  };
+  auto scan = definition.walk([&](Operation *operation) {
+    if (failed(debit(1, operation)))
+      return WalkResult::interrupt();
+    auto marker = operation->getAttr("ac.verification_observer");
+    if (!marker)
+      return WalkResult::advance();
+    auto name = dyn_cast<StringAttr>(marker);
+    auto compare = dyn_cast<BitsCompareOp>(operation);
+    auto origin = operation->getAttrOfType<DictionaryAttr>("ac.origin");
+    if (!name ||
+        (name.getValue() != "case_eq" && name.getValue() != "is_known") ||
+        !compare || compare.getPredicate() != "case_eq" || !origin ||
+        failed(detail::verifyOccurrence(
+            origin, [&] { return operation->emitOpError(); }))) {
+      operation->emitOpError() << "four-state observer requires authenticated "
+                                  "source comparison provenance";
+      return WalkResult::interrupt();
+    }
+    return failed(results(operation)) ? WalkResult::interrupt()
+                                      : WalkResult::advance();
+  });
+  if (scan.wasInterrupted())
+    return failure();
+  auto reject = [](Operation *operation) -> LogicalResult {
+    return operation->emitOpError()
+           << "four-state observer is verification-only; its data or control "
+              "dependency reaches a functional use";
+  };
+  auto diagnosticBranch = [&](Operation *branch) -> LogicalResult {
+    auto checked = branch->walk([&](Operation *operation) {
+      if (failed(debit(1, operation)))
+        return WalkResult::interrupt();
+      if (operation == branch)
+        return WalkResult::advance();
+      // SourceExpect's own verifier authenticates authored assertions and the
+      // generated range/knownness obligations. They are all diagnostic sinks.
+      if (isa<SourceExpectOp, SourceObserveOp, YieldOp, SourcePredicateOp>(
+              operation) ||
+          operation->getName().getStringRef() == "scf.yield" ||
+          operation->getName().getStringRef() == "scf.if" ||
+          isa<SourceBranchOp>(operation) ||
+          detail::isCombinationalHardwareOperation(operation))
+        return WalkResult::advance();
+      (void)reject(operation);
+      return WalkResult::interrupt();
+    });
+    if (checked.wasInterrupted())
+      return failure();
+    // An unchanged SSA yield in both arms has no control dependence.
+    for (auto [index, result] : llvm::enumerate(branch->getResults())) {
+      bool unchanged = branch->getNumRegions() == 2;
+      Value common;
+      for (Region &region : branch->getRegions()) {
+        if (!region.hasOneBlock() || region.front().empty()) {
+          unchanged = false;
+          break;
+        }
+        Operation *terminator = region.front().getTerminator();
+        if (index >= terminator->getNumOperands()) {
+          unchanged = false;
+          break;
+        }
+        Value yielded = terminator->getOperand(index);
+        if (common && common != yielded)
+          unchanged = false;
+        common = yielded;
+      }
+      if (unchanged)
+        continue;
+      auto paths =
+          analysis.getFieldPaths(result.getType(), bindings, branch, debit);
+      if (failed(paths))
+        return failure();
+      for (const auto &path : *paths)
+        if (failed(push(result, path, branch)))
+          return failure();
+    }
+    return success();
+  };
+  // Memoize only direct dependency edges within this immutable invocation.
+  // Common Struct/ValueMerge/Table rules preserve unrelated field authority.
+  struct ResultEdges {
+    WireEndpoint output;
+    SmallVector<WireEndpoint> inputs;
+  };
+  llvm::DenseMap<Operation *, SmallVector<ResultEdges, 0>> edges;
+  auto propagate = [&](Operation *operation,
+                       const WireEndpoint &input) -> LogicalResult {
+    auto found = edges.find(operation);
+    if (found == edges.end()) {
+      SmallVector<ResultEdges, 0> described;
+      for (Value result : operation->getResults()) {
+        auto paths = analysis.getFieldPaths(result.getType(), bindings,
+                                            operation, debit);
+        if (failed(paths))
+          return failure();
+        for (const auto &path : *paths) {
+          auto dependencies =
+              analysis.getDependencies(result, path, bindings, debit);
+          if (failed(dependencies))
+            return failure();
+          uint64_t storage = sizeof(ResultEdges);
+          for (const auto &endpoint : *dependencies)
+            storage = Budget::add(
+                storage, Budget::add(sizeof(WireEndpoint),
+                                     Budget::multiply(endpoint.path.size(),
+                                                      sizeof(StringAttr))));
+          if (failed(debit(Budget::bytes(Budget::multiply(4, storage)),
+                           operation)))
+            return failure();
+          described.push_back({{result, path}, std::move(*dependencies)});
+        }
+      }
+      found = edges.try_emplace(operation, std::move(described)).first;
+    }
+    for (const auto &edge : found->second)
+      for (const auto &dependency : edge.inputs) {
+        if (failed(debit(Budget::add(1, dependency.path.size()), operation)))
+          return failure();
+        if (dependency == input &&
+            failed(push(edge.output.value, edge.output.path, operation)))
+          return failure();
+      }
+    return success();
+  };
+  while (!pending.empty()) {
+    WireEndpoint endpoint = pending.pop_back_val();
+    Value value = endpoint.value;
+    for (OpOperand &use : value.getUses()) {
+      Operation *user = use.getOwner();
+      unsigned index = use.getOperandNumber();
+      if (failed(debit(1, user)))
+        return failure();
+      if (isa<SourceExpectOp>(user)) {
+        if (index < 2)
+          continue;
+        return reject(user);
+      }
+      if (isa<SourceObserveOp>(user))
+        continue;
+      if (isa<SourceBranchOp>(user) ||
+          user->getName().getStringRef() == "scf.if") {
+        if (failed(diagnosticBranch(user)))
+          return failure();
+        continue;
+      }
+      if (isa<RuleOp, SourceTransactionOp, SourceMethodOp>(user)) {
+        unsigned argument = index;
+        if (isa<SourceTransactionOp>(user)) {
+          if (index < 2)
+            return reject(user);
+          argument -= 2;
+        } else if (auto method = dyn_cast<SourceMethodOp>(user)) {
+          // A Method declaration's operands bind lexical captures, not authored
+          // hardware call arguments. Its regions put those after formals.
+          argument += method.getFunctionType().getNumInputs();
+        }
+        for (Region &region : user->getRegions()) {
+          if (!region.hasOneBlock() ||
+              argument >= region.front().getNumArguments())
+            return reject(user);
+          if (failed(push(region.front().getArgument(argument), endpoint.path,
+                          user)))
+            return failure();
+        }
+        continue;
+      }
+      if (isa<YieldOp>(user) || user->getName().getStringRef() == "scf.yield") {
+        Operation *owner = user->getParentOp();
+        if (isa<ModuleOp, SourceMethodOp>(owner))
+          return reject(user);
+        if (auto transaction = dyn_cast<SourceTransactionOp>(owner))
+          if (user->getParentRegion() == &transaction.getGuard())
+            return reject(user);
+        if (!isa<RuleOp, SourceTransactionOp, SourceBranchOp, TableMapOp,
+                 TableMatchOp>(owner) &&
+            owner->getName().getStringRef() != "scf.if")
+          return reject(user);
+        if (index >= owner->getNumResults())
+          return reject(user);
+        if (failed(push(owner->getResult(index), endpoint.path, user)))
+          return failure();
+        continue;
+      }
+      if (isa<SourcePredicateOp>(user)) {
+        if (failed(push(user->getResult(0), {}, user)))
+          return failure();
+        continue;
+      }
+      // Index/admission/resource/call operands remain functional boundaries.
+      if ((isa<TableGetOp>(user) && index != 0) || isa<TableIndexOp>(user))
+        return reject(user);
+      if (detail::isCombinationalHardwareOperation(user)) {
+        if (failed(propagate(user, endpoint)))
+          return failure();
+        // The common dependency analysis specifies Table region bindings too.
+        for (Region &region : user->getRegions())
+          for (Block &block : region)
+            for (BlockArgument argument : block.getArguments()) {
+              auto paths = analysis.getFieldPaths(argument.getType(), bindings,
+                                                  user, debit);
+              if (failed(paths))
+                return failure();
+              for (const auto &path : *paths) {
+                auto dependencies =
+                    analysis.getDependencies(argument, path, bindings, debit);
+                if (failed(dependencies))
+                  return failure();
+                for (const auto &dependency : *dependencies)
+                  if (dependency == endpoint &&
+                      failed(push(argument, path, user)))
+                    return failure();
+              }
+            }
+        continue;
+      }
+      return reject(user);
+    }
+  }
+  return success();
+}
+
 LogicalResult predicate(const HardwareAnalysis &analysis, Value value,
                         const HardwareBindings &bindings, Operation *site) {
   if (!isa<BitsType>(value.getType()))
@@ -131,8 +402,8 @@ Operation *sourceEffectCallable(Operation *operation) {
              ? parent
              : nullptr;
 }
-int compareCheck(DictionaryAttr lhs, DictionaryAttr rhs) {
-  for (StringRef key : {"registration", "check", "obligation"})
+int compareCheckWithinRegistration(DictionaryAttr lhs, DictionaryAttr rhs) {
+  for (StringRef key : {"check", "obligation"})
     if (int order =
             detail::compareClosedSourceStructure(lhs.get(key), rhs.get(key)))
       return order;
@@ -434,11 +705,30 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
   if (definition->getNumRegions() != 1 || !definition.getBody().hasOneBlock())
     return definition.emitOpError()
            << "source checks require one definition graph block";
+  if (failed(verifyObserverUses(analysis, definition, bindings, budget)))
+    return failure();
   SmallVector<HardwareCheckBinding> result;
-  std::map<DictionaryAttr, size_t, bool (*)(DictionaryAttr, DictionaryAttr)>
-      identities([](DictionaryAttr lhs, DictionaryAttr rhs) {
-        return compareCheck(lhs, rhs) < 0;
-      });
+  // Keep registration ordering once per registration. IDs within a group
+  // have already proved that registration and compare only the remaining
+  // semantic fields. Integer widths/signedness still use the closed-source
+  // comparator rather than Attribute pointer identity.
+  struct CheckLess {
+    bool operator()(DictionaryAttr lhs, DictionaryAttr rhs) const {
+      return compareCheckWithinRegistration(lhs, rhs) < 0;
+    }
+  };
+  struct RegistrationLess {
+    bool operator()(DictionaryAttr lhs, DictionaryAttr rhs) const {
+      return detail::compareClosedSourceStructure(lhs, rhs) < 0;
+    }
+  };
+  using CheckMap = std::map<DictionaryAttr, size_t, CheckLess>;
+  struct CheckGroup {
+    CheckMap identities;
+    RuleOp sampled;
+    SmallVector<size_t, 0> direct;
+  };
+  std::map<DictionaryAttr, CheckGroup, RegistrationLess> registrations;
   llvm::DenseMap<Operation *, detail::SampledAdmissionView> sampledRules;
   auto prepared = validation.prepare(definition, bindings);
   if (failed(prepared))
@@ -478,6 +768,35 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
       return error()
              << "source check suffix requires two results per obligation";
     uint64_t first = rule.getNumResults() - 2 * required.size();
+    // Sampled Rules may append private state-entry witnesses after checks.
+    // The authenticated inventory, rather than the total result count, owns
+    // the check base in that case.
+    if (auto sampled = sampledRules.find(rule); sampled != sampledRules.end())
+      first = sampled->second.checkBase;
+    CheckGroup *group = nullptr;
+    if (!required.empty()) {
+      auto [position, inserted] =
+          registrations.try_emplace(rule.getOccurrence());
+      group = &position->second;
+      if (inserted && sampledRules.count(rule)) {
+        group->sampled = rule;
+        if (failed(budget.debit(
+                detail::SourceCheckBudget::multiply(
+                    required.size(),
+                    detail::SourceCheckBudget::bytes(sizeof(size_t))),
+                rule)))
+          return failure();
+        group->direct.reserve(required.size());
+      } else if (group->sampled) {
+        // Several Rules may share a semantic registration. Such groups use
+        // the general structural map, preserving cross-Rule duplicate checks
+        // and the same global ordering as ordinary Rules.
+        for (size_t index : group->direct)
+          group->identities.emplace(result[index].checkID, index);
+        group->direct.clear();
+        group->sampled = {};
+      }
+    }
     for (auto [index, raw] : llvm::enumerate(required)) {
       auto record = dyn_cast<DictionaryAttr>(raw);
       auto id = record ? record.getAs<DictionaryAttr>("id") : DictionaryAttr();
@@ -525,7 +844,11 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
                                   3 * sizeof(void *)),
                               rule)))
         return failure();
-      if (!identities.emplace(id, result.size()).second)
+      if (group->sampled) {
+        // validation.verify above proves each ID's obligation equals its
+        // RequiredCheck row ordinal, so this is an exact, duplicate-free key.
+        group->direct.push_back(result.size());
+      } else if (!group->identities.emplace(id, result.size()).second)
         return error() << "duplicate full source CheckID";
       if (failed(predicate(analysis, rule.getResult(conditionResult), bindings,
                            rule)) ||
@@ -550,11 +873,33 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
     if (failed(detail::verifySourceExpectOperation(analysis, expect, bindings)))
       return failure();
     auto id = expect->getAttrOfType<DictionaryAttr>("ac.check_id");
-    auto position = identities.find(id);
-    if (position == identities.end())
+    auto registration =
+        registrations.find(id.getAs<DictionaryAttr>("registration"));
+    if (registration == registrations.end())
       return expect.emitOpError()
              << "orphan source check without RequiredCheck owner";
-    auto &found = result[position->second];
+    auto &group = registration->second;
+    size_t foundIndex;
+    if (group.sampled) {
+      auto ordinal = detail::decodeU64(id.getAs<IntegerAttr>("obligation"),
+                                       "CheckID obligation",
+                                       [&] { return expect.emitOpError(); });
+      if (failed(ordinal))
+        return failure();
+      if (*ordinal >= group.direct.size() ||
+          compareCheckWithinRegistration(
+              id, result[group.direct[*ordinal]].checkID) != 0)
+        return expect.emitOpError()
+               << "orphan source check without RequiredCheck owner";
+      foundIndex = group.direct[*ordinal];
+    } else {
+      auto position = group.identities.find(id);
+      if (position == group.identities.end())
+        return expect.emitOpError()
+               << "orphan source check without RequiredCheck owner";
+      foundIndex = position->second;
+    }
+    auto &found = result[foundIndex];
     if (found.expect)
       return expect.emitOpError() << "duplicate expect for source CheckID";
     if (found.kind != expect.getKindAttr() ||
@@ -621,32 +966,39 @@ detail::definitionSourceChecks(const HardwareAnalysis &analysis,
               detail::SourceCheckBudget::bytes(sizeof(Operation *))),
           definition)))
     return failure();
-  for (const auto &[id, index] : identities) {
-    const auto &binding = result[index];
-    if (!sampledRules.count(binding.rule)) {
-      ordered.push_back(binding);
+  for (const auto &[registration, group] : registrations) {
+    if (group.sampled) {
+      for (size_t index : group.direct)
+        ordered.push_back(result[index]);
       continue;
     }
-    if (!emitted.insert(binding.rule).second)
-      continue;
-    const auto &sampled = sampledRules.find(binding.rule)->second;
-    uint64_t count = detail::SourceCheckBudget::add(sampled.controls.size(),
-                                                    sampled.bodyChecks.size());
-    if (index < binding.requiredIndex)
-      return definition.emitOpError()
-             << "sampled check ordering lost its first obligation";
-    uint64_t first = index - binding.requiredIndex;
-    if (first > result.size() || count > result.size() - first)
-      return definition.emitOpError()
-             << "sampled check ordering exceeds catalog";
-    for (uint64_t ordinal = 0; ordinal < count; ++ordinal) {
-      if (failed(budget.debit(1, definition)))
-        return failure();
-      const auto &found = result[first + ordinal];
-      if (found.rule != binding.rule || found.requiredIndex != ordinal)
+    for (const auto &[id, index] : group.identities) {
+      const auto &binding = result[index];
+      if (!sampledRules.count(binding.rule)) {
+        ordered.push_back(binding);
+        continue;
+      }
+      if (!emitted.insert(binding.rule).second)
+        continue;
+      const auto &sampled = sampledRules.find(binding.rule)->second;
+      uint64_t count = detail::SourceCheckBudget::add(
+          sampled.controls.size(), sampled.bodyChecks.size());
+      if (index < binding.requiredIndex)
         return definition.emitOpError()
-               << "sampled check ordering lost an obligation";
-      ordered.push_back(found);
+               << "sampled check ordering lost its first obligation";
+      uint64_t first = index - binding.requiredIndex;
+      if (first > result.size() || count > result.size() - first)
+        return definition.emitOpError()
+               << "sampled check ordering exceeds catalog";
+      for (uint64_t ordinal = 0; ordinal < count; ++ordinal) {
+        if (failed(budget.debit(1, definition)))
+          return failure();
+        const auto &found = result[first + ordinal];
+        if (found.rule != binding.rule || found.requiredIndex != ordinal)
+          return definition.emitOpError()
+                 << "sampled check ordering lost an obligation";
+        ordered.push_back(found);
+      }
     }
   }
   return ordered;
@@ -768,11 +1120,51 @@ resolveHardwareRootBindings(const HardwareAnalysis &analysis) {
 }
 } // namespace detail
 
+thread_local detail::NativeSourceCheckScope
+    *detail::NativeSourceCheckScope::active = nullptr;
+
+detail::NativeSourceCheckScope::NativeSourceCheckScope(
+    const HardwareAnalysis &analysis, SampledAdmissionValidation &validation,
+    SourceCheckBudget &budget, Definitions &definitions)
+    : previous(active), analysis(analysis), validation(validation),
+      budget(budget), definitions(definitions) {
+  active = this;
+}
+detail::NativeSourceCheckScope::~NativeSourceCheckScope() { active = previous; }
+
+std::optional<LogicalResult>
+detail::NativeSourceCheckScope::verify(ModuleOp definition) {
+  if (!active || !definition ||
+      definition->getParentOp() != active->analysis.getPackage().getOperation())
+    return std::nullopt;
+  auto &scope = *active;
+  if (failed(scope.budget.debit(1, definition)))
+    return failure();
+  // No transform can run inside this synchronous MLIR verification scope.
+  // This catalog holds current default-binding checks, never an edited-IR or
+  // occurrence verdict; bound occurrence checks still use their existing owner.
+  if (scope.definitions.contains(definition))
+    return success();
+  HardwareBindings bindings;
+  bindings.owner = definition;
+  auto checks = definitionSourceChecks(scope.analysis, definition, bindings,
+                                       scope.validation, scope.budget);
+  if (failed(checks) ||
+      failed(scope.budget.debit(
+          SourceCheckBudget::bytes(sizeof(Definitions::value_type)),
+          definition)))
+    return failure();
+  scope.definitions.try_emplace(definition, std::move(*checks));
+  return success();
+}
+
 LogicalResult
 HardwareAnalysis::verifyDefinitionSourceChecks(ModuleOp definition) const {
   if (!definition || definition->getParentOp() != package.getOperation())
     return package.emitOpError()
            << "source check definition must belong to analyzed package";
+  if (auto shared = detail::NativeSourceCheckScope::verify(definition))
+    return *shared;
   HardwareBindings bindings;
   bindings.owner = definition;
   detail::SourceCheckBudget budget(HardwareSourceCheckLimits{});
@@ -802,7 +1194,8 @@ LogicalResult HardwareAnalysis::verifySourceCheckPlan(
     return package.emitOpError()
            << "source check plan differs from current hardware package";
   };
-  if (plan.bindings.size() != fresh->bindings.size() ||
+  if (plan.resetSemantics != fresh->resetSemantics ||
+      plan.bindings.size() != fresh->bindings.size() ||
       plan.owners.size() != fresh->owners.size() ||
       plan.checks.size() != fresh->checks.size() ||
       plan.commits.size() != fresh->commits.size() ||
@@ -856,5 +1249,218 @@ LogicalResult HardwareAnalysis::verifySourceCheckPlan(
         lhs.ordinal != rhs.ordinal)
       return mismatch();
   return success();
+}
+
+FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
+    const HardwareSourceCheckPlan &plan,
+    HardwareSourceCheckLimits limits) const {
+  if (failed(verifySourceCheckPlan(plan, limits)))
+    return failure();
+  if (plan.owners.empty())
+    return package.emitOpError() << "physical RTL requires a root owner";
+  auto root = plan.owners.front().definition;
+  auto kind = root->getAttrOfType<StringAttr>("ac.root_kind");
+  if (kind && kind.getValue() == "system")
+    return root.emitOpError()
+           << "physical RTL requires an ordinary Module, not a closed System";
+  auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
+  auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
+  auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
+  auto layout = getModulePortLayout(root);
+  if (failed(layout))
+    return failure();
+  if (!clock || !reset || clock.getValue().getActiveBits() > 32 ||
+      reset.getValue().getActiveBits() > 32 || clock == reset ||
+      clock.getValue().getZExtValue() >= layout->sourceInputCount ||
+      reset.getValue().getZExtValue() >= layout->sourceInputCount)
+    return root.emitOpError()
+           << "physical RTL requires one actual root clock/reset pair";
+  unsigned clk = clock.getValue().getZExtValue(),
+           rst = reset.getValue().getZExtValue();
+  detail::SourceCheckBudget budget(limits);
+  budget.setPhase("physical RTL projection");
+  // Identity-only transport is sufficient for domain proof. Uniform Tables
+  // preserve identity through Collection slicing and layout permutations.
+  // Derived expressions deliberately have no domain identity.
+  std::function<FailureOr<unsigned>(Value, uint64_t, unsigned)> identity;
+  identity = [&](Value value, uint64_t owner,
+                 unsigned depth) -> FailureOr<unsigned> {
+    auto &occurrence = plan.owners[owner];
+    Operation *site = value.getDefiningOp();
+    if (!site)
+      site = value.getParentBlock()->getParentOp();
+    if (depth > 256 || failed(budget.debit(1, site)))
+      return site->emitOpError()
+             << "physical domain identity exceeds bounded traversal";
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      auto *parent = argument.getOwner()->getParentOp();
+      if (auto rule = dyn_cast<RuleOp>(parent))
+        return identity(rule->getOperand(argument.getArgNumber()), owner,
+                        depth + 1);
+      if (parent == occurrence.definition) {
+        if (!occurrence.parent)
+          return argument.getArgNumber() == clk   ? 1u
+                 : argument.getArgNumber() == rst ? 2u
+                                                  : 0u;
+        auto *allocation = occurrence.path.back().allocation;
+        return identity(allocation->getOperand(argument.getArgNumber()),
+                        *occurrence.parent, depth + 1);
+      }
+      return 0u;
+    }
+    if (auto result = dyn_cast<OpResult>(value)) {
+      if (auto rule = dyn_cast<RuleOp>(result.getOwner()))
+        return identity(cast<YieldOp>(rule.getBody().front().back())
+                            .getValues()[result.getResultNumber()],
+                        owner, depth + 1);
+    }
+    if (auto extract = value.getDefiningOp<BitsExtractOp>()) {
+      auto low = evaluateStatic(extract.getLow(), occurrence.bindings, extract);
+      auto inWidth = getPackedWidth(extract.getInput().getType(),
+                                    occurrence.bindings, extract);
+      auto outWidth =
+          getPackedWidth(value.getType(), occurrence.bindings, extract);
+      if (failed(low) || failed(inWidth) || failed(outWidth))
+        return failure();
+      auto integer = dyn_cast<MathIntAttr>(*low);
+      if (integer && llvm::APSInt(integer.getCanonicalValue()).isZero() &&
+          *inWidth == *outWidth)
+        return identity(extract.getInput(), owner, depth + 1);
+    }
+    if (auto splat = value.getDefiningOp<TableSplatOp>())
+      return identity(splat.getInput(), owner, depth + 1);
+    if (auto create = value.getDefiningOp<TableCreateOp>()) {
+      unsigned uniform = 0;
+      for (Value element : create->getOperands()) {
+        auto part = identity(element, owner, depth + 1);
+        if (failed(part))
+          return failure();
+        if (!*part || (uniform && uniform != *part))
+          return 0u;
+        uniform = *part;
+      }
+      return uniform;
+    }
+    return 0u;
+  };
+  auto pair = [&](Value clockValue, Value resetValue, uint64_t owner,
+                  Operation *site) -> LogicalResult {
+    auto c = identity(clockValue, owner, 0), r = identity(resetValue, owner, 0);
+    if (failed(c) || failed(r))
+      return failure();
+    if (*c != 1 || *r != 2)
+      return site->emitOpError()
+             << "physical RTL requires all sampling and storage to use the "
+                "actual root clock/reset pair";
+    return success();
+  };
+  llvm::DenseSet<Operation *> reachable;
+  for (const auto &owner : plan.owners)
+    reachable.insert(owner.definition);
+  for (const auto &check : plan.bindings)
+    if (reachable.contains(check.definition) &&
+        check.kind.getValue() != "guard_known")
+      return check.expect->emitOpError()
+             << "physical RTL requires managed execution for residual "
+             << check.kind.getValue() << " checks";
+  for (const auto &sampling : plan.samplingOccurrences) {
+    const auto &binding = plan.samplingBindings[sampling.bindingIndex];
+    if (failed(pair(binding.clock, binding.reset, sampling.ownerOccurrence,
+                    binding.definition)))
+      return failure();
+  }
+  for (auto [owner, occurrence] : llvm::enumerate(plan.owners)) {
+    auto definition = occurrence.definition;
+    auto observations = definition.getBody().front().getOps<SourceObserveOp>();
+    if (!observations.empty())
+      return definition.emitOpError()
+             << "physical RTL does not support observations";
+    // Include stateless and readonly transactions even if no storage/check
+    // occurrence happens to retain their domain in the managed plan.
+    for (auto rule : definition.getBody().front().getOps<RuleOp>()) {
+      if (!rule->hasAttr("ac.sampled_admission"))
+        continue;
+      auto view = detail::parseSampledAdmission(rule, *this,
+                                                occurrence.bindings, budget);
+      if (failed(view) || failed(pair(view->clock, view->reset, owner, rule)))
+        return failure();
+      for (const auto &control : view->controls)
+        if (control.kind != detail::SampledControlKind::CallableGuard &&
+            control.kind != detail::SampledControlKind::BranchSelect)
+          return rule.emitOpError() << "physical RTL requires managed "
+                                       "execution for non-guard controls";
+    }
+    for (Operation &op : definition.getBody().front()) {
+      if (!isa<InstanceOp, CollectionOp>(op))
+        continue;
+      auto *callee = isa<InstanceOp>(op)
+                         ? resolveCallee(cast<InstanceOp>(op))
+                         : resolveCallee(cast<CollectionOp>(op));
+      auto primitive = getPrimitiveKind(callee);
+      if (primitive.empty())
+        continue;
+      if (primitive != "dff" && primitive != "dffe")
+        return op.emitOpError()
+               << "physical RTL supports only DFF/DFFE storage primitives";
+      if (op.getNumOperands() < 2 ||
+          failed(pair(op.getOperand(0), op.getOperand(1), owner, &op)))
+        return failure();
+      unsigned initialIndex = primitive == "dff" ? 3 : 4;
+      if (op.getNumOperands() <= initialIndex ||
+          failed(detail::verifyClosedStateInitializer(
+              *this, op.getOperand(initialIndex), occurrence.bindings, &op)))
+        return failure();
+    }
+    auto uses = definition.walk([&](Operation *op) {
+      for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
+        auto id = identity(operand, owner, 0);
+        if (failed(id))
+          return WalkResult::interrupt();
+        if (*id != 1)
+          continue;
+        bool transport = isa<TableSplatOp>(op);
+        if (auto create = dyn_cast<TableCreateOp>(op)) {
+          auto result = identity(create.getResult(), owner, 0);
+          if (failed(result))
+            return WalkResult::interrupt();
+          transport = *result == 1;
+        }
+        if (auto extract = dyn_cast<BitsExtractOp>(op)) {
+          auto result = identity(extract.getResult(), owner, 0);
+          if (failed(result))
+            return WalkResult::interrupt();
+          transport = *result == 1;
+        }
+        if (auto rule = dyn_cast<RuleOp>(op)) {
+          auto metadata =
+              rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+          auto capture = metadata ? metadata.getAs<IntegerAttr>("clock_capture")
+                                  : IntegerAttr();
+          transport = capture && index == capture.getValue().getZExtValue();
+        }
+        if (isa<InstanceOp, CollectionOp>(op)) {
+          auto *callee = isa<InstanceOp>(op)
+                             ? resolveCallee(cast<InstanceOp>(op))
+                             : resolveCallee(cast<CollectionOp>(op));
+          auto primitive = getPrimitiveKind(callee);
+          // Ordinary child arguments are checked in their actual occurrence.
+          transport =
+              primitive.empty() ||
+              ((primitive == "dff" || primitive == "dffe") && index == 0);
+        }
+        if (auto expect = dyn_cast<SourceExpectOp>(op))
+          transport = expect.getKind() == "guard_known" && index == 2;
+        if (!transport) {
+          op->emitOpError() << "physical RTL forbids clock use as data or "
+                               "combinational control";
+          return WalkResult::interrupt();
+        }
+      }
+      return WalkResult::advance();
+    });
+    if (uses.wasInterrupted())
+      return failure();
+  }
+  return HardwarePhysicalProjection{root, clk, rst};
 }
 } // namespace acir::ac

@@ -254,6 +254,21 @@ SourceHeaderRegistry::create(MLIRContext *context, ArrayRef<ModuleOp> headers,
       return failure();
   }
 
+  for (StringRef kind : {"fifo_local", "fifo_downstream_pop"}) {
+    SmallVector<std::pair<StringRef, Type>> inputs{
+        {"clk", one(kind)}, {"rst", one(kind)}, {"in_valid", one(kind)},
+        {"in_data", dataType(kind)}, {"out_ready", one(kind)}};
+    SmallVector<std::pair<StringRef, Type>> outputs{
+        {"ready", one(kind)}, {"valid", one(kind)},
+        {"data", dataType(kind)}, {"local_capacity", one(kind)}};
+    SmallVector<SmallVector<unsigned>> dependencies(4);
+    if (kind == "fifo_downstream_pop")
+      dependencies[0].push_back(4);
+    if (failed(addCatalogEntry(kind, {"DEPTH", "AVAILABILITY_LATENCY"},
+                               {2, 1}, inputs, outputs, dependencies)))
+      return failure();
+  }
+
   auto addMemory = [&](StringRef kind, bool dualPort,
                        bool asynchronousRead) -> LogicalResult {
     Type data = dataType(kind);
@@ -296,6 +311,12 @@ SourceHeaderRegistry::create(MLIRContext *context, ArrayRef<ModuleOp> headers,
       outputs.append({{"rdata0", data}, {"rdata1", data}});
     else
       outputs.push_back({"rdata", data});
+    if (!asynchronousRead) {
+      if (dualPort)
+        outputs.append({{"rlive0", one(kind)}, {"rlive1", one(kind)}});
+      else
+        outputs.push_back({"rlive", one(kind)});
+    }
     SmallVector<SmallVector<unsigned>> dependencies(outputs.size());
     if (asynchronousRead)
       dependencies[0].push_back(2);

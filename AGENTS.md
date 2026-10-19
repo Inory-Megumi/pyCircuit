@@ -20,6 +20,85 @@ Read affected specifications and exact semantic approvals under
 not implementation or execution evidence. Preserve frozen technical records;
 update active behavior docs when implementation changes.
 
+## Pythonic authoring contract
+
+The user requests Astra (`gpt-6-astra`) for delegated pyCircuit source authoring
+and authoring-contract review. Keep compiler-only implementation routing separate.
+
+For source authoring, first read [.codex/skills/pycircuit-authoring/SKILL.md](.codex/skills/pycircuit-authoring/SKILL.md).
+Write function calls, ordinary local computations and sequential Rule assignments.
+Rule definitions can be source-global or nested; definition location is not
+Module ownership. External Rules receive explicit arguments.
+Module variables own persistent state; ACIR supplies storage and its controls.
+Ordinary example/benchmark frontend sources must not expose clk/reset, register
+q/d interfaces, DFF/DFFE bindings or proposal/commit plumbing. Original RTL names
+and physical ports belong at the compiler export or test adapter boundary.
+Single values use scalar arguments/results; do not wrap one ac.u8/Bits/bool in a
+one-field Struct or singleton tuple. Structs group multiple related fields.
+Dedicated primitive/nominal-type conformance tests retain their explicit test
+purpose and must not be copied as ordinary design style.
+
+## Module output authoring
+
+Choose module interfaces by how their fields are connected. When several fields
+normally travel together to one downstream module, prefer a named Struct as one
+output and one typed input on the consumer. Pass that structured value directly;
+avoid flattening it into parallel ports and rebuilding it at the next boundary.
+Adding or removing a field should normally update the shared Struct definition
+and affected field users, not the inter-module argument/result lists.
+
+Use `-> tuple[T0, T1, ...]`, ordered returns and direct unpacking for independent
+interfaces or outputs routed separately. Each tuple element may itself be a
+Struct. A real structured connection is encouraged; do not impose one wrapper
+Struct/NamedTuple or mapping over unrelated output interfaces. Preserve instance
+identity, timing and existing oracles.
+Follow the [frontend authoring contract](docs/development/agent-frontend-guide.md#module-hierarchy-and-independent-outputs)
+and [multi-output example](examples/multi_outputs/README.md). This requirement
+supersedes blanket advice to either bundle all outputs or split every field.
+
+## Rule authoring requirements
+
+Agents must follow the [Rule authoring contract](docs/development/agent-frontend-guide.md#rule-authoring-contract).
+Keep each Rule simple and cohesive: one function or one set of effects that must
+commit together. Put independent functions in separate Rules; preserve required
+atomicity when splitting. A Rule may be defined inside its Module and has no
+persistent local state. Use typed arguments and the same multi-output calling
+style as Modules: ordered tuple results with direct unpacking for independent
+interfaces, and named Structs for fields of one shared interface.
+
+Leave resource admission and proposal/commit guards to compiler analysis and
+Rule lowering. Do not require authors to repeat full/empty/ready or output
+acceptance checks already specified by the called interface. Keep actual
+algorithmic predicates explicit. The compiler generates and propagates ordinary
+output availability; do not add a payload validity field, replacement zero or
+holding register solely to represent a Rule that did not commit. Protocol fields
+such as a queue's raw valid signal remain part of that interface. The standalone
+Signal resource design is cancelled: use typed Module/Rule inputs and results
+with compiler-owned availability, and state/Queue for cross-cycle storage.
+Do not introduce Signal declaration/set/get APIs or restore that task. Never infer protocol semantics from signal
+names, delete necessary checks before equivalent lowering exists, or claim
+unsupported Rule syntax works. Record such gaps under issue #319; the authoring
+requirement does not establish implementation support.
+
+Cross-Module Rule calls target an existing Module instance. MLIR owns the
+additional ports and hierarchy wiring needed for arguments, results and atomic
+control; authors must not hand-build forwarding/handshake wrappers. Preserve the
+callee's state identity and include its proposals in the caller's transaction.
+Use the supported static instance and callable forms documented in the frontend
+guide; retain independent compile/link and generated System coverage.
+
+## Module state declaration checks
+
+Treat module-scope persistent variables as compiler-generated DFF/DFFE storage
+children, using the same `ac.instance` and typed ports as other child modules.
+Require coverage of declared Bits, Enum, Struct and arithmetic data types with
+defined storage representations; do not restrict this principle to `u1`–`u63`.
+Preserve logical types, ownership, initial/reset values and update conditions.
+Ordinary expression locals and child-result bindings remain wires, not storage.
+Follow the [required state-declaration checks](docs/development/agent-frontend-guide.md#required-state-declaration-checks).
+Report unsupported type/path combinations as implementation gaps; a handbook
+requirement is not evidence that those combinations already compile and execute.
+
 ## Issue and PR delivery
 
 All subsequent pyCircuit issues and PRs, including agent and CLI submissions,

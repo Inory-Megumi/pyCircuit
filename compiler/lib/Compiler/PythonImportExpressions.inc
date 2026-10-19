@@ -1,3 +1,78 @@
+if (node.kind() == "Call" && intrinsic(node.child("func"), "four_state")) {
+  auto pattern = fourStatePattern(node);
+  if (failed(pattern))
+    return failure();
+  auto result =
+      createOp(at, node.location(b.getContext(), source.path),
+               ac::BitsConstant4Op::getOperationName(), {},
+               TypeRange{internalBits(pattern->size(), node, ownerSymbol)},
+               {at.getNamedAttr("pattern", at.getStringAttr(pattern->lower()))})
+          ->getResult(0);
+  remember(result, std::nullopt);
+  fixedValues.insert(result);
+  return result;
+}
+if (node.kind() == "Call" && (intrinsic(node.child("func"), "case_eq") ||
+                              intrinsic(node.child("func"), "is_known"))) {
+  bool known = intrinsic(node.child("func"), "is_known");
+  if (node.array("args").size() != (known ? 1u : 2u) ||
+      !node.array("keywords").empty())
+    return error() << "four-state observer requires exactly "
+                   << (known ? "one" : "two") << " positional Bits operands";
+  auto lhs = expression(node.item("args", 0), at, ownerSymbol, values,
+                        instances, {}, captures);
+  if (failed(lhs))
+    return failure();
+  FailureOr<Value> rhs = known
+                             ? lhs
+                             : expression(node.item("args", 1), at, ownerSymbol,
+                                          values, instances, {}, captures);
+  if (failed(rhs))
+    return failure();
+  if (!isa<ac::BitsType>(lhs->getType()) ||
+      !isa<ac::BitsType>(rhs->getType()) || !fixedValues.contains(*lhs) ||
+      !fixedValues.contains(*rhs) ||
+      !ac::areEquivalentHardwareTypes(lhs->getType(), rhs->getType()))
+    return error()
+           << "four-state observer requires equal-width fixed Bits operands";
+  auto bit = internalBits(1, node, ownerSymbol);
+  auto compare = [&](Value left, Value right, StringRef predicate) {
+    return createOp(at, node.location(b.getContext(), source.path),
+                    ac::BitsCompareOp::getOperationName(), {left, right},
+                    TypeRange{bit},
+                    {at.getNamedAttr("predicate", at.getStringAttr(predicate))})
+        ->getResult(0);
+  };
+  Value result;
+  if (known) {
+    auto equal = compare(*lhs, *lhs, "eq");
+    auto one = constant(bit, 1, node, at, ownerSymbol);
+    if (failed(one))
+      return failure();
+    result = compare(equal, *one, "case_eq");
+  } else
+    result = compare(*lhs, *rhs, "case_eq");
+  result.getDefiningOp()->setAttr(
+      "ac.verification_observer",
+      at.getStringAttr(known ? "is_known" : "case_eq"));
+  result.getDefiningOp()->setAttr("ac.origin",
+                                  sourceOccurrence(at, ownerSymbol, node));
+  remember(result, ValueKind::Boolean);
+  return result;
+}
+// Memory handles are static identities; all data accesses are Rule operations.
+AstNode memoryBase = node.kind() == "Attribute" ? node.child("value") : node;
+if (memoryBase.kind() == "Name") {
+  auto found = instances.find(memoryBase.string("id"));
+  if (found != instances.end() && memoryInstance(found->second) &&
+      !values.contains(memoryBase.string("id")))
+    return error() << "Memory handle is a static allocation identity, not a payload value";
+}
+// Queue construction produces an ordinary immutable instance handle. Its three
+// public raw views are ordinary instance outputs.
+auto queueRaw = queueRawExpression(node, at, ownerSymbol, values, instances);
+if (failed(queueRaw)) return failure();
+if (*queueRaw) return **queueRaw;
 if (activeSourceEffects &&
     (node.kind() == "Name" || node.kind() == "Call")) {
   auto effect = sourceEffectExpression(node, at, ownerSymbol, values, instances);
@@ -118,7 +193,8 @@ if (node.kind() == "Constant" && expected && !isa<ac::BitsType>(*expected)) {
 if (node.kind() == "Attribute" &&
     !(node.child("value").kind() == "Name" &&
       !queryBound(node.child("value").string("id")) &&
-      instances.contains(node.child("value").string("id")))) {
+      instances.contains(node.child("value").string("id")) &&
+      !values.contains(node.child("value").string("id")))) {
   auto base = expression(node.child("value"), at, ownerSymbol, values,
                          instances, {}, captures);
   if (failed(base))
@@ -214,6 +290,14 @@ if (node.kind() == "Subscript") {
                  TypeRange{shape->type}, {at.getNamedAttr("low", shape->low)})
             ->getResult(0);
     ac::HardwareAnalysis analysis(*body);
+    // A symbolic slice still has fixed-bit authority. Range/value facts need
+    // concrete widths and remain absent until actual binding proves them.
+    if (!analysis.isStaticEvaluable(cast<ac::BitsType>(shape->type).getWidth(), {}) ||
+        !analysis.isStaticEvaluable(shape->low, {})) {
+      remember(result, std::nullopt);
+      fixedValues.insert(result);
+      return result;
+    }
     auto low = analysis.evaluateStatic(shape->low, {}, result.getDefiningOp());
     auto width = analysis.getPackedWidth(shape->type, {}, result.getDefiningOp());
     if (failed(low) || failed(width))
@@ -247,15 +331,46 @@ if (node.kind() == "Subscript") {
                           instances, {}, captures);
   if (failed(index))
     return failure();
+  if (isa<ac::BitsType>(base->getType())) {
+    if (!fixedValues.contains(*base))
+      return error() << "bit index requires authoritative fixed bits, not a "
+                        "Boolean or Integer carrier";
+    ac::HardwareAnalysis analysis(*body);
+    auto width = analysis.getPackedWidth(base->getType(), {},
+                                         at.getInsertionBlock()->getParentOp());
+    if (failed(width) || failed(proveIndexExtent(*index, *width, node, "bit")))
+      return failure();
+    // Keep the complete index carrier, including high X/Z bits. A logical
+    // Boolean/Integer index crosses an explicit fresh fixed-Bits boundary;
+    // aliases of the original source value retain their source-kind facts.
+    auto count = unsignedBoundary(*index, index->getType(), node.child("slice"),
+                                  at, ownerSymbol);
+    if (failed(count))
+      return failure();
+    auto shifted =
+        fixedUnsignedShift(*base, *count, "lshr", node, node.child("value"),
+                           node.child("slice"), at, ownerSymbol);
+    if (failed(shifted))
+      return failure();
+    auto result =
+        createOp(at, node.location(b.getContext(), source.path),
+                 ac::BitsExtractOp::getOperationName(), {*shifted},
+                 TypeRange{internalBits(1, node, ownerSymbol)},
+                 {at.getNamedAttr("low", literal(0, node, ownerSymbol))})
+            ->getResult(0);
+    remember(result, std::nullopt);
+    fixedValues.insert(result);
+    return result;
+  }
   auto type = dyn_cast<ac::TableType>(base->getType());
   if (!type)
-    return error() << "subscript requires a table";
+    return error() << "subscript requires fixed bits or a table";
   if (failed(proveIndex(*base, *index, node)))
     return failure();
   auto result =
       createOp(at, node.location(b.getContext(), source.path),
                ac::TableGetOp::getOperationName(), {*base, *index},
-               TypeRange{type.getElementType(), bits(1, node, ownerSymbol)}, {})
+               TypeRange{type.getElementType(), internalBits(1, node, ownerSymbol)}, {})
           ->getResult(0);
   if (isa<ac::BitsType>(result.getType()))
     fixedValues.insert(result);

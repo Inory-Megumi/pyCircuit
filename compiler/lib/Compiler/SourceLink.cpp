@@ -1,4 +1,5 @@
 #include "SourceLink.h"
+#include "LiteralPayloadWires.h"
 #include "SourceHeaderHelpers.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -17,6 +18,42 @@ using namespace mlir;
 
 namespace acir::compiler {
 namespace {
+
+// Source pairs and native IR are authenticated before this pass sees the
+// linked clone. Keep compile-time boundary wires in published source units;
+// compact only redundant literal payload inputs before transaction planning.
+class CompactLiteralPayloadWiresPass final
+    : public PassWrapper<CompactLiteralPayloadWiresPass,
+                         OperationPass<mlir::ModuleOp>> {
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CompactLiteralPayloadWiresPass)
+
+  void runOnOperation() final {
+    for (auto module : getOperation().getOps<ac::ModuleOp>()) {
+      auto &block = module.getBody().front();
+      for (auto extract :
+           llvm::make_early_inc_range(block.getOps<ac::BitsExtractOp>())) {
+        Value input = detail::literalPayloadReplacement(extract, block);
+        if (!input) continue;
+        extract.getResult().replaceAllUsesWith(input);
+        extract.erase();
+      }
+      // This standard link pass operates on the already admitted clone. Keep
+      // the existing hardware/transaction verification limits at their owners.
+      auto plan = detail::planLiteralPayloadConstants(
+          block, [](uint64_t, uint64_t) { return success(); });
+      if (failed(plan)) {
+        module.emitError("literal payload plan exceeds container capacity");
+        signalPassFailure();
+        return;
+      }
+      for (auto [constant, representative] : *plan) {
+        constant.getResult().replaceAllUsesWith(representative);
+        constant.erase();
+      }
+    }
+  }
+};
 
 struct TransactionStageCapture {
   unsigned beforeCount = 0;
@@ -129,10 +166,12 @@ admitSourceLinkUnits(llvm::ArrayRef<SourceLinkUnit> units,
   return std::move(*registry);
 }
 
-FailureOr<OwningOpRef<ModuleOp>>
-linkHardwareUnits(ArrayRef<SourceLinkUnit> units, StringRef top,
-                  ac::detail::EmitError emitError,
-                  SourceLinkStages *retainedStages) {
+FailureOr<OwningOpRef<ModuleOp>> linkHardwareUnits(
+    ArrayRef<SourceLinkUnit> units, StringRef top,
+    ac::detail::EmitError emitError, SourceLinkStages *retainedStages,
+    ArrayRef<SourceLinkParameterBinding> parameters, StringRef resetSemantics) {
+  if (resetSemantics != "strict" && resetSemantics != "if_one")
+    return emitError() << "reset semantics must be strict or if_one";
   auto admitted = admitSourceLinkUnits(units, emitError);
   if (failed(admitted))
     return failure();
@@ -199,13 +238,55 @@ linkHardwareUnits(ArrayRef<SourceLinkUnit> units, StringRef top,
   if (!root.getTypeParameters().empty())
     return root.emitOpError(
         "source link requires concrete root type arguments");
+  llvm::StringMap<ac::MathIntAttr> overrides;
+  for (const SourceLinkParameterBinding &binding : parameters) {
+    if (binding.name.empty() || overrides.contains(binding.name))
+      return root.emitOpError(
+          "root parameter binding names must be nonempty and unique");
+    if (!llvm::any_of(root.getParameters(), [&](Attribute raw) {
+          return cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue() ==
+                 binding.name;
+        }))
+      return root.emitOpError() << "unknown root integer parameter: "
+                                << binding.name;
+    auto value = ac::detail::parseMathIntAttr(context, binding.value, emitError);
+    if (failed(value))
+      return failure();
+    overrides[binding.name] = *value;
+  }
+  DictionaryAttr origin, span;
+  if (!overrides.empty()) {
+    origin = root->getAttrOfType<DictionaryAttr>("ac.origin");
+    auto location = dyn_cast<FileLineColLoc>(root.getLoc());
+    if (!origin || !location)
+      return root.emitOpError(
+          "root parameter bindings require the source declaration location");
+    // The binding belongs to the selected declaration. Preserve that actual
+    // occurrence and source point instead of inventing a Python AST site.
+    span = builder.getDictionaryAttr({
+        builder.getNamedAttr("path", location.getFilename()),
+        builder.getNamedAttr("line", builder.getI64IntegerAttr(location.getLine())),
+        builder.getNamedAttr("column", builder.getI64IntegerAttr(location.getColumn())),
+        builder.getNamedAttr("end_line", builder.getI64IntegerAttr(location.getLine())),
+        builder.getNamedAttr("end_column", builder.getI64IntegerAttr(location.getColumn()))});
+  }
   SmallVector<Attribute> arguments;
   for (Attribute raw : root.getParameters()) {
     auto parameter = cast<DictionaryAttr>(raw);
+    StringRef name = parameter.getAs<StringAttr>("name").getValue();
     auto value = parameter.getAs<ac::StaticExprAttr>("default");
+    if (auto found = overrides.find(name); found != overrides.end())
+      value = ac::StaticExprAttr::get(
+          context, builder.getDictionaryAttr({
+              builder.getNamedAttr("kind", builder.getStringAttr("literal")),
+              builder.getNamedAttr("value", builder.getDictionaryAttr({
+                  builder.getNamedAttr("kind", builder.getStringAttr("integer")),
+                  builder.getNamedAttr("value", found->second)})),
+              builder.getNamedAttr("origin", origin),
+              builder.getNamedAttr("location", span)}));
     if (!value)
-      return root.emitOpError(
-          "source link root integer parameter requires a default");
+      return root.emitOpError() << "source link root integer parameter requires "
+                                  "a value or default: " << name;
     arguments.push_back(value);
   }
   OperationState state(root.getLoc(), ac::SystemOp::getOperationName());
@@ -216,6 +297,9 @@ linkHardwareUnits(ArrayRef<SourceLinkUnit> units, StringRef top,
            builder.getNamedAttr("parameters", builder.getArrayAttr(arguments)),
            builder.getNamedAttr("type_arguments", builder.getArrayAttr({}))}));
   state.addAttribute("domain", builder.getStringAttr("default"));
+  state.addAttribute("ac.execution_policy",
+                     builder.getDictionaryAttr({builder.getNamedAttr(
+                         "reset", builder.getStringAttr(resetSemantics))}));
   (*linked).getBody()->push_back(Operation::create(state));
   auto residualCall = linked->walk([&](func::CallOp call) {
     if (call->getParentOfType<func::FuncOp>())
@@ -244,6 +328,8 @@ linkHardwareUnits(ArrayRef<SourceLinkUnit> units, StringRef top,
   // printing, using existing hardware limits for packages with no transactions.
   TransactionStageCapture capture;
   PassManager pipeline(context);
+  pipeline.addPass(acir::createNormalizeSourceControlFlowPass());
+  pipeline.addPass(std::make_unique<CompactLiteralPayloadWiresPass>());
   if (ac::detail::findUnloweredTransaction(linked->getOperation()))
     pipeline.addPass(acir::createAnalyzeTransactionStateSSAPass());
   else

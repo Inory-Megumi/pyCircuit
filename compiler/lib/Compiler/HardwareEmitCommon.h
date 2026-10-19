@@ -5,10 +5,10 @@
 #include "llvm/Support/raw_ostream.h"
 #include <array>
 #include <cstdint>
-#include <utility>
 #include <functional>
 #include <optional>
 #include <string>
+#include <utility>
 namespace acir::compiler {
 struct EmitNames {
   std::string cppQualified;
@@ -23,14 +23,22 @@ struct EmitNames {
 };
 class HardwareEmitContext {
 public:
-  HardwareEmitContext(mlir::ModuleOp package, ac::HardwareAnalysis &analysis);
+  HardwareEmitContext(mlir::ModuleOp package, ac::HardwareAnalysis &analysis,
+                      bool physical = false);
   mlir::LogicalResult prepare();
   bool isSystem();
   bool managesChecks();
+  bool isPhysical() const { return physical_; }
+  const ac::HardwarePhysicalProjection &physicalProjection() const {
+    return *physicalProjection_;
+  }
   // Prepare the verified check lifecycle shared by generated systems and
   // checked module callers; each emitter retains its observation boundary.
   mlir::LogicalResult prepareNativeChecks();
   const ac::HardwareSourceCheckPlan &sourceChecks() const;
+  bool resetIfOne() const;
+  std::string cppReset(llvm::StringRef expression) const;
+  std::string rtlReset(llvm::StringRef expression) const;
   const EmitNames &names(mlir::Operation *definition) const;
   mlir::FailureOr<std::string> cppFormalName(llvm::StringRef name,
                                              mlir::Operation *site) const;
@@ -53,6 +61,7 @@ public:
   mlir::FailureOr<std::string> staticRtlValue(ac::StaticExprAttr expression,
                                               mlir::Operation *site) const;
   mlir::FailureOr<ac::HardwareBindings> rootBindings() const;
+  mlir::FailureOr<std::string> rootPortMap(bool rtl = true);
   mlir::FailureOr<std::string> rootCppType() const;
   mlir::FailureOr<std::string> rootRtlParameters() const;
   mlir::FailureOr<std::string> cppInstanceType(ac::InstanceOp instance) const;
@@ -89,6 +98,8 @@ public:
 
 private:
   mlir::LogicalResult prepareImpl(bool allowSourceChecks);
+  bool physical_ = false;
+  std::optional<ac::HardwarePhysicalProjection> physicalProjection_;
   std::optional<ac::HardwareSourceCheckPlan> sourceChecks_;
   llvm::DenseMap<mlir::Operation *, EmitNames> names_;
 };
@@ -114,8 +125,10 @@ struct ObservationEmissionOccurrence {
   llvm::SmallVector<std::pair<mlir::Operation *, uint64_t>> logicalOwnerPath;
 };
 struct ObservationEmissionPlan {
-  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<ObservationEmissionSite>> definitions;
-  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<ObservationEmissionChild>> children;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<ObservationEmissionSite>>
+      definitions;
+  llvm::DenseMap<mlir::Operation *, llvm::SmallVector<ObservationEmissionChild>>
+      children;
   llvm::DenseMap<mlir::Operation *, uint64_t> subtreeWidth;
   llvm::DenseMap<mlir::Operation *, llvm::SmallVector<uint64_t>> childBaseUnits;
   llvm::SmallVector<std::array<uint64_t, 5>> table;
@@ -124,8 +137,11 @@ struct ObservationEmissionPlan {
 };
 mlir::FailureOr<ObservationEmissionPlan>
 observationEmissionPlan(HardwareEmitContext &context);
+mlir::FailureOr<uint64_t>
+observationPayloadWidth(HardwareEmitContext &context,
+                        const ObservationEmissionOccurrence &occurrence);
 mlir::FailureOr<std::string> emissionMetadataJson(mlir::Attribute value,
-                                               mlir::Operation *site);
+                                                  mlir::Operation *site);
 mlir::FailureOr<std::string>
 observationSiteMetadataJson(ac::SourceObserveOp observe);
 mlir::FailureOr<std::string>
@@ -137,9 +153,8 @@ cppObservationConfigureCall(HardwareEmitContext &context);
 mlir::FailureOr<std::string>
 cppObservationChildBase(HardwareEmitContext &context, ac::ModuleOp definition,
                         unsigned childIndex);
-mlir::FailureOr<uint64_t>
-cppObservationLaneStride(HardwareEmitContext &context,
-                         ac::ModuleOp definition);
+mlir::FailureOr<uint64_t> cppObservationLaneStride(HardwareEmitContext &context,
+                                                   ac::ModuleOp definition);
 mlir::FailureOr<uint64_t>
 cppObservationSubtreeWidth(HardwareEmitContext &context,
                            ac::ModuleOp definition);

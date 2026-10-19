@@ -108,7 +108,7 @@ def _source(
     if not assertions:
         bench = source / "bench.py"
         original = bench.read_text()
-        assertion = '        assert right.value < 4, "deliberate limit"\n'
+        assertion = '        assert right < 4, "deliberate limit"\n'
         assert assertion in original
         bench.write_text(original.replace(assertion, ""))
     return source
@@ -491,11 +491,15 @@ def _conditional_probe_rtl_observation_oracle(generated):
     ):
         display = re.search(r'\$display\(("(?:\\.|[^"\\])*")', body)
         assert display is not None
-        descriptor = json.loads(json.loads(display[1]))
+        # The generated formatter now renders each tagged value with %s. Read
+        # only its identity/spec prefix; payload expectations remain the
+        # independent constants below and are checked against frozen RTL slots.
+        template = json.loads(display[1])
+        descriptor = json.loads(template[: template.rindex(',"values":')] + "}")
         assert descriptor["instance"] == instance and descriptor["kind"] == kind
         assert descriptor["spec"].get("event", descriptor["spec"].get("name")) == name
         slots = re.findall(
-            r"\$unsigned\(dut\.dut\.pyc_observation_value_(\d+)\)",
+            r"pyc_observation_json_\d+\(dut\.dut\.pyc_observation_value_(\d+),",
             body[display.end() :],
         )
         assert len(slots) == len(values) and slots[0] == first
@@ -699,6 +703,7 @@ endmodule
                 "conditional_four_state",
                 "-o",
                 str(binary),
+                str(_install() / "include/verilog/dff.v"),
                 str(_install() / "include/verilog/dffe.v"),
                 *[str(path) for path in rtl if path.name != "simulation_top.sv"],
                 str(testbench),
@@ -984,6 +989,7 @@ endmodule
                 "conditional_system_precommit",
                 "-o",
                 str(binary),
+                str(_install() / "include/verilog/dff.v"),
                 str(_install() / "include/verilog/dffe.v"),
                 *map(str, rtl),
                 str(monitor),
@@ -1227,6 +1233,7 @@ endmodule
                 f"branch_{mode}_four_state",
                 "-o",
                 str(binary),
+                str(_install() / "include/verilog/dff.v"),
                 str(_install() / "include/verilog/dffe.v"),
                 *map(str, design_rtl),
                 str(testbench),
@@ -1296,6 +1303,7 @@ endmodule
                 "branch_system_precommit",
                 "-o",
                 str(binary),
+                str(_install() / "include/verilog/dff.v"),
                 str(_install() / "include/verilog/dffe.v"),
                 *map(str, rtl),
                 str(monitor),
@@ -1665,6 +1673,7 @@ endmodule
                 "method_effects_four_state",
                 "-o",
                 str(binary),
+                str(_install() / "include/verilog/dff.v"),
                 str(_install() / "include/verilog/dffe.v"),
                 str(generated / "design_top.sv"),
                 str(generated / "sources/checks/method_effects_provider.v"),
@@ -1682,10 +1691,18 @@ def _assert_run_receipt(build, target, status="success"):
     receipt = json.loads((build / "run-execution.json").read_text())
     assert receipt["status"] == status
     executable = build / "simulation" / target / "bin/pycircuit_sim"
-    assert receipt["command"][0] == str(executable)
+    backend_receipt = Path(str(executable) + ".backend.json")
+    backend_inputs = set()
+    if target == "verilog":
+        backend = json.loads(backend_receipt.read_text())
+        assert backend["backend"] == "iverilog"
+        assert receipt["command"][:2] == [backend["runner"], str(executable)]
+        backend_inputs = {str(backend_receipt), backend["compiler"], backend["runner"]}
+    else:
+        assert receipt["command"][0] == str(executable)
     generated = build / target
     manifest = json.loads((generated / "generated.json").read_text())
-    expected = {str(executable), str(generated / "generated.json")}
+    expected = {str(executable), str(generated / "generated.json"), *backend_inputs}
     expected.update(str(generated / row["path"]) for row in manifest["files"])
     runtimes = {str(path) for path in _install().glob("lib*/*pyc6_runtime*")}
     assert runtimes
@@ -1823,7 +1840,7 @@ def test_observation_marker_text_is_literal_in_cpp_and_verilator(tmp_path):
     assert report_statistics[0] == report_statistics[1]
 
 
-def test_duplicate_report_names_in_one_module_reject_and_preserve_unit(tmp_path):
+def test_duplicate_report_names_in_one_module_reject_and_preserve_program(tmp_path):
     source = tmp_path / "duplicate report source"
     source.mkdir()
     design = source / "duplicate_reports.py"
@@ -1847,26 +1864,42 @@ def test_duplicate_report_names_in_one_module_reject_and_preserve_unit(tmp_path)
     design.write_text(valid)
     output = tmp_path / "duplicate report unit"
     _ok(_compile(source, design.name, output))
+    published = tmp_path / "duplicate report program"
+    published.mkdir()
+    final = published / "reports.ac"
+    _ok(
+        _cli(
+            "link",
+            str(output),
+            "--top",
+            "checks.duplicate_reports.DistinctReports",
+            "-o",
+            str(final),
+        )
+    )
     before = {
-        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+        str(path.relative_to(published)): path.read_bytes()
+        for path in published.rglob("*")
+        if path.is_file()
     }
     design.write_text(valid.replace("report('right', value)", "report('left', value)"))
+    conflicting = tmp_path / "conflicting report unit"
+    _ok(_compile(source, design.name, conflicting))
     rejected = _cli(
-        "compile",
-        "-c",
-        str(design),
-        "--source-root",
-        str(source),
-        "--package-prefix",
-        "checks",
+        "link",
+        str(conflicting),
+        "--top",
+        "checks.duplicate_reports.DistinctReports",
         "-o",
-        str(output),
+        str(final),
         "--replace",
     )
     assert rejected.returncode != 0
-    assert "report name must be unique within module: left" in rejected.stderr
+    assert "report name must be unique within logical owner: left" in rejected.stderr
     assert {
-        path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
+        str(path.relative_to(published)): path.read_bytes()
+        for path in published.rglob("*")
+        if path.is_file()
     } == before
 
 
@@ -1881,9 +1914,9 @@ def test_duplicate_report_names_across_instances_execute_in_both_backends(tmp_pa
         "    report('shared', value)\n"
         "\n"
         "@module\n"
-        "def Probe(value: u8) -> {}:\n"
+        "def Probe(value: u8) -> u8:\n"
         "    observe(value)\n"
-        "    return {}\n"
+        "    return value\n"
     )
     (source / "bench.py").write_text(
         "from checks.probe import Probe\n"
@@ -1896,16 +1929,10 @@ def test_duplicate_report_names_across_instances_execute_in_both_backends(tmp_pa
         "@system\n"
         "def TwoProbes():\n"
         "    value: u8 = 0\n"
-        "    left = Probe()\n"
-        "    right = Probe()\n"
-        "\n"
-        "    @rule\n"
-        "    def drive():\n"
-        "        left(value=value)\n"
-        "        right(value=value)\n"
+        "    left = Probe(value)\n"
+        "    right = Probe(value)\n"
         "\n"
         "    advance(value)\n"
-        "    drive()\n"
     )
     probe = tmp_path / "probe unit"
     bench = tmp_path / "probe bench unit"
@@ -2132,7 +2159,7 @@ def FailingOwner():
 
 
 @pytest.mark.parametrize(
-    "selected,checks", [("UncheckedRoot", 0), ("TwoCheckedChildren", 4)]
+    "selected,checks", [("UncheckedRoot", 1), ("TwoCheckedChildren", 8)]
 )
 def test_emitted_verification_metadata_counts_selected_reachable_instances(
     tmp_path, selected, checks
@@ -2153,7 +2180,14 @@ def test_emitted_verification_metadata_counts_selected_reachable_instances(
     entry = f"checks.verification_bench.{selected}"
     final = tmp_path / "verification.ac"
     _ok(_cli("link", str(provider), str(unit), "--top", entry, "-o", str(final)))
-    assert final.read_text().count('"ac.expect"(') == 3
+    # Three authored assertions plus five compiler-owned bare-Rule guard
+    # obligations exist in the closure. Only the selected instance tree counts
+    # below: one unchecked Rule, or two parent Rules plus two checked children.
+    check_lines = [
+        line for line in final.read_text().splitlines() if '"ac.expect"(' in line
+    ]
+    assert sum('kind = "assert"' in line for line in check_lines) == 3
+    assert sum('kind = "guard_known"' in line for line in check_lines) == 5
     for target in ("cpp", "verilog"):
         generated = tmp_path / target
         _ok(_cli("emit", str(final), "--target", target, "-o", str(generated)))
@@ -2166,6 +2200,9 @@ def test_emitted_verification_metadata_counts_selected_reachable_instances(
             "entry": {"definition": f'@"{entry}"', "arguments": []},
             "entry_source": {"package": "checks", "path": "verification_bench.py"},
             "source_checks": checks,
+            "system_samples": [],
+            "needs_four_state": True,
+            "reset_semantics": "strict",
         }
 
 
@@ -2216,7 +2253,9 @@ def test_source_builtin_type_shadow_rejects_without_replacing_unit(
         "--replace",
     )
     assert rejected.returncode != 0
-    assert "shadow" in rejected.stderr.lower(), rejected.stderr
+    assert any(
+        word in rejected.stderr.lower() for word in ("shadow", "rebind")
+    ), rejected.stderr
     assert {
         path.name: path.read_bytes() for path in output.iterdir() if path.is_file()
     } == before
@@ -2334,7 +2373,7 @@ def test_imported_nested_struct_full_constructors_execute_with_nominal_rule_resu
         ("duplicate-field", "duplicate"),
         ("foreign-nominal", "type"),
         ("shadowed-constructor", "shadow"),
-        ("persistent-initializer", "initializer"),
+        ("persistent-initializer", "unknown hardware value 'count'"),
     ],
 )
 def test_imported_struct_constructor_refusals_preserve_published_unit(
@@ -2364,8 +2403,8 @@ def test_imported_struct_constructor_refusals_preserve_published_unit(
     elif mutation == "persistent-initializer":
         changed = original.replace(
             "    count: u8 = 0",
-            "    saved: Packet = Packet(inner=Inner(flag=1, data=0), sequence=3)\n"
-            "    count: u8 = 0",
+            "    count: u8 = 0\n"
+            "    saved: Packet = Packet(inner=Inner(flag=1, data=count), sequence=3)",
         )
     else:
         assert constructor in original
@@ -2480,6 +2519,579 @@ def test_closed_system_generated_cpp_and_verilator_observations(
                 else:
                     assert "check failed at epoch 8" in wide.stdout + wide.stderr
     assert transcripts[0] == transcripts[1] == transcripts[2]
+
+
+def test_imported_tuple_module_outputs_execute_from_one_final_artifact(tmp_path):
+    source = tmp_path / "tuple module sources"
+    source.mkdir()
+    for filename in ("multi_output_provider.py", "multi_output_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+
+    provider = tmp_path / "tuple provider"
+    consumer = tmp_path / "tuple consumer"
+    _ok(_compile(source, "multi_output_provider.py", provider))
+    provider_receipt = json.loads((provider / "unit.json").read_text())
+    interface = provider / provider_receipt["files"]["interface"]
+    contract = next(
+        line
+        for line in interface.read_text().splitlines()
+        if 'sym_name = "checks.multi_output_provider.StatefulTuple"' in line
+    )
+    assert 'output_names = ["result_0", "result_1", "result_2"]' in contract
+    assert 'ac.return_form = "tuple"' in contract
+    assert contract.count('source_kind = "nominal"') == 2
+    assert contract.count('source_kind = "fixed_bits"') >= 1
+
+    provider_source = source / "multi_output_provider.py"
+    body = provider / provider_receipt["files"]["body"]
+    depfile = provider / provider_receipt["files"]["depfile"]
+    hidden_source = tmp_path / provider_source.name
+    hidden_body = tmp_path / body.name
+    hidden_depfile = tmp_path / depfile.name
+    provider_source.rename(hidden_source)
+    body.rename(hidden_body)
+    depfile.rename(hidden_depfile)
+    try:
+        _ok(_compile(source, "multi_output_bench.py", consumer, [provider]))
+    finally:
+        hidden_body.rename(body)
+        hidden_depfile.rename(depfile)
+    assert not provider_source.exists()
+    consumer_receipt = json.loads((consumer / "unit.json").read_text())
+    dependencies = (consumer / consumer_receipt["files"]["depfile"]).read_text()
+
+    def depfile_path(path):
+        return str(path).replace(" ", "\\ ")
+
+    assert depfile_path(interface) in dependencies
+    assert depfile_path(body) not in dependencies
+    assert depfile_path(provider_source) not in dependencies
+
+    final = tmp_path / "tuple-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.multi_output_bench.ExerciseMultiOutput",
+            "-o",
+            str(final),
+        )
+    )
+    final_digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    transcripts = []
+    manifests = {}
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("tuple-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        manifests[target] = json.loads(
+            (target_root / target / "generated.json").read_text()
+        )
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "3", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=3"]
+            )
+            rows = _records(_ok(_run([str(binary), *arguments], timeout=20)))
+            events = [
+                row
+                for row in rows
+                if row["kind"] == "log" and row["spec"]["event"] == "tuple outputs"
+            ]
+            assert [
+                tuple(int(value["value"]) for value in row["values"]) for row in events
+            ] == [
+                (5, 10, 1),
+                (5, 10, 1),
+                (6, 11, 1),
+                (6, 11, 1),
+                (7, 12, 1),
+                (7, 12, 1),
+            ]
+            assert [
+                (int(row["evaluation_epoch"]), int(row["commit_epoch"]))
+                for row in events
+            ] == [(epoch, epoch + 1) for epoch in range(6)]
+            _assert_closed_observation_identities(rows)
+            transcripts.append(events)
+
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == final_digest
+    assert manifests["cpp"]["entry"] == manifests["verilog"]["entry"]
+
+
+def test_imported_rule_and_method_tuple_outputs_execute_from_one_final_artifact(
+    tmp_path,
+):
+    source = tmp_path / "callable tuple sources"
+    source.mkdir()
+    for filename in ("callable_outputs_provider.py", "callable_outputs_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+    provider = tmp_path / "callable provider"
+    consumer = tmp_path / "callable consumer"
+    _ok(_compile(source, "callable_outputs_provider.py", provider))
+    receipt = json.loads((provider / "unit.json").read_text())
+    interface = provider / receipt["files"]["interface"]
+    text = interface.read_text()
+    assert 'name = "advance"' in text
+    assert 'name = "singleton"' in text
+    assert text.count('ac.return_form = "tuple"') >= 2
+
+    # The consumer must derive every ordered result contract from the header.
+    # Neither Python execution nor a provider body is available at this stage.
+    (source / "callable_outputs_provider.py").unlink()
+    body = provider / receipt["files"]["body"]
+    hidden = tmp_path / "unavailable callable body.ac"
+    body.rename(hidden)
+    try:
+        _ok(_compile(source, "callable_outputs_bench.py", consumer, [provider]))
+    finally:
+        hidden.rename(body)
+    final = tmp_path / "callable-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.callable_outputs_bench.ExerciseCallableOutputs",
+            "-o",
+            str(final),
+        )
+    )
+    final_digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    transcripts = []
+    manifests = {}
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("callable-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        manifests[target] = json.loads(
+            (target_root / target / "generated.json").read_text()
+        )
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "3", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=3"]
+            )
+            rows = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            events = [
+                row
+                for row in rows
+                if row["kind"] == "log" and row["spec"]["event"] == "callable outputs"
+            ]
+            # Imported state advances by 2 then 3 within one transaction;
+            # the saved first Packet keeps its statement-time value. The
+            # independent local instance advances by one each rising edge.
+            expected = [
+                (
+                    5 + 5 * cycle,
+                    7 + 5 * cycle,
+                    1,
+                    7 + 5 * cycle,
+                    11 + cycle,
+                    12 + cycle,
+                    17,
+                    26,
+                    4 + 2 * cycle,
+                    6 + 2 * cycle,
+                )
+                for cycle in range(3)
+                for _ in range(2)
+            ]
+            assert [
+                tuple(int(value["value"]) for value in row["values"]) for row in events
+            ] == expected
+            assert [
+                (int(row["evaluation_epoch"]), int(row["commit_epoch"]))
+                for row in events
+            ] == [(epoch, epoch + 1) for epoch in range(6)]
+            _assert_closed_observation_identities(rows)
+            transcripts.append(events)
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == final_digest
+    assert manifests["cpp"]["entry"] == manifests["verilog"]["entry"]
+
+
+def test_finite_state_types_preserve_candidates_hold_and_instance_identity(tmp_path):
+    source = tmp_path / "finite state sources"
+    source.mkdir()
+    for filename in ("finite_state_provider.py", "finite_state_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+    provider = tmp_path / "finite state provider"
+    consumer = tmp_path / "finite state consumer"
+    _ok(_compile(source, "finite_state_provider.py", provider))
+    _ok(_compile(source, "finite_state_bench.py", consumer, [provider]))
+    final = tmp_path / "finite-state-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.finite_state_bench.ExerciseFiniteState",
+            "-o",
+            str(final),
+        )
+    )
+    digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    # Independent snapshots: phase zero updates; phase one is denied; phase two
+    # updates again. The second instance never receives an update. Table row 1
+    # reads the saved row 0, while row 0 receives the new packet's left field.
+    # Observation slots are at most 64 bits; sample both parts of the 73-bit
+    # register. Its first update carries across the low/high word boundary.
+    initial = (2**64 - 2, 256, 1, 3, 0, 4, 8, 5, 2, 2, 0)
+    first = (1, 257, 0, 10, 5, 6, 9, 5, 6, 3, 0)
+    second = (4, 257, 1, 17, 0, 8, 11, 0, 8, 8, 0)
+    expected = (initial, first, first, second)
+    transcripts = []
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("finite-state-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "4", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=4"]
+            )
+            records = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            events = [
+                row
+                for row in records
+                if row["kind"] == "log" and row["spec"]["event"] == "finite state"
+            ]
+            assert len(events) == 16
+            for epoch in range(8):
+                samples = [
+                    row for row in events if int(row["evaluation_epoch"]) == epoch
+                ]
+                assert len(samples) == 2
+                assert all(int(row["commit_epoch"]) == epoch + 1 for row in samples)
+                values = {
+                    row["instance"]: tuple(
+                        int(value["value"]) for value in row["values"]
+                    )
+                    for row in samples
+                }
+                assert values == {
+                    "root/owner": expected[epoch // 2],
+                    "root/isolated": initial,
+                }
+            terminal = [row for row in records if row["kind"] == "result"]
+            assert len(terminal) == 1
+            assert int(terminal[0]["epoch_time"]) == 8
+            identities = {}
+            for row in events:
+                registration = json.loads(row["registration"])
+                identity = json.loads(row["site"])
+                assert set(registration) == {"site", "expansion"}
+                assert set(identity) == {"site", "invocation", "ordinal"}
+                assert len(identity["invocation"]) == 1
+                assert set(identity["invocation"][0]) == {"call", "receiver"}
+                current = (registration, identity)
+                assert identities.setdefault(row["instance"], current) == current
+            assert identities["root/owner"] != identities["root/isolated"]
+            transcripts.append(events)
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == digest
+
+
+def test_nested_cross_module_rules_preserve_outer_atomicity_and_instance_identity(
+    tmp_path,
+):
+    source = tmp_path / "nested rule sources"
+    source.mkdir()
+    for filename in ("nested_rule_provider.py", "nested_rule_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+    provider = tmp_path / "nested rule provider"
+    consumer = tmp_path / "nested rule consumer"
+    _ok(_compile(source, "nested_rule_provider.py", provider))
+    receipt = json.loads((provider / "unit.json").read_text())
+    body = provider / receipt["files"]["body"]
+    hidden = tmp_path / "unavailable nested rule body.ac"
+    (source / "nested_rule_provider.py").unlink()
+    body.rename(hidden)
+    try:
+        _ok(_compile(source, "nested_rule_bench.py", consumer, [provider]))
+    finally:
+        hidden.rename(body)
+    final = tmp_path / "nested-rule-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.nested_rule_bench.ExerciseNestedRules",
+            "-o",
+            str(final),
+        )
+    )
+    digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    transcripts = []
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("nested-rule-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "4", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=4"]
+            )
+            records = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            owners = [
+                row
+                for row in records
+                if row["kind"] == "log" and row["spec"]["event"] == "nested owners"
+            ]
+            expected = [(5, 5, 0), (10, 6, 1), (10, 7, 2), (15, 8, 3)]
+            assert [
+                tuple(int(value["value"]) for value in row["values"]) for row in owners
+            ] == [value for value in expected for _ in range(2)]
+            assert _observations(records, "log", "nested accepted") == [
+                (0, 1, 10),
+                (1, 2, 10),
+                (4, 5, 15),
+                (5, 6, 15),
+                (6, 7, 20),
+                (7, 8, 20),
+            ]
+            _assert_closed_observation_identities(records)
+            transcripts.append([row for row in records if row["kind"] != "result"])
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == digest
+
+
+def test_ehr_predecessor_visibility_excludes_unordered_writes_and_denied_proposals(
+    tmp_path,
+):
+    source = tmp_path / "ehr sources"
+    source.mkdir()
+    shutil.copy2(FIXTURE / "ehr_bench.py", source)
+    unit = tmp_path / "ehr unit"
+    _ok(_compile(source, "ehr_bench.py", unit))
+    final = tmp_path / "ehr-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(unit),
+            "--top",
+            "checks.ehr_bench.ExerciseEhrOrder",
+            "-o",
+            str(final),
+        )
+    )
+    digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    transcripts = []
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("ehr-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "4", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=4"]
+            )
+            records = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            # first is denied in cycle 1, second is denied in cycles 1..3.
+            # middle has only first as predecessor even though its registration
+            # follows second: it must observe 6, not second's candidate 12.
+            expected = {
+                "ehr middle": [(5, 6), (12, 12), (12, 13), (13, 14)],
+                "ehr final": [(5, 12), (12, 12), (12, 13), (13, 14)],
+            }
+            for name, values in expected.items():
+                events = [
+                    row
+                    for row in records
+                    if row["kind"] == "log" and row["spec"]["event"] == name
+                ]
+                assert [
+                    tuple(int(value["value"]) for value in row["values"])
+                    for row in events
+                ] == [value for value in values for _ in range(2)]
+                assert [int(row["evaluation_epoch"]) for row in events] == list(
+                    range(8)
+                )
+                assert all(
+                    int(row["commit_epoch"]) == int(row["evaluation_epoch"]) + 1
+                    for row in events
+                )
+            _assert_closed_observation_identities(records)
+            transcripts.append([row for row in records if row["kind"] != "result"])
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == digest
+
+
+def test_compiler_output_validity_gates_only_reached_consumers(tmp_path):
+    source = tmp_path / "output validity sources"
+    source.mkdir()
+    for filename in ("output_validity_provider.py", "output_validity_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+    provider = tmp_path / "output validity provider"
+    consumer = tmp_path / "output validity consumer"
+    _ok(_compile(source, "output_validity_provider.py", provider))
+    receipt = json.loads((provider / "unit.json").read_text())
+    body = provider / receipt["files"]["body"]
+    hidden = tmp_path / "unavailable validity body.ac"
+    (source / "output_validity_provider.py").unlink()
+    body.rename(hidden)
+    try:
+        _ok(_compile(source, "output_validity_bench.py", consumer, [provider]))
+    finally:
+        hidden.rename(body)
+    final = tmp_path / "output-validity-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.output_validity_bench.ExerciseOutputValidity",
+            "-o",
+            str(final),
+        )
+    )
+    digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    transcripts = []
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("output-validity-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "4", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=4"]
+            )
+            records = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            expected = {
+                "validity destination": [
+                    (epoch, (saved, phase, count, count))
+                    for phase, (saved, count) in enumerate(
+                        ((0, 0), (4, 1), (4, 1), (8, 2))
+                    )
+                    for epoch in (2 * phase, 2 * phase + 1)
+                ],
+                "validity output": [
+                    (epoch, values)
+                    for phase, values in ((0, (1, 3)), (2, (3, 5)), (3, (4, 6)))
+                    for epoch in (2 * phase, 2 * phase + 1)
+                ],
+                "validity selected": [
+                    (epoch, (value,))
+                    for phase, value in ((0, 1), (2, 3), (3, 4))
+                    for epoch in (2 * phase, 2 * phase + 1)
+                ],
+                "validity constant": [(2, (99,)), (3, (99,))],
+            }
+            for name, values in expected.items():
+                events = [
+                    row
+                    for row in records
+                    if row["kind"] == "log" and row["spec"]["event"] == name
+                ]
+                assert [
+                    (
+                        int(row["evaluation_epoch"]),
+                        tuple(int(value["value"]) for value in row["values"]),
+                    )
+                    for row in events
+                ] == values
+                assert all(
+                    int(row["commit_epoch"]) == int(row["evaluation_epoch"]) + 1
+                    for row in events
+                )
+            _assert_closed_observation_identities(records)
+            transcripts.append([row for row in records if row["kind"] != "result"])
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == digest
+
+
+@pytest.mark.parametrize("with_while", [False, True], ids=["for", "for-while"])
+def test_scf_rules_preserve_typed_carries_state_and_nested_calls(tmp_path, with_while):
+    source = tmp_path / "scf rule sources"
+    source.mkdir()
+    for filename in ("scf_rule_provider.py", "scf_rule_bench.py"):
+        shutil.copy2(FIXTURE / filename, source)
+    if not with_while:
+        provider_source = source / "scf_rule_provider.py"
+        text = provider_source.read_text()
+        start = text.index("        while count < limit:\n")
+        end = text.index("        total = total + local.data\n", start)
+        provider_source.write_text(text[:start] + text[end:])
+    provider = tmp_path / "scf rule provider"
+    consumer = tmp_path / "scf rule consumer"
+    _ok(_compile(source, "scf_rule_provider.py", provider))
+    _ok(_compile(source, "scf_rule_bench.py", consumer, [provider]))
+    final = tmp_path / "scf-rule-system.ac"
+    _ok(
+        _cli(
+            "link",
+            str(provider),
+            str(consumer),
+            "--top",
+            "checks.scf_rule_bench.ExerciseScfRules",
+            "-o",
+            str(final),
+        )
+    )
+    digest = hashlib.sha256(final.read_bytes()).hexdigest()
+    # Exercise every u3 loop limit, including the maximum finite bound.
+    increments = tuple((5 if with_while else 3) * cycle for cycle in range(8))
+    before = tuple((5 + sum(increments[:cycle])) % 256 for cycle in range(8))
+    tags = tuple(5 if with_while and cycle % 2 else 0 for cycle in range(8))
+    transcripts = []
+    for target in ("cpp", "verilog"):
+        target_root = tmp_path / ("scf-rule-" + target)
+        target_root.mkdir()
+        binary = _bundle(final, target_root, target)
+        for workers in (1, 2) if target == "cpp" else (1,):
+            arguments = (
+                ["--cycles", "8", "--workers", str(workers)]
+                if target == "cpp"
+                else ["+cycles=8"]
+            )
+            records = _records(_ok(_run([str(binary), *arguments], timeout=30)))
+            expected = {
+                "scf candidate": [
+                    (before[cycle], increments[cycle], tags[cycle], 10, 11)
+                    for cycle in range(8)
+                    for _ in range(2)
+                ],
+                "scf state": [
+                    (before[cycle], cycle, cycle, cycle)
+                    for cycle in range(8)
+                    for _ in range(2)
+                ],
+            }
+            for name, values in expected.items():
+                events = [
+                    row
+                    for row in records
+                    if row["kind"] == "log" and row["spec"]["event"] == name
+                ]
+                assert [
+                    tuple(int(value["value"]) for value in row["values"])
+                    for row in events
+                ] == values
+                assert [int(row["evaluation_epoch"]) for row in events] == list(
+                    range(16)
+                )
+                assert all(
+                    int(row["commit_epoch"]) == int(row["evaluation_epoch"]) + 1
+                    for row in events
+                )
+            transcripts.append([row for row in records if row["kind"] != "result"])
+    assert transcripts[0] == transcripts[1] == transcripts[2]
+    assert hashlib.sha256(final.read_bytes()).hexdigest() == digest
 
 
 def test_method_system_effects_execute_atomically_from_one_final_artifact(tmp_path):
@@ -2932,7 +3544,6 @@ def OrderedBindings():
     )
     stages = tmp_path / "ordered source stages"
     stages.mkdir()
-    imported = stages / "source-import.ac"
     compiler = os.environ.get("PYCIRCUIT_SOURCE_COMPILER")
     assert compiler, "set PYCIRCUIT_SOURCE_COMPILER to this candidate's compiler"
     _ok(
@@ -2951,8 +3562,6 @@ def OrderedBindings():
                 str(stages / "interface.ac"),
                 "--deps-out",
                 str(stages / "deps.json"),
-                "--source-import-out",
-                str(imported),
             ]
         )
     )
@@ -2960,28 +3569,55 @@ def OrderedBindings():
         assert (stages / (kind + ".ac")).read_bytes() == (
             unit / receipt["files"][kind]
         ).read_bytes()
+    typed = stages / "body.ac"
+    assert '"ac.method"' in typed.read_text()
     _ok(
         _run(
             [
                 str(_install() / "bin/pycircuit-opt"),
-                str(imported),
+                str(typed),
                 "-o",
-                str(stages / "verified-source-import.ac"),
+                str(stages / "verified-source-body.ac"),
             ]
         )
     )
+    before_lowering = stages / "transaction-input.ac"
+    after_lowering = stages / "transaction-output.ac"
     final = tmp_path / "ordered.ac"
+    linker = os.environ.get("PYCIRCUIT_LINKER")
+    assert linker, "set PYCIRCUIT_LINKER to this candidate's native linker"
     _ok(
-        _cli(
-            "link",
-            str(unit),
-            "--top",
-            "checks.ordered.OrderedBindings",
-            "-o",
-            str(final),
+        _run(
+            [
+                linker,
+                "--body",
+                str(typed),
+                "--header",
+                str(stages / "interface.ac"),
+                "--top",
+                "checks.ordered.OrderedBindings",
+                "--target",
+                "final",
+                "--transaction-input-out",
+                str(before_lowering),
+                "--transaction-output-out",
+                str(after_lowering),
+                "--output",
+                str(final),
+            ]
         )
     )
-    artifacts = (capture, imported, stages / "body.ac", stages / "interface.ac", final)
+    assert '"ac.method.call"' in before_lowering.read_text()
+    assert '"ac.method.call"' not in after_lowering.read_text()
+    assert "ac.sampled_admission" in after_lowering.read_text()
+    artifacts = (
+        capture,
+        typed,
+        stages / "interface.ac",
+        before_lowering,
+        after_lowering,
+        final,
+    )
     digests = [hashlib.sha256(path.read_bytes()).hexdigest() for path in artifacts]
     transcripts = []
     for target in ("cpp", "verilog"):
@@ -3459,7 +4095,10 @@ endmodule
 """
     )
     binary = tmp_path / "atomic_rtl"
-    runtime = _install() / "include/verilog/dffe.v"
+    runtime = [
+        _install() / "include/verilog/dff.v",
+        _install() / "include/verilog/dffe.v",
+    ]
     _ok(
         _run(
             [
@@ -3475,7 +4114,7 @@ endmodule
                 str(tmp_path / "atomic-verilated"),
                 "-o",
                 str(binary),
-                str(runtime),
+                *[str(path) for path in runtime],
                 str(generated / "design_top.sv"),
                 str(generated / "sources/checks/dut.v"),
                 str(generated / "sources/checks/bench.v"),

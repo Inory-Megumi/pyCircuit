@@ -24,7 +24,27 @@ cd "${PYC_ROOT_DIR}"
 nightly_python_tests=(
   tests/system/test_runtime_install.py
   tests/system/test_public_emit.py
+  tests/system/test_scalar_generic_modules.py
+  tests/system/test_physical_rtl_export.py
+  tests/system/test_physical_projection_rejections.py
   tests/system/test_source_system_execution.py
+  tests/system/test_four_state_frontend_system.py
+  tests/system/test_four_state_runtime_unknown.py
+  tests/system/test_module_statement_parity.py
+  tests/system/test_dynamic_bits_index.py
+  tests/system/test_memory_rule_calls.py
+  tests/system/test_rule_formal_proposals.py
+  tests/system/test_rule_formal_demands.py
+  tests/system/test_rule_scf_control.py
+  tests/system/test_selected_module_proposals.py
+  tests/system/test_source_rule_queues.py
+  tests/system/test_rule_resource_demand.py
+  tests/system/test_rule_queue_external_pop.py
+  tests/system/test_hierarchical_state_rules.py
+  tests/system/test_queue_rule_pipeline_example.py
+  tests/system/test_module_scalar_outputs.py
+  tests/system/test_source_captured_validity.py
+  tests/system/test_unannotated_rule_execution.py
   tests/system/test_source_map.py
   tests/system/test_incremental_build.py
   tests/system/test_relocated_compiler.py

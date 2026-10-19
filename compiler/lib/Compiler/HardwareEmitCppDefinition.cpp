@@ -14,28 +14,34 @@ using Path = ac::FieldPath;
 ArrayRef<StringRef> queuePinNames(bool output) {
   static const StringRef inputs[] = {"clk", "rst", "in_valid", "in_data",
                                      "out_ready"};
-  static const StringRef outputs[] = {"in_ready", "out_valid", "out_data"};
+  static const StringRef outputs[] = {"ready", "valid", "data",
+                                      "local_capacity"};
   return output ? ArrayRef<StringRef>(outputs) : ArrayRef<StringRef>(inputs);
 }
+bool isQueue(Operation *op) {
+  auto instance = dyn_cast_or_null<ac::InstanceOp>(op);
+  return instance && ac::isQueueInstance(instance);
+}
 StringRef ownerPrefix(Operation *op) {
-  return isa<ac::QueueOp>(op) ? "pyc_queue_" : "pyc_instance_";
+  return isQueue(op) ? "pyc_queue_" : "pyc_instance_";
 }
 FailureOr<std::string> queueKernelType(HardwareEmitContext &ctx,
-                                       ac::QueueOp queue,
+                                       ac::InstanceOp queue,
                                        const ac::HardwareBindings &bindings) {
-  auto payload = ctx.cppType(queue.getInData().getType(), bindings, queue);
-  auto depth = ctx.staticValue(queue.getDepth(), bindings, queue);
-  auto latency = ctx.unsignedStaticValue(queue.getAvailabilityLatency(), queue,
-                                         false, bindings);
+  auto config = ac::getQueueConfiguration(queue);
+  if (failed(config))
+    return failure();
+  auto payload = ctx.cppType(queue.getInputs()[3].getType(), bindings, queue);
+  auto depth = ctx.staticValue(config->getAs<ac::StaticExprAttr>("depth"),
+                               bindings, queue);
+  auto latency = ctx.unsignedStaticValue(
+      config->getAs<ac::StaticExprAttr>("availability_latency"), queue,
+      false, bindings);
   if (failed(payload) || failed(depth) || failed(latency))
     return failure();
-  StringRef policy;
-  if (queue.getReadyPolicy() == "local_occupancy")
-    policy = "LocalOccupancy";
-  else if (queue.getReadyPolicy() == "downstream_pop")
-    policy = "DownstreamPop";
-  else
-    return queue.emitOpError() << "unsupported queue ready policy";
+  StringRef policy = config->getAs<StringAttr>("ready_policy").getValue() == "local_occupancy"
+                         ? "LocalOccupancy"
+                         : "DownstreamPop";
   return "gfsim::fifo_kernel<" + *payload + ", " + *depth +
          ", gfsim::QueueReadyPolicy::" + policy.str() + ", " + *latency + ">";
 }
@@ -61,7 +67,8 @@ struct Leaf {
   ac::HardwareBindings bindings;
   std::string prefix, count, kernel;
   bool sampled = false;
-  std::array<bool, 3> queueRead{};
+  bool readComputed = false;
+  std::array<bool, 4> queueRead{};
 };
 class WorkEmitter {
 public:
@@ -311,8 +318,6 @@ private:
     return nullptr;
   }
   FailureOr<ac::HardwareBindings> bind(Operation *op, Scope &s) {
-    if (isa<ac::QueueOp>(op))
-      return s.bindings;
     return isa<ac::InstanceOp>(op)
                ? ctx.analysis.bindInstance(cast<ac::InstanceOp>(op), s.bindings)
                : ctx.analysis.bindInstance(cast<ac::CollectionOp>(op),
@@ -320,7 +325,7 @@ private:
   }
   LogicalResult collect(Scope &s) {
     for (Operation &op : s.definition.getBody().front())
-      if (isa<ac::InstanceOp, ac::CollectionOp, ac::QueueOp>(op)) {
+      if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
         auto name =
             id(op.getAttrOfType<StringAttr>("instance_name").getValue(), &op);
         auto b = bind(&op, s);
@@ -333,10 +338,11 @@ private:
             return failure();
           count = "(" + count + " * (" + *n + "))";
         }
-        if (isa<ac::QueueOp>(op) ||
+        if (isQueue(&op) ||
             !ctx.analysis.getPrimitiveKind(b->owner).empty()) {
-          auto kernel = isa<ac::QueueOp>(op)
-                            ? queueKernelType(ctx, cast<ac::QueueOp>(op), *b)
+          auto kernel = isQueue(&op)
+                            ? queueKernelType(ctx, cast<ac::InstanceOp>(op),
+                                              s.bindings)
                             : ctx.cppBoundModuleType(b->owner, *b, &op, true);
           if (failed(kernel))
             return failure();
@@ -353,7 +359,7 @@ private:
     return success();
   }
   FailureOr<std::string> pinName(Operation *op, unsigned port, bool output) {
-    if (isa<ac::QueueOp>(op))
+    if (isQueue(op))
       return id(queuePinNames(output)[port], op);
     auto *callee = ctx.analysis.lookupDefinition(
         op->getAttrOfType<FlatSymbolRefAttr>("callee").getValue());
@@ -374,7 +380,7 @@ private:
     if (failed(b))
       return failure();
     return s.object + ownerPrefix(op).str() + *name +
-           (!isa<ac::QueueOp>(op) &&
+           (!isQueue(op) &&
                     ctx.analysis.getPrimitiveKind(b->owner).empty()
                 ? "->"
                 : "_") +
@@ -402,13 +408,15 @@ private:
     return success();
   }
   FailureOr<std::string> kernelInputs(Leaf &leaf, StringRef lane) {
-    if (isa<ac::QueueOp>(leaf.op)) {
+    if (isQueue(leaf.op)) {
       SmallVector<std::string> pins;
       for (auto [index, name] : llvm::enumerate(queuePinNames(false)))
         pins.push_back(leaf.prefix +
                        (index == 3
                             ? "input_tokens[" + lane.str() + "]"
                             : name.str() + ".element(" + lane.str() + ")"));
+      if (!resetting)
+        pins[1] = ctx.cppReset(pins[1]);
       return "typename " + leaf.kernel + "::Inputs{" + join(pins, ", ") + "}";
     }
     auto names = leaf.bindings.owner->getAttrOfType<ArrayAttr>("input_names");
@@ -420,6 +428,12 @@ private:
         return failure();
       pins.push_back(leaf.prefix + *name + ".element(" + lane.str() + ")");
     }
+    // Canonical primitive contracts place reset at ordinal one. Ordinary
+    // module connections retain raw pins; only the kernel consumes this view.
+    // Host Reset does not sample physical reset. Its accessor returns borrowed
+    // inputs, so retain persistent pin references rather than a temporary view.
+    if (!resetting)
+      pins[1] = ctx.cppReset(pins[1]);
     if (kind == "sync_mem")
       pins = {pins[0],
               pins[1],
@@ -441,10 +455,10 @@ private:
     return "typename " + leaf.kernel + "::Inputs{" + join(pins, ", ") + "}";
   }
   FailureOr<std::string> kernelOutputs(Leaf &leaf, StringRef lane) {
-    if (isa<ac::QueueOp>(leaf.op))
+    if (isQueue(leaf.op))
       return "typename " + leaf.kernel + "::Outputs{" + leaf.prefix +
-             "in_ready.element(" + lane.str() + "), " + leaf.prefix +
-             "out_valid.element(" + lane.str() + "), " + leaf.prefix +
+             "ready.element(" + lane.str() + "), " + leaf.prefix +
+             "valid.element(" + lane.str() + "), " + leaf.prefix +
              "output_tokens[" + lane.str() + "]}";
     SmallVector<std::string> pins;
     for (auto raw :
@@ -456,23 +470,27 @@ private:
     }
     StringRef kind = ctx.analysis.getPrimitiveKind(leaf.bindings.owner);
     if (kind == "sync_mem" || kind == "sync_mem_dp") {
+      unsigned reads = kind == "sync_mem_dp" ? 2 : 1;
+      if (pins.size() != 2 * reads)
+        return leaf.op->emitOpError()
+               << "synchronous memory output layout mismatch";
       for (auto &pin : pins)
         pin = "&" + pin;
-      return "typename " + leaf.kernel + "::Outputs{{" + join(pins, ", ") +
-             "}}";
+      return "typename " + leaf.kernel + "::Outputs{{" +
+             join(ArrayRef<std::string>(pins).take_front(reads), ", ") + "}, {" +
+             join(ArrayRef<std::string>(pins).drop_front(reads), ", ") + "}}";
     }
     return "typename " + leaf.kernel + "::Outputs{" + join(pins, ", ") + "}";
   }
   LogicalResult queueTokenCopy(Leaf &leaf, bool gather) {
-    auto queue = cast<ac::QueueOp>(leaf.op);
-    auto t = type(queue.getInData().getType(), *leaf.scope, leaf.op);
-    auto plan = fieldPlane(queue.getInData().getType(), {}, *leaf.scope,
-                           leaf.op);
+    Type payloadType = leaf.op->getOperand(3).getType();
+    auto t = type(payloadType, *leaf.scope, leaf.op);
+    auto plan = fieldPlane(payloadType, {}, *leaf.scope, leaf.op);
     if (failed(t) || failed(plan))
       return failure();
     std::string token =
         leaf.prefix + (gather ? "input_tokens" : "output_tokens");
-    std::string plane = leaf.prefix + (gather ? "in_data" : "out_data");
+    std::string plane = leaf.prefix + (gather ? "in_data" : "data");
     out << "    for (std::size_t pyc_queue_lane = 0; pyc_queue_lane < "
         << leaf.count << "; ++pyc_queue_lane) {\n";
     if (isa<ac::TableType>(*t)) {
@@ -503,7 +521,7 @@ private:
       if (failed(text) || failed(setPort(*leaf.scope, leaf.op, i, {}, *text)))
         return failure();
     }
-    if (isa<ac::QueueOp>(leaf.op) && failed(queueTokenCopy(leaf, true)))
+    if (isQueue(leaf.op) && failed(queueTokenCopy(leaf, true)))
       return failure();
     auto in = kernelInputs(leaf, "pyc_lane"),
          q = kernelOutputs(leaf, "pyc_lane");
@@ -513,6 +531,8 @@ private:
         << "; ++pyc_lane) " << leaf.prefix << "state->work(pyc_lane, " << *in
         << ", " << *q << ");\n";
     leaf.sampled = true;
+    if (ctx.analysis.getPrimitiveKind(leaf.bindings.owner) == "byte_mem")
+      leaf.readComputed = true;
     return success();
   }
   std::string name() { return "pyc_value_" + std::to_string(nextName++); }
@@ -617,12 +637,39 @@ private:
     return "gfsim::FourState<" + *w + ">::known(pyc_bits<" + *w + ">(" +
            *literal + "))";
   }
+  FailureOr<std::string> constant4(ac::BitsConstant4Op op, Scope &s) {
+    auto w = width(op.getResult().getType(), s, op);
+    if (failed(w))
+      return failure();
+    StringRef pattern = op.getPattern();
+    llvm::APInt value(pattern.size(), 0), known(pattern.size(), 0),
+        z(pattern.size(), 0);
+    for (auto [index, symbol] : llvm::enumerate(pattern)) {
+      unsigned bit = pattern.size() - 1 - index;
+      if (symbol == '0' || symbol == '1')
+        known.setBit(bit);
+      if (symbol == '1')
+        value.setBit(bit);
+      if (symbol == 'z')
+        z.setBit(bit);
+    }
+    auto bits = [&](const llvm::APInt &plane) {
+      SmallVector<std::string> words;
+      for (unsigned i = 0; i < plane.getNumWords(); ++i)
+        words.push_back(std::to_string(plane.getRawData()[i]) + "ULL");
+      return "gfsim::Bits<" + *w + ">{" + join(words, ", ") + "}";
+    };
+    return "gfsim::FourState<" + *w + ">::fromMasks(" + bits(value) + ", " +
+           bits(known) + ", " + bits(z) + ")";
+  }
   FailureOr<std::string>
   scalarExpression(Scope &s, Value value, Path path,
                    function_ref<FailureOr<std::string>(Value, Path)> operand) {
     Operation *op = value.getDefiningOp();
     if (!op)
       return failure();
+    if (auto pattern = dyn_cast<ac::BitsConstant4Op>(op))
+      return constant4(pattern, s);
     if (auto constantOp = dyn_cast<ac::BitsConstantOp>(op))
       return constant(constantOp, s);
     if (auto create = dyn_cast<ac::EnumCreateOp>(op)) {
@@ -743,6 +790,15 @@ private:
         text = text.empty() ? *e : "gfsim::concat(" + text + ", " + *e + ")";
       }
       return text;
+    }
+    if (auto require = dyn_cast<ac::ValueRequireOp>(op)) {
+      // Payload retains source provenance, but is not evaluated by admission.
+      auto available = operand(require.getAvailability(), {});
+      auto path = operand(require.getPath(), {});
+      if (failed(available) || failed(path))
+        return failure();
+      return "gfsim::select(" + *path + ", " + *available +
+             ", gfsim::FourState<1>::known(gfsim::Bits<1>{1}))";
     }
     SmallVector<std::string> operands;
     for (auto v : op->getOperands()) {
@@ -1147,14 +1203,19 @@ private:
                   cast<ac::YieldOp>(rule.getBody().front().back())
                       .getValues()[cast<OpResult>(v).getResultNumber()],
                   path);
-    if (auto queue = dyn_cast<ac::QueueOp>(op)) {
+    if (auto queue = dyn_cast<ac::InstanceOp>(op);
+        queue && ac::isQueueInstance(queue)) {
       unsigned port = cast<OpResult>(v).getResultNumber();
       for (auto &leaf : storage) {
         if (leaf.scope != &s || leaf.op != op)
           continue;
         if (!leaf.queueRead[port]) {
-          if (port == 0 && queue.getReadyPolicy() == "downstream_pop") {
-            auto ready = emit(s, queue.getOutReady());
+          auto config = ac::getQueueConfiguration(queue);
+          if (failed(config))
+            return failure();
+          if (port == 0 &&
+              config->getAs<StringAttr>("ready_policy").getValue() == "downstream_pop") {
+            auto ready = emit(s, queue->getOperand(4));
             if (failed(ready) || failed(setPort(s, op, 4, {}, *ready)))
               return failure();
           }
@@ -1165,10 +1226,13 @@ private:
           else
             out << queuePinNames(true)[port]
                 << ".element(pyc_lane) = " << leaf.kernel
-                << (port == 0 ? "::readReady(" : "::readValid(");
+                << (port == 0 || port == 3 ? "::readReady(" : "::readValid(");
           out << leaf.prefix << "state->current(pyc_lane)";
           if (port == 0)
             out << ", " << leaf.prefix << "out_ready.element(pyc_lane)";
+          else if (port == 3)
+            out << ", gfsim::wire<gfsim::Bits<1>>::fromPacked("
+                   "gfsim::FourState<1>::known(gfsim::Bits<1>{0}))";
           out << ");\n";
           if (port == 2 && failed(queueTokenCopy(leaf, false)))
             return failure();
@@ -1204,7 +1268,10 @@ private:
       if (ctx.analysis.getPrimitiveKind(b->owner) == "byte_mem")
         for (auto &leaf : storage)
           if (leaf.scope == &s && leaf.op == op) {
-            if (resetting && !leaf.sampled) {
+            // Read only committed storage while evaluating combinational SSA.
+            // The existing sampling loop still invokes Work once, after all
+            // write pins are ready, to validate and stage the pending update.
+            if (!leaf.readComputed) {
               auto address = emit(s, op->getOperand(2));
               if (failed(address) || failed(setPort(s, op, 2, {}, *address)))
                 return failure();
@@ -1215,9 +1282,8 @@ private:
                   << leaf.count << "; ++pyc_lane) " << leaf.kernel << "::read("
                   << leaf.prefix << "state->current(pyc_lane), " << leaf.prefix
                   << "raddr.element(pyc_lane), " << *pins << ");\n";
-              leaf.sampled = true;
-            } else if (!resetting && failed(sample(leaf)))
-              return failure();
+              leaf.readComputed = true;
+            }
           }
       auto pin = pinObject(s, op, port, true);
       if (failed(pin))
@@ -1663,14 +1729,12 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
   ac::HardwareBindings parent;
   parent.owner = definition;
   for (Operation &op : definition.getBody().front())
-    if (isa<ac::InstanceOp, ac::CollectionOp, ac::QueueOp>(op)) {
-      bool observed = isa<ac::InstanceOp, ac::CollectionOp>(op);
+    if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
+      bool observed = true;
       auto name = legalizeIdentifier(
           op.getAttrOfType<StringAttr>("instance_name").getValue(),
           [&] { return op.emitOpError(); });
-      auto b =
-          isa<ac::QueueOp>(op) ? FailureOr<ac::HardwareBindings>(parent)
-          : isa<ac::InstanceOp>(op)
+      auto b = isa<ac::InstanceOp>(op)
               ? ctx.analysis.bindInstance(cast<ac::InstanceOp>(op), parent)
               : ctx.analysis.bindInstance(cast<ac::CollectionOp>(op), parent);
       if (failed(name) || failed(b))
@@ -1682,10 +1746,10 @@ FailureOr<SmallVector<ChildInfo>> childInfo(HardwareEmitContext &ctx,
           return failure();
         count = "(pyc_count * (" + *n + "))";
       }
-      bool leaf = isa<ac::QueueOp>(op) ||
+      bool leaf = isQueue(&op) ||
                   !ctx.analysis.getPrimitiveKind(b->owner).empty();
-      auto type = isa<ac::QueueOp>(op)
-                      ? queueKernelType(ctx, cast<ac::QueueOp>(op), *b)
+      auto type = isQueue(&op)
+                      ? queueKernelType(ctx, cast<ac::InstanceOp>(op), parent)
                   : leaf ? ctx.cppBoundModuleType(b->owner, *b, &op, true)
                          : ctx.cppBoundFamilyType(b->owner, *b, &op, count);
       if (failed(type))
@@ -1708,9 +1772,22 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
   const unsigned scalarInputCount =
       selectedRoot ? layout->sourceInputCount
                    : definition.getFunctionType().getNumInputs();
-  const unsigned scalarOutputCount =
-      selectedRoot ? layout->sourceOutputCount
-                   : definition.getFunctionType().getNumResults();
+  SmallVector<unsigned> scalarOutputIndices;
+  unsigned sourceOutputs = selectedRoot
+                               ? layout->sourceOutputCount
+                               : definition.getFunctionType().getNumResults();
+  for (unsigned i = 0; i < sourceOutputs; ++i)
+    scalarOutputIndices.push_back(i);
+  if (selectedRoot)
+    for (int64_t companion : layout->outputValidity)
+      if (companion >= 0)
+        scalarOutputIndices.push_back(companion);
+  SmallVector<Type> scalarOutputTypes;
+  SmallVector<Attribute> scalarOutputNames;
+  for (unsigned index : scalarOutputIndices) {
+    scalarOutputTypes.push_back(definition.getFunctionType().getResult(index));
+    scalarOutputNames.push_back(definition.getOutputNames()[index]);
+  }
   const bool bindRootInputs =
       selectedRoot && !layout->rootInputDefaults.empty();
   // Native observation plumbing is emitted only for a definition whose subtree
@@ -1816,19 +1893,19 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
     }
     out << "  std::shared_ptr<gfsim::collection_storage<" << child.type << ">> "
         << child.name << "_state;\n";
-    if (auto queue = dyn_cast<ac::QueueOp>(child.op)) {
+    if (auto queue = dyn_cast<ac::InstanceOp>(child.op);
+        queue && ac::isQueueInstance(queue)) {
       Builder builder(definition.getContext());
       auto inputNames = builder.getStrArrayAttr(queuePinNames(false));
       auto outputNames = builder.getStrArrayAttr(queuePinNames(true));
       if (failed(familyPorts(queue->getOperandTypes(), inputNames,
-                             child.name + "_", child.count, child.bindings,
+                             child.name + "_", child.count, parent,
                              queue)) ||
           failed(familyPorts(queue->getResultTypes(), outputNames,
-                             child.name + "_", child.count, child.bindings,
+                             child.name + "_", child.count, parent,
                              queue)))
         return failure();
-      auto token =
-          ctx.cppType(queue.getInData().getType(), child.bindings, queue);
+      auto token = ctx.cppType(queue->getOperand(3).getType(), parent, queue);
       if (failed(token))
         return failure();
       for (StringRef direction : {"input", "output"})
@@ -1867,17 +1944,17 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
            "  // Gauge publishes the raw unsigned bit pattern; a one-bit "
            "Event\n"
            "  // keeps the source bool shape the runner protocol carries.\n"
-           "  template <bool pyc_event_bool>\n"
+           "  template <bool pyc_event_bool, unsigned pyc_width>\n"
            "  void __pyc_stage_observation(std::size_t pyc_lane, "
-           "std::size_t pyc_site, std::uint64_t pyc_value, bool pyc_valid, "
+           "std::size_t pyc_site, const gfsim::FourState<pyc_width> "
+           "&pyc_value, bool pyc_valid, "
            "bool pyc_path) noexcept {\n"
            "    if (pyc_sink_ == nullptr || pyc_sink_->slots == nullptr || "
            "pyc_sink_->system == nullptr) return;\n"
-           "    pyc_sink_->slots->Stage(pyc_observation_base_ + pyc_lane * "
+           "    pyc_sink_->slots->StagePacked(pyc_observation_base_ + pyc_lane "
+           "* "
         << *laneStride
-        << " + pyc_site, "
-           "pyc_event_bool ? gfsim::SlotValue::Bool(pyc_value != 0) : "
-           "gfsim::SlotValue::Unsigned(pyc_value), pyc_valid, pyc_path, "
+        << " + pyc_site, pyc_value, pyc_event_bool, pyc_valid, pyc_path, "
            "pyc_sink_->system->cycle());\n"
            "  }\n";
   out << "  void Work() {\n    __pyc_clear_check_snapshots();\n    try "
@@ -1899,9 +1976,9 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
         out << "    " << child.name << "_state->discard();\n";
       else {
         SmallVector<std::string> q;
-        if (isa<ac::QueueOp>(child.op)) {
-          q = {child.name + "_in_ready.element(pyc_lane)",
-               child.name + "_out_valid.element(pyc_lane)",
+        if (isQueue(child.op)) {
+          q = {child.name + "_ready.element(pyc_lane)",
+               child.name + "_valid.element(pyc_lane)",
                child.name + "_output_tokens[pyc_lane]"};
         } else
           for (auto raw :
@@ -1914,9 +1991,15 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
         auto kind = ctx.analysis.getPrimitiveKind(child.bindings.owner);
         std::string result;
         if (kind == "sync_mem" || kind == "sync_mem_dp") {
+          unsigned reads = kind == "sync_mem_dp" ? 2 : 1;
+          if (q.size() != 2 * reads)
+            return child.op->emitOpError()
+                   << "synchronous memory output layout mismatch";
           for (auto &pin : q)
             pin = "&" + pin;
-          result = "{{" + join(q, ", ") + "}}";
+          result = "{{" + join(ArrayRef<std::string>(q).take_front(reads), ", ") +
+                   "}, {" +
+                   join(ArrayRef<std::string>(q).drop_front(reads), ", ") + "}}";
         } else
           result = "{" + join(q, ", ") + "}";
         out << "    " << child.name
@@ -1983,19 +2066,22 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
           definition.getFunctionType().getInputs().take_front(scalarInputCount),
           definition.getInputNames().getValue().take_front(
               scalarInputCount))) ||
-      failed(scalarPorts(definition.getFunctionType().getResults().take_front(
-                             scalarOutputCount),
-                         definition.getOutputNames().getValue().take_front(
-                             scalarOutputCount))))
+      failed(scalarPorts(scalarOutputTypes, scalarOutputNames)))
     return failure();
   auto bridge = [&](bool input) -> LogicalResult {
     auto types = input ? definition.getFunctionType().getInputs()
                        : definition.getFunctionType().getResults();
     auto portNames =
         input ? definition.getInputNames() : definition.getOutputNames();
-    unsigned count = input ? scalarInputCount : scalarOutputCount;
-    for (auto [t, raw] : llvm::zip(types.take_front(count),
-                                   portNames.getValue().take_front(count))) {
+    SmallVector<unsigned> indices;
+    if (input)
+      for (unsigned i = 0; i < scalarInputCount; ++i)
+        indices.push_back(i);
+    else
+      indices = scalarOutputIndices;
+    for (unsigned index : indices) {
+      Type t = types[index];
+      Attribute raw = portNames[index];
       auto n = id(cast<StringAttr>(raw).getValue());
       if (failed(n))
         return failure();
@@ -2052,8 +2138,19 @@ LogicalResult emitHardwareCppDefinition(HardwareEmitContext &ctx,
           id(cast<StringAttr>(definition.getInputNames()[index]).getValue());
       if (failed(type) || failed(name))
         return failure();
-      out << "    pyc_implementation->" << *name << ".element(0) = gfsim::wire<"
-          << *type << ">::known(" << *type << "{0});\n";
+      auto initial = cast<IntegerAttr>(
+          layout->rootInputDefaults[index - scalarInputCount]);
+      if (initial.getValue().isZero()) {
+        // Family ports flatten Table axes into element lanes. Initialize the
+        // complete column, including nominal leaves with explicit constructors.
+        out << "    pyc_implementation->" << *name
+            << " = decltype(pyc_implementation->" << *name << ")::known({});\n";
+      } else {
+        // Nonzero defaults are admitted only for scalar availability companions.
+        out << "    pyc_implementation->" << *name << ".element(0) = gfsim::wire<"
+            << *type << ">::known(" << *type << "{" << initial.getInt()
+            << "});\n";
+      }
     }
     out << "  }\n";
   }

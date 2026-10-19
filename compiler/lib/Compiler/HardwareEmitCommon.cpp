@@ -552,8 +552,9 @@ buildObservationPlan(HardwareEmitContext &context) {
 }
 } // namespace
 HardwareEmitContext::HardwareEmitContext(ModuleOp package,
-                                         ac::HardwareAnalysis &analysis)
-    : package(package), analysis(analysis) {}
+                                         ac::HardwareAnalysis &analysis,
+                                         bool physical)
+    : package(package), analysis(analysis), physical_(physical) {}
 LogicalResult HardwareEmitContext::prepare() { return prepareImpl(false); }
 LogicalResult HardwareEmitContext::prepareNativeChecks() {
   return prepareImpl(true);
@@ -563,7 +564,20 @@ const ac::HardwareSourceCheckPlan &HardwareEmitContext::sourceChecks() const {
   return *sourceChecks_;
 }
 bool HardwareEmitContext::managesChecks() {
-  return isSystem() || (sourceChecks_ && !sourceChecks_->checks.empty());
+  return !physical_ &&
+         (isSystem() || (sourceChecks_ && !sourceChecks_->checks.empty()));
+}
+bool HardwareEmitContext::resetIfOne() const {
+  return sourceChecks().resetSemantics == ac::HardwareResetSemantics::IfOne;
+}
+std::string HardwareEmitContext::cppReset(StringRef expression) const {
+  return resetIfOne() ? "gfsim::interpretReset(" + expression.str() +
+                            ", gfsim::ResetSemantics::IfOne)"
+                      : expression.str();
+}
+std::string HardwareEmitContext::rtlReset(StringRef expression) const {
+  return resetIfOne() ? "((" + expression.str() + ") === 1'b1)"
+                      : expression.str();
 }
 LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   sourceChecks_.reset();
@@ -763,7 +777,8 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     if (widths.wasInterrupted())
       return failure();
     for (auto &op : module.getBody().front()) {
-      if (auto queue = dyn_cast<ac::QueueOp>(op)) {
+      if (auto queue = dyn_cast<ac::InstanceOp>(op);
+          queue && ac::isQueueInstance(queue)) {
         auto config = analysis.resolveQueue(queue, bindings);
         if (failed(config))
           return failure();
@@ -788,7 +803,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
           return op.emitOpError() << "queue token representation overflows";
         uint64_t tokenBytes = config->tokenCardinality * scalarBytes;
         uint64_t capacity = std::numeric_limits<std::ptrdiff_t>::max();
-        // Six control planes (144), Current/Pending metadata (32/8), and a
+        // Seven control planes (168), Current/Pending metadata (32/8), and a
         // completion word (8) per lane; 128 reserves the shared owner. Besides
         // D slots, retain Pending, two data pin planes and two token buffers.
         // Delayed availability adds D u64 deadlines plus tick, maturity cursor
@@ -796,7 +811,7 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
         // reserve.
         uint64_t laneCapacity = (capacity - 128) / multiplicity;
         bool delayed = config->availabilityLatency > 1;
-        uint64_t fixedBytes = delayed ? 216 : 192;
+        uint64_t fixedBytes = delayed ? 240 : 216;
         if (laneCapacity <= fixedBytes)
           return op.emitOpError()
                  << "queue storage including enclosing collections exceeds "
@@ -994,6 +1009,12 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     // Owners may intentionally share a basename; grouping checks unequal
     // owners.
     names_.try_emplace(site, std::move(names));
+  }
+  if (physical_) {
+    auto projection = analysis.getPhysicalProjection(*checks);
+    if (failed(projection))
+      return failure();
+    physicalProjection_ = *projection;
   }
   sourceChecks_ = std::move(*checks);
   return success();
@@ -1298,6 +1319,99 @@ FailureOr<ac::HardwareBindings> HardwareEmitContext::rootBindings() const {
     bindings.integers[formal.getAs<StringAttr>("name").getValue()] = *value;
   }
   return bindings;
+}
+FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
+  auto system = *package.getOps<ac::SystemOp>().begin();
+  auto root = cast<ac::ModuleOp>(analysis.lookupDefinition(
+      system.getEntry().getAs<FlatSymbolRefAttr>("callee").getValue()));
+  auto bindings = rootBindings();
+  auto layout = ac::getModulePortLayout(root);
+  if (failed(bindings) || failed(layout))
+    return failure();
+  auto signature = root.getFunctionType();
+  llvm::json::Array inputs, outputs, controls;
+  auto describe = [&](Type type, StringRef name,
+                      unsigned ordinal) -> FailureOr<llvm::json::Object> {
+    auto wire = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto width = analysis.getPackedWidth(type, *bindings, root);
+    auto leaves = analysis.getLeaves(type, *bindings, root);
+    if (failed(wire) || failed(width) || failed(leaves))
+      return failure();
+    llvm::json::Array fields;
+    for (const auto &leaf : *leaves) {
+      llvm::json::Array path;
+      for (auto part : leaf.path)
+        path.emplace_back(part.getValue());
+      fields.emplace_back(llvm::json::Object{
+          {"path", std::move(path)}, {"low", leaf.low}, {"width", leaf.width}});
+    }
+    return llvm::json::Object{{"ordinal", ordinal},
+                              {"name", name},
+                              {"wire", *wire},
+                              {"width", *width},
+                              {"fields", std::move(fields)}};
+  };
+  for (unsigned i = 0; i < layout->sourceInputCount; ++i) {
+    auto row =
+        describe(signature.getInput(i),
+                 cast<StringAttr>(root.getInputNames()[i]).getValue(), i);
+    if (failed(row))
+      return failure();
+    inputs.emplace_back(std::move(*row));
+  }
+  llvm::DenseSet<int64_t> companions;
+  for (unsigned i = 0; i < layout->sourceOutputCount; ++i) {
+    auto row =
+        describe(signature.getResult(i),
+                 cast<StringAttr>(root.getOutputNames()[i]).getValue(), i);
+    if (failed(row))
+      return failure();
+    (*row)["availability"] = nullptr;
+    int64_t companion = layout->outputValidity[i];
+    if (companion >= 0) {
+      auto wire = legalizeIdentifier(
+          cast<StringAttr>(root.getOutputNames()[companion]).getValue(),
+          [&] { return root.emitOpError(); });
+      if (failed(wire))
+        return failure();
+      (*row)["availability"] = *wire;
+      if (companions.insert(companion).second)
+        controls.emplace_back(llvm::json::Object{{"direction", "output"},
+                                                 {"role", "availability"},
+                                                 {"wire", *wire},
+                                                 {"width", 1}});
+    }
+    outputs.emplace_back(std::move(*row));
+  }
+  llvm::json::Object domains{{"clock", nullptr}, {"reset", nullptr}};
+  if (auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs"))
+    for (StringRef role : {StringRef("clock"), StringRef("reset")})
+      if (auto ordinal = domain.getAs<IntegerAttr>(role))
+        domains[role] = ordinal.getValue().getZExtValue();
+  if (rtl && managesChecks()) {
+    auto control = [&](StringRef direction, StringRef role, StringRef wire,
+                       unsigned width) {
+      controls.emplace_back(llvm::json::Object{{"direction", direction},
+                                               {"role", role},
+                                               {"wire", wire},
+                                               {"width", width}});
+    };
+    control("input", "phase", "pyc_phase", 3);
+    control("input", "commit_permission", "pyc_root_commit_ok", 1);
+    control("output", "check_complete", "pyc_check_complete", 1);
+    control("output", "sampling_error", "pyc_sampling_error", 1);
+    control("output", "local_error", "pyc_local_error", 1);
+  }
+  llvm::json::Value map(llvm::json::Object{{"schema_version", 1},
+                                           {"target", rtl ? "verilog" : "cpp"},
+                                           {"inputs", std::move(inputs)},
+                                           {"outputs", std::move(outputs)},
+                                           {"domains", std::move(domains)},
+                                           {"controls", std::move(controls)}});
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << map;
+  return text;
 }
 FailureOr<std::string> HardwareEmitContext::rootCppType() const {
   auto bindings = rootBindings();
@@ -1604,44 +1718,38 @@ FailureOr<std::string> HardwareEmitContext::cppBoundFamilyType(
   return result + ">";
 }
 
-static uint64_t nativeObservationWidth(const ac::HardwareAnalysis &analysis,
-                                       Type type,
-                                       const ac::HardwareBindings &bindings,
-                                       Operation *site,
-                                       llvm::DenseSet<Type> &active) {
-  auto resolved = analysis.resolveType(type, bindings, site);
-  if (failed(resolved))
-    return 0;
-  type = *resolved;
-  if (auto bits = dyn_cast<ac::BitsType>(type)) {
-    auto value = analysis.evaluateStatic(bits.getWidth(), bindings, site);
-    if (failed(value))
-      return 0;
-    auto integer = dyn_cast<ac::MathIntAttr>(*value);
-    if (!integer)
-      return 0;
-    return llvm::APSInt(integer.getCanonicalValue()).getZExtValue();
+FailureOr<uint64_t>
+observationPayloadWidth(HardwareEmitContext &context,
+                        const ObservationEmissionOccurrence &occurrence) {
+  auto rootBindings = context.rootBindings();
+  if (failed(rootBindings))
+    return failure();
+  ac::HardwareBindings bindings = std::move(*rootBindings);
+  for (auto [operation, lane] : occurrence.path) {
+    (void)lane;
+    auto child = isa<ac::InstanceOp>(operation)
+                     ? context.analysis.bindInstance(
+                           cast<ac::InstanceOp>(operation), bindings)
+                     : context.analysis.bindInstance(
+                           cast<ac::CollectionOp>(operation), bindings);
+    if (failed(child))
+      return failure();
+    bindings = std::move(*child);
   }
-  if (auto enumeration = dyn_cast<ac::EnumType>(type)) {
-    auto view = analysis.resolveEnum(enumeration, site);
-    return failed(view) ? 0 : view->width;
-  }
-  if (auto record = dyn_cast<ac::StructType>(type)) {
-    if (!active.insert(record).second)
-      return 0;
-    uint64_t total = 0;
-    for (Attribute raw : analysis.lookupStruct(record).getFields()) {
-      auto field = cast<DictionaryAttr>(raw).getAs<TypeAttr>("type").getValue();
-      uint64_t width =
-          nativeObservationWidth(analysis, field, bindings, site, active);
-      if (width == 0)
-        return 0;
-      total += width;
-    }
-    active.erase(record);
-    return total;
-  }
-  return 0;
+  auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
+  Value observed = occurrence.site.carriesValue
+                       ? observe.getValues()[occurrence.site.valueIndex]
+                       : observe.getPath();
+  auto width =
+      context.analysis.getPackedWidth(observed.getType(), bindings, observe);
+  if (failed(width))
+    return failure();
+  if (*width == 0 || *width > std::numeric_limits<std::uint32_t>::max())
+    return observe.emitOpError()
+           << "observation payload width exceeds Runtime capacity";
+  if (occurrence.site.gauge && *width > 64)
+    return observe.emitOpError() << "numeric report requires at most 64 bits";
+  return *width;
 }
 FailureOr<std::string>
 cppObservationDescriptorTable(HardwareEmitContext &context) {
@@ -1660,11 +1768,15 @@ cppObservationDescriptorTable(HardwareEmitContext &context) {
   for (auto [index, entry] : llvm::enumerate(plan->table)) {
     const auto &occurrence = plan->occurrences[index];
     auto observe = cast<ac::SourceObserveOp>(occurrence.site.op);
+    auto width = observationPayloadWidth(context, occurrence);
+    if (failed(width))
+      return failure();
     out << "\n    {" << entry[0] << ", " << entry[1] << ", " << entry[2] << ", "
         << entry[3]
         << ", gfsim::ObservationKind::" << (entry[4] ? "Gauge" : "Event")
         << ", " << occurrence.site.valueIndex << ", "
-        << std::max<std::size_t>(1, observe.getValues().size()) << "},";
+        << std::max<std::size_t>(1, observe.getValues().size()) << ", "
+        << *width << "},";
   }
   out << "\n};\n";
   out.flush();
@@ -1733,16 +1845,13 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
       return failure();
     Value observed = site.carriesValue ? observe.getValues()[site.valueIndex]
                                        : observe.getPath();
-    llvm::DenseSet<Type> active;
-    uint64_t width = nativeObservationWidth(
-        context.analysis, observed.getType(), bindings, observe, active);
-    if (width == 0)
-      return observe.emitOpError()
-             << "native observation value type is unresolved";
-    if (width > 64)
-      return observe.emitOpError()
-             << "native observation value exceeds the 64-bit single-plane "
-                "slot; publish one scalar field per observation";
+    auto resolvedWidth =
+        context.analysis.getPackedWidth(observed.getType(), bindings, observe);
+    if (failed(resolvedWidth))
+      return failure();
+    uint64_t width = *resolvedWidth;
+    if (site.gauge && width > 64)
+      return observe.emitOpError() << "numeric report requires at most 64 bits";
     auto payload = context.cppType(observed.getType(), bindings, observe);
     if (failed(payload))
       return failure();
@@ -1764,8 +1873,7 @@ cppObservationStaging(HardwareEmitContext &context, ac::ModuleOp definition,
                 ? "false"
                 : "(gfsim::hardware_traits<" + *payload + ">::width == 1)")
         << ">(pyc_lane, " << index
-        << ", pyc_observed.value().value(), pyc_observed.isFullyKnown() && "
-           "pyc_observed_path.isFullyKnown(), "
+        << ", pyc_observed, pyc_observed_path.isFullyKnown(), "
         << "pyc_observed_path.isFullyKnown() && "
            "static_cast<bool>(pyc_observed_path.value().value() & 1u));\n"
         << "    }\n";
