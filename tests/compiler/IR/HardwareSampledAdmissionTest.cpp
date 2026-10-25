@@ -1975,4 +1975,148 @@ TEST_F(HardwareSampledAdmissionTest, BudgetRejectsBeforeLateProofWork) {
   EXPECT_EQ(expect->getNumOperands(), 4u);
 }
 
+TEST_F(HardwareSampledAdmissionTest,
+       ParsedAdmissionScopePreservesAllRepeatedControlValues) {
+    build(false, {}, 6);
+    ac::HardwareAnalysis analysis(*package);
+    ac::HardwareBindings bindings;
+    bindings.owner = definition;
+    detail::SourceCheckBudget budget({1 << 20});
+    detail::SampledAdmissionParseScope session(analysis, budget);
+    auto first = capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    });
+    ASSERT_TRUE(succeeded(first)) << diagnostics;
+    for (unsigned repeat = 0; repeat < 8; ++repeat) {
+        auto next = capture([&] {
+            return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+        });
+        ASSERT_TRUE(succeeded(next)) << diagnostics;
+        EXPECT_EQ(next->rule, first->rule);
+        EXPECT_EQ(next->definition, first->definition);
+        EXPECT_EQ(next->clock, first->clock);
+        EXPECT_EQ(next->reset, first->reset);
+        EXPECT_EQ(next->fire, first->fire);
+        ASSERT_EQ(next->controls.size(), first->controls.size());
+        for (auto [actual, expected] : llvm::zip(next->controls, first->controls)) {
+            EXPECT_EQ(actual.id, expected.id);
+            EXPECT_EQ(actual.invocation, expected.invocation);
+            EXPECT_EQ(actual.raw, expected.raw);
+            EXPECT_EQ(actual.reached, expected.reached);
+            EXPECT_EQ(actual.predecessor, expected.predecessor);
+        }
+    }
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       ParsedAdmissionScopeReducesWorkAndSeparatesCompleteBindings) {
+    build(false, {}, 6);
+    ac::HardwareAnalysis analysis(*package);
+    auto admits = [&](uint64_t limit, bool useScope, unsigned bindingKind,
+                      bool distinctBindings) {
+        detail::SourceCheckBudget budget({limit});
+        std::optional<detail::SampledAdmissionParseScope> session;
+        if (useScope)
+            session.emplace(analysis, budget);
+        for (unsigned repeat = 0; repeat < 8; ++repeat) {
+            ac::HardwareBindings bindings;
+            bindings.owner = definition;
+            if (bindingKind == 1)
+                bindings.integers["N"] = b.getI64IntegerAttr(distinctBindings ? repeat : 0);
+            if (bindingKind == 2)
+                bindings.types["T"] = ac::BitsType::get(
+                    &context, literal(distinctBindings ? repeat + 1 : 1));
+            auto parsed = capture([&] {
+                return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+            });
+            if (failed(parsed))
+                return false;
+        }
+        return true;
+    };
+    auto minimum = [&](bool useScope, unsigned bindingKind, bool distinctBindings = false) {
+        uint64_t low = 0, high = 1 << 20;
+        EXPECT_TRUE(admits(high, useScope, bindingKind, distinctBindings)) << diagnostics;
+        while (low < high) {
+            uint64_t middle = low + (high - low) / 2;
+            if (admits(middle, useScope, bindingKind, distinctBindings))
+                high = middle;
+            else
+                low = middle + 1;
+        }
+        return low;
+    };
+    uint64_t repeated = minimum(true, 0);
+    EXPECT_LT(repeated, minimum(false, 0));
+    EXPECT_LT(minimum(true, 1), minimum(true, 1, true));
+    EXPECT_LT(minimum(true, 2), minimum(true, 2, true));
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       ParsedAdmissionScopeNeverAuthenticatesAnInvalidSibling) {
+    build();
+    auto invalid = cloneSampledRule(0);
+    invalid->setAttr("ac.sampled_admission", b.getDictionaryAttr({}));
+    ac::HardwareAnalysis analysis(*package);
+    ac::HardwareBindings bindings;
+    bindings.owner = definition;
+    detail::SourceCheckBudget budget({1 << 20});
+    detail::SampledAdmissionParseScope session(analysis, budget);
+    ASSERT_TRUE(succeeded(capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    }))) << diagnostics;
+    EXPECT_TRUE(failed(capture([&] {
+        return detail::parseSampledAdmission(invalid, analysis, bindings, budget);
+    })));
+    EXPECT_FALSE(diagnostics.empty());
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       ParsedAdmissionScopeDoesNotSurviveAnIRChangeAfterItsLifetime) {
+    build();
+    ac::HardwareAnalysis analysis(*package);
+    ac::HardwareBindings bindings;
+    bindings.owner = definition;
+    detail::SourceCheckBudget budget({1 << 20});
+    {
+        detail::SampledAdmissionParseScope session(analysis, budget);
+        ASSERT_TRUE(succeeded(capture([&] {
+            return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+        }))) << diagnostics;
+    }
+    rule->setAttr("ac.sampled_admission", b.getDictionaryAttr({}));
+    EXPECT_TRUE(failed(capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    })));
+    EXPECT_FALSE(diagnostics.empty());
+    detail::SampledAdmissionParseScope freshSession(analysis, budget);
+    EXPECT_TRUE(failed(capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    })));
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       ParsedAdmissionNestedScopeCannotBorrowAnotherBudgetsWarmCache) {
+    build();
+    ac::HardwareAnalysis analysis(*package);
+    ac::HardwareBindings bindings;
+    bindings.owner = definition;
+    detail::SourceCheckBudget budget({1 << 20});
+    detail::SampledAdmissionParseScope session(analysis, budget);
+    ASSERT_TRUE(succeeded(capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    }))) << diagnostics;
+    {
+        detail::SourceCheckBudget tiny({1});
+        detail::SampledAdmissionParseScope nested(analysis, tiny);
+        EXPECT_TRUE(failed(capture([&] {
+            return detail::parseSampledAdmission(rule, analysis, bindings, tiny);
+        })));
+        EXPECT_NE(diagnostics.find("analysis work budget"), std::string::npos);
+    }
+    EXPECT_TRUE(succeeded(capture([&] {
+        return detail::parseSampledAdmission(rule, analysis, bindings, budget);
+    }))) << diagnostics;
+}
+
 } // namespace

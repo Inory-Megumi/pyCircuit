@@ -278,8 +278,14 @@ private-use 与 clock history 验证继续独立进行，不能按定义名去�
 结果与已经成功的 definition-local Rule prefix 证明。它绑定同一 analysis 和 budget，
 不允许复制/移动；`verifyInvocation` 拒绝错配。`prepare(definition, bindings)` 只通过
 原 factory 构造完整边界，稳定保存指针；普通定义成功返回空指针。
-`verify(rule, bindings)` 每次从真实 Rule 重新解析 schema，只有精确 definition、完整
-bindings 与 Rule 身份已成功时才复用 prefix 证明。首次仍运行同一个 prover，失败不记录。
+`verify(rule, bindings)` 从真实 Rule 取得 schema；独立入口每次重新解析。Builder 在
+raw preflight 成功后，以词法作用域 `SampledAdmissionParseScope` 复用一次只读验证内
+已解析的 schema，键包含精确 Rule 身份、同一 analysis/budget 以及完整整数/类型/owner
+bindings。作用域结束即销毁；线程局部的嵌套作用域恢复前一作用域，其他线程不借用缓存。
+这不缓存物理 occurrence 或新增证明结论。查找、bindings 比较、存储、copy sizing 与
+每次返回的完整 view 复制均由同一预算计费，原 raw reserve 与限额不变。
+只有精确 definition、完整 bindings 与 Rule 身份已成功时才复用 prefix 证明。
+首次仍运行同一个 prover，失败不记录。
 调用者不能注入 view 或“已成功”标志；Prepared 对象本身仍不授予证明权威。
 
 Builder 将同一个 validation 贯穿 catalog、绑定检查和 wiring；独立 native 入口各自

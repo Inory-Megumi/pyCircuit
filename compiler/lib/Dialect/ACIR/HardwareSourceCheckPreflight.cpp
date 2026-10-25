@@ -49,6 +49,8 @@ public:
       if (failed(rawPreflight()))
         return failure();
     }
+    // All following verifiers read this immutable package and exact bindings.
+    SampledAdmissionParseScope parsedAdmissions(analysis, budget);
     if (failed(verifyHardwarePackageStage(analysis, profile))) return failure();
     {
       NativeSourceCheckScope native(analysis, validation, budget, nativeChecks);

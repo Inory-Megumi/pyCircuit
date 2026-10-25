@@ -124,8 +124,9 @@ copy 与 conjunction 项保持。实际 effect path yields 是 seeds，condition
 原源认证同样提前计费 replay 存储、payload vectors、全部 terminal scans 与 frame 链。
 
 成功证明复用只限同一 analysis、budget 调用、immutable package、准确 definition、
-完整 bindings、Rule 和完整 boundary policy。每次查询仍解析实际 Rule；每个实际根的
-owner、domain、terminal 与 private-use 检查独立进行。IR 改变后相关 plans、prepared
+完整 bindings、Rule 和完整 boundary policy。独立入口每次解析实际 Rule；同一次
+Builder 只读验证内可按[采样准入合同](sampled-admission.md)复用已解析 schema，
+完整 view 的复制仍收费。每个实际根的 owner、domain、terminal 与 private-use 检查独立进行。IR 改变后相关 plans、prepared
 boundaries 和检查/发射 contexts 全部失效。MLIR uniqued Attribute 的相等比较可以使用
 实际恒定成本，不借此跳过结构验证或改变 schema reserve。
 

@@ -196,6 +196,33 @@ prepareSampledBoundaries(ModuleOp definition, const HardwareAnalysis &analysis,
                          const HardwareBindings &bindings,
                          SourceCheckBudget &budget);
 
+/// A lexical read-only compiler verification. IR and complete bindings must
+/// remain unchanged while this scope is alive. Unscoped API calls still parse
+/// current IR; no proof verdict or physical occurrence is cached here.
+class SampledAdmissionParseScope {
+public:
+    SampledAdmissionParseScope(const HardwareAnalysis &analysis,
+                              SourceCheckBudget &budget);
+    ~SampledAdmissionParseScope();
+    SampledAdmissionParseScope(const SampledAdmissionParseScope &) = delete;
+    SampledAdmissionParseScope &operator=(const SampledAdmissionParseScope &) = delete;
+    SampledAdmissionParseScope(SampledAdmissionParseScope &&) = delete;
+    SampledAdmissionParseScope &operator=(SampledAdmissionParseScope &&) = delete;
+
+private:
+    friend mlir::FailureOr<SampledAdmissionView>
+    parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
+                          const HardwareBindings &bindings, SourceCheckBudget &budget);
+    mlir::FailureOr<SampledAdmissionView>
+    parse(RuleOp rule, const HardwareBindings &bindings);
+    struct Impl;
+    static thread_local SampledAdmissionParseScope *active;
+    SampledAdmissionParseScope *previous;
+    const HardwareAnalysis &analysis;
+    SourceCheckBudget &budget;
+    std::unique_ptr<Impl> cache;
+};
+
 /// Reuses only definition-local preparation and completed prefix proofs.
 /// The analysis, budget, package and complete boundaries must remain fixed for
 /// this object's lifetime. Actual occurrence and root wiring proofs stay

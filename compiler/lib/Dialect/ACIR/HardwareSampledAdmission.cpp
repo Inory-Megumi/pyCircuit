@@ -411,8 +411,8 @@ LogicalResult bindStateEndpoint(StateEndpoint &result, Operation *storage,
 }
 } // namespace
 
-FailureOr<SampledAdmissionView>
-parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
+static FailureOr<SampledAdmissionView>
+parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
                       const HardwareBindings &bindings,
                       SourceCheckBudget &budget) {
   auto lexical = dyn_cast<ModuleOp>(rule->getParentOp());
@@ -1119,6 +1119,8 @@ parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
 #include "HardwareWriteDomainParsing.inc"
   return result;
 }
+
+#include "HardwareSampledAdmissionCache.inc"
 
 FailureOr<TransactionWiringView>
 parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
@@ -2814,8 +2816,8 @@ SampledAdmissionValidation::verifySampledAdmissionImpl(
   if (!*prepared)
     return rule->emitOpError()
            << "sampled validation lacks prepared definition boundaries";
-  // Parse current IR on every call. Only a completed prefix proof is reused,
-  // under immutable IR, exact bindings and the prepared complete stop policy.
+  // Standalone calls parse current IR; the Builder read-only scope may reuse
+  // exact parsed schema. Prefix proofs retain the complete stop policy.
   auto sampled = parseSampledAdmission(rule, analysis, bindings, budget);
   if (failed(sampled))
     return failure();
