@@ -54,7 +54,7 @@ protected:
   auto error() {
     return [&] { return emitError(attrs.getUnknownLoc()); };
   }
-  OwningOpRef<ModuleOp> compileCaptured(StringRef sourceName, StringRef top) {
+  OwningOpRef<ModuleOp> compileCaptured(StringRef sourceName, StringRef top, bool expectLink = true) {
     auto captured = parseSourceFile<ModuleOp>(path("capture.mlir"), &context);
     if (!captured)
       return {};
@@ -72,7 +72,7 @@ protected:
       return {};
     auto final = compiler::linkSourceUnits({{*unit->body, *unit->interface}},
                                              top, error());
-    EXPECT_TRUE(succeeded(final)) << diagnostics;
+    EXPECT_EQ(succeeded(final), expectLink) << diagnostics;
     return succeeded(final) ? std::move(*final) : OwningOpRef<ModuleOp>{};
   }
   bool capture(StringRef script, StringRef option = "") {
@@ -165,6 +165,91 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
     if (!capture(script, orderedParent ? "ordered" : "unordered"))
       return {};
     return compileCaptured("hierarchy.py", "execution.hierarchy.Top");
+  }
+  OwningOpRef<ModuleOp> compositeFixture(bool overlap = false) {
+    static constexpr llvm::StringLiteral script = R"py(
+import sys
+from pathlib import Path
+repo, output = map(Path, sys.argv[1:3])
+sys.path.insert(0, str(repo / "python"))
+from pycircuit._source_capture import _capture_source_file
+from pycircuit._source_transport import _emit_source_transport
+text = '''
+from enum import Enum
+import pycircuit as ac
+
+@ac.encoding(width=2)
+class Phase(Enum):
+    FREE = 0
+    ACTIVE = 1
+    HELD = 2
+
+@ac.struct
+class State:
+    phase: Phase
+    write: ac.u1
+    received: ac.u2
+
+@ac.module
+def Owner():
+    state: State = State(phase=Phase.FREE, write=0, received=0)
+
+    @ac.method(guard=lambda kind: state.phase == Phase.FREE)
+    def start(kind: ac.u1) -> None:
+        state = State(phase=Phase.ACTIVE, write=kind, received=0)
+
+    @ac.method(guard=lambda bits: state.phase == Phase.ACTIVE and state.write == 1
+        and bits != state.received and (bits | state.received) == bits)
+    def progress(bits: ac.u2) -> None:
+        state = State(phase=state.phase, write=state.write, received=bits)
+
+    @ac.method(guard=lambda: state.phase == Phase.ACTIVE
+        and (state.write == 0 or state.received == 3))
+    def capture() -> None:
+        state = State(phase=Phase.HELD, write=state.write, received=state.received)
+
+    @ac.method(guard=lambda: state.phase == Phase.HELD)
+    def release() -> None:
+        state = State(phase=Phase.FREE, write=state.write, received=state.received)
+
+    @ac.method
+    def read() -> State:
+        return State(phase=state.phase, write=state.write, received=state.received)
+
+@ac.module
+def Top(mask: ac.u2, kind: ac.u1):
+    owner = Owner()
+
+    @ac.rule
+    def start() -> None:
+        owner.start(kind)
+
+    @ac.rule
+    def progress() -> None:
+        before = owner.read()
+        owner.progress(before.received | mask)
+
+    @ac.rule
+    def capture() -> None:
+        owner.capture()
+
+    @ac.rule
+    def release() -> None:
+        owner.release()
+
+    start()
+    progress()
+    capture()
+    release()
+'''
+if sys.argv[3] == "overlap":
+    text = text.replace("    release()\n", "    capture()\n")
+source = output.with_name("composite.py")
+source.write_text(text)
+output.write_text(_emit_source_transport(_capture_source_file(source, source_root=source.parent)), encoding="utf-8")
+)py";
+    if (!capture(script, overlap ? "overlap" : "disjoint")) return {};
+    return compileCaptured("composite.py", "execution.composite.Top", !overlap);
   }
   LogicalResult verifyFinal(ModuleOp file) {
     ac::HardwareAnalysis analysis(file);
@@ -710,4 +795,16 @@ TEST_F(HardwareWriteDomainsTest, PrivateMaskCannotGainAnUnrelatedPayloadUse) {
   b.create(state);
   rejects(*file, "private write-domain mask");
 }
+
+TEST_F(HardwareWriteDomainsTest, CompositeEnumOwnerUsesHierarchicalDisjointGuards) {
+  auto file = compositeFixture();
+  ASSERT_TRUE(file) << diagnostics;
+  EXPECT_TRUE(succeeded(ac::verifyHardwarePackage(*file))) << diagnostics;
+}
+TEST_F(HardwareWriteDomainsTest, CompositeEnumOwnerStillRejectsOverlappingCallers) {
+  auto file = compositeFixture(true);
+  EXPECT_FALSE(file);
+  EXPECT_NE(diagnostics.find("multiple outer writers"), std::string::npos) << diagnostics;
+}
+
 } // namespace

@@ -96,33 +96,77 @@ private:
     }
     return save(std::move(endpoint));
   }
+  LogicalResult indexPlan(const ac::TransactionStatePlan &plan) {
+    if (!charge(budget, root)) return failure();
+    if (indexedPlans.contains(&plan)) return success();
+    for (auto [id, candidate] : llvm::enumerate(plan.values)) {
+      if (!charge(budget, root, 8)) return failure();
+      OperandKey key{&plan, {candidate.anchor, {candidate.frame, candidate.value.getAsOpaquePointer()}}};
+      operands.try_emplace(key, id);
+    }
+    for (auto [id, frame] : llvm::enumerate(plan.frames))
+      for (const auto *arguments : {&frame.guardArguments, &frame.bodyArguments})
+        for (const auto &argument : *arguments) {
+          if (!charge(budget, root, 7)) return failure();
+          FormalKey key{&plan, {id, argument.formal.getAsOpaquePointer()}};
+          formals[key] = argument.actual;
+        }
+    for (const auto &call : plan.calls)
+      for (const auto &result : call.results) {
+        if (!charge(budget, root, 6)) return failure();
+        aliases[{&plan, result.result}] = result.yielded;
+      }
+    for (const auto &write : plan.formalWrites) {
+      if (!charge(budget, root, 6)) return failure();
+      if (write.snapshot)
+        aliases.try_emplace(std::make_pair(&plan, *write.snapshot),
+                           write.owner ? write.candidate : *write.previous);
+    }
+    for (const auto &read : plan.reads) {
+      if (!charge(budget, root, 6)) return failure();
+      const auto &version = plan.versions[read.version];
+      // Explicit predecessors replace Q0 with an EHR candidate; never alias
+      // that snapshot with another registration's committed old Q.
+      if (version.kind == ac::StateVersionKind::OldQ && plan.predecessors.empty())
+        aliases.try_emplace(std::make_pair(&plan, read.result), plan.owners[read.owner].oldQ);
+    }
+    if (!charge(budget, root, 2)) return failure();
+    indexedPlans.insert(&plan);
+    return success();
+  }
   FailureOr<Node> operand(const Endpoint &endpoint, Value value) {
     if (endpoint.plan) {
       const auto &ref = endpoint.plan->values[*endpoint.bound];
       auto frame = moduleValue(value, endpoint.plan->instances[ref.anchor].definition)
                        ? endpoint.plan->rootFrame : ref.frame;
-      for (auto [id, candidate] : llvm::enumerate(endpoint.plan->values)) {
-        if (!charge(budget, root)) return failure();
-        if (candidate.value == value && candidate.anchor == ref.anchor && candidate.frame == frame)
-          return bind(*endpoint.plan, endpoint.prefix, id);
-      }
-      return failure();
+      if (failed(indexPlan(*endpoint.plan))) return failure();
+      if (!charge(budget, root)) return failure();
+      OperandKey key{endpoint.plan, {ref.anchor, {frame, value.getAsOpaquePointer()}}};
+      auto found = operands.find(key);
+      if (found == operands.end()) return failure();
+      return bind(*endpoint.plan, endpoint.prefix, found->second);
     }
     Endpoint raw; raw.value = value; raw.scope = endpoint.scope; return save(std::move(raw));
   }
-  FailureOr<ac::HardwareBindings> bindings(const Endpoint &endpoint) {
+  FailureOr<std::reference_wrapper<const ac::HardwareBindings>> bindings(const Endpoint &endpoint) {
+    if (!charge(budget, root)) return failure();
     if (endpoint.plan) {
-      const auto &bound = endpoint.plan->frames[endpoint.plan->values[*endpoint.bound].frame].bindings;
-      if (!charge(budget, root, SourceCheckBudget::bindings(bound))) return failure();
-      return bound;
+      // Plans and their frame bindings are immutable throughout this proof.
+      return std::cref(endpoint.plan->frames[endpoint.plan->values[*endpoint.bound].frame].bindings);
     }
+    if (!charge(budget, root, lookupCost() + endpoint.scope.size())) return failure();
+    auto scope = routePath(root->getContext(), endpoint.scope).getAsOpaquePointer();
+    auto found = scopeBindings.find(scope);
+    if (found != scopeBindings.end()) return std::cref(found->second);
     ac::HardwareBindings result; result.owner = root;
     for (auto instance : endpoint.scope) {
       if (!charge(budget, root, 1 + SourceCheckBudget::bindings(result))) return failure();
       auto next = hardware.bindInstance(instance, result);
       if (failed(next)) return failure(); result = std::move(*next);
     }
-    return result;
+    if (!charge(budget, root, 8 + SourceCheckBudget::bindings(result))) return failure();
+    auto inserted = scopeBindings.emplace(scope, std::move(result));
+    return std::cref(inserted.first->second);
   }
   bool payAttribute(Attribute attribute, unsigned depth = 0) {
     if (depth >= 128 || !charge(budget, root)) return false;
@@ -147,6 +191,11 @@ private:
     return std::optional<llvm::APSInt>(llvm::APSInt(number.getCanonicalValue()));
   }
   FailureOr<std::optional<uint64_t>> width(Value value, const ac::HardwareBindings &bound) {
+    if (isa<ac::EnumType>(value.getType())) {
+      auto count = hardware.getPackedWidth(value.getType(), bound, root);
+      if (failed(count)) return failure();
+      return std::optional<uint64_t>(*count);
+    }
     auto type = dyn_cast<ac::BitsType>(value.getType());
     if (!type) return std::optional<uint64_t>();
     auto number = integer(type.getWidth(), bound, root);
@@ -156,6 +205,15 @@ private:
     return std::optional<uint64_t>((**number).getZExtValue());
   }
   FailureOr<Node> canonical(Node id, unsigned depth) {
+    if (!charge(budget, root)) return failure();
+    if (auto found = canonicalNodes.find(id); found != canonicalNodes.end()) return found->second;
+    auto result = canonicalImpl(id, depth);
+    if (failed(result) || !charge(budget, root, 4)) return failure();
+    canonicalNodes.try_emplace(id, *result);
+    canonicalNodes.try_emplace(*result, *result);
+    return *result;
+  }
+  FailureOr<Node> canonicalImpl(Node id, unsigned depth) {
     for (; depth < 128; ++depth) {
       if (id >= endpoints.size() || !charge(budget, root, 2)) return failure();
       if (!product(budget, root, endpoints[id].scope.size() + endpoints[id].prefix.size(),
@@ -166,40 +224,14 @@ private:
       if (endpoint.plan) {
         const auto &plan = *endpoint.plan;
         const auto &ref = plan.values[*endpoint.bound];
-        const auto &frame = plan.frames[ref.frame];
-        for (const auto *bindings : {&frame.guardArguments, &frame.bodyArguments})
-          for (const auto &binding : *bindings) {
-            if (!charge(budget, root)) return failure();
-            if (binding.formal == ref.value) {
-              auto actual = bind(plan, endpoint.prefix, binding.actual);
-              if (failed(actual)) return failure(); next = *actual;
-            }
-          }
-        if (!next) for (const auto &call : plan.calls)
-          for (const auto &result : call.results) {
-            if (!charge(budget, root)) return failure();
-            if (result.result == *endpoint.bound) {
-              auto actual = bind(plan, endpoint.prefix, result.yielded);
-              if (failed(actual)) return failure(); next = *actual;
-            }
-          }
-        if (!next) for (const auto &write : plan.formalWrites) {
-          if (!charge(budget, root)) return failure();
-          if (write.snapshot == endpoint.bound) {
-            auto actual = bind(plan, endpoint.prefix, write.owner ? write.candidate : *write.previous);
-            if (failed(actual)) return failure(); next = *actual;
-          }
-        }
-        if (!next) for (const auto &read : plan.reads) {
-          if (!charge(budget, root)) return failure();
-          if (read.result != *endpoint.bound) continue;
-          const auto &version = plan.versions[read.version];
-          // Explicit predecessors replace an owner's entry with its EHR
-          // candidate. Such reads must not alias another registration's Q0.
-          if (version.kind == ac::StateVersionKind::OldQ && plan.predecessors.empty()) {
-            auto actual = bind(plan, endpoint.prefix, plan.owners[read.owner].oldQ);
-            if (failed(actual)) return failure(); next = *actual;
-          }
+        if (failed(indexPlan(plan)) || !charge(budget, root, 2)) return failure();
+        FormalKey key{&plan, {ref.frame, ref.value.getAsOpaquePointer()}};
+        auto formal = formals.find(key);
+        auto alias = aliases.find({&plan, *endpoint.bound});
+        if (formal != formals.end() || alias != aliases.end()) {
+          auto actual = bind(plan, endpoint.prefix,
+              formal != formals.end() ? formal->second : alias->second);
+          if (failed(actual)) return failure(); next = *actual;
         }
       }
       if (!next) if (auto argument = dyn_cast<BlockArgument>(endpoint.value))
@@ -213,7 +245,50 @@ private:
       if (!next) {
         auto bound = bindings(endpoint); if (failed(bound)) return failure();
         Value input;
-        if (auto extract = endpoint.value.getDefiningOp<ac::BitsExtractOp>()) {
+        if (auto toBits = endpoint.value.getDefiningOp<ac::EnumToBitsOp>()) {
+          if (failed(hardware.verifyResolvedOperation(toBits, *bound))) return failure();
+          input = toBits.getInput();
+        } else if (auto fromBits = endpoint.value.getDefiningOp<ac::EnumFromBitsOp>();
+                   fromBits && endpoint.value == fromBits.getValue()) {
+          if (failed(hardware.verifyResolvedOperation(fromBits, *bound))) return failure();
+          input = fromBits.getInput();
+        } else if (auto field = endpoint.value.getDefiningOp<ac::StructGetOp>()) {
+          if (failed(hardware.verifyResolvedOperation(field, *bound))) return failure();
+          auto source = operand(endpoint, field.getValue());
+          if (failed(source)) return failure();
+          auto base = canonical(*source, depth + 1);
+          if (failed(base)) return failure();
+          Endpoint aggregate = endpoints[*base];
+          if (auto create = aggregate.value ? aggregate.value.getDefiningOp<ac::StructCreateOp>() : ac::StructCreateOp()) {
+            auto aggregateBindings = bindings(aggregate);
+            if (failed(aggregateBindings) || failed(hardware.verifyResolvedOperation(create, *aggregateBindings))) return failure();
+            auto decl = hardware.lookupStruct(cast<ac::StructType>(create.getResult().getType()));
+            if (!decl) return failure();
+            for (auto [ordinal, member] : llvm::enumerate(decl.getFields())) {
+              if (!charge(budget, root)) return failure();
+              if (cast<DictionaryAttr>(member).getAs<StringAttr>("name") == field.getFieldAttr()) {
+                auto actual = operand(aggregate, create->getOperand(ordinal));
+                if (failed(actual)) return failure();
+                next = *actual; break;
+              }
+            }
+            if (!next) return failure();
+          } else {
+            // A projection's identity includes its exact old-Q/candidate base.
+            // No identity is shared merely because two FSMs have equal types.
+            auto key = std::make_pair(*base, field.getFieldAttr().getAsOpaquePointer());
+            if (!charge(budget, root, lookupCost())) return failure();
+            auto found = projections.find(key);
+            if (found != projections.end()) return found->second;
+            auto count = width(endpoint.value, *bound);
+            if (failed(count)) return failure();
+            Endpoint projected; Core::NodeView view; view.width = *count;
+            projected.synthetic = view;
+            auto node = save(std::move(projected));
+            if (failed(node) || !charge(budget, root, 8)) return failure();
+            projections.emplace(key, *node); return *node;
+          }
+        } else if (auto extract = endpoint.value.getDefiningOp<ac::BitsExtractOp>()) {
           auto low = integer(extract.getLow(), *bound, extract);
           auto from = width(extract.getInput(), *bound), to = width(endpoint.value, *bound);
           if (failed(low) || failed(from) || failed(to)) return failure();
@@ -249,6 +324,17 @@ private:
         auto pattern = llvm::APSInt((**code).zextOrTrunc(**bits), true);
         view.fullyKnown = Core::Constant{ac::MathIntAttr::get(root->getContext(), pattern), **bits};
       }
+    } else if (auto create = dyn_cast_or_null<ac::EnumCreateOp>(operation)) {
+      if (failed(hardware.verifyResolvedOperation(create, *bound))) return failure();
+      auto enumeration = hardware.resolveEnum(cast<ac::EnumType>(endpoint.value.getType()), create);
+      if (failed(enumeration)) return failure();
+      for (const auto &member : enumeration->members) {
+        if (!charge(budget, root, 1 + member.code.getCanonicalValue().size())) return failure();
+        if (member.name == create.getMemberAttr()) {
+          view.fullyKnown = Core::Constant{member.code, enumeration->width}; break;
+        }
+      }
+      if (!view.fullyKnown) return failure();
     } else {
       if (auto unary = dyn_cast_or_null<ac::BitsUnaryOp>(operation); unary && unary.getOpcode() == "not") view.kind = Core::NodeView::Not;
       else if (auto binary = dyn_cast_or_null<ac::BitsBinaryOp>(operation)) {
@@ -310,5 +396,15 @@ private:
   SourceCheckBudget &budget;
   SmallVector<Endpoint, 0> endpoints;
   std::map<Key, Node, Less> index;
+  std::map<std::pair<Node, const void *>, Node> projections;
+  llvm::DenseMap<Node, Node> canonicalNodes;
+  using OperandKey = std::pair<const ac::TransactionStatePlan *,
+      std::pair<uint64_t, std::pair<uint64_t, const void *>>>;
+  llvm::DenseMap<OperandKey, ac::BoundValueId> operands;
+  using FormalKey = std::pair<const ac::TransactionStatePlan *, std::pair<uint64_t, const void *>>;
+  llvm::DenseMap<FormalKey, ac::BoundValueId> formals;
+  llvm::DenseMap<std::pair<const ac::TransactionStatePlan *, ac::BoundValueId>, ac::BoundValueId> aliases;
+  llvm::DenseSet<const ac::TransactionStatePlan *> indexedPlans;
+  std::map<const void *, ac::HardwareBindings> scopeBindings;
   Core core;
 };

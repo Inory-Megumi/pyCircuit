@@ -122,10 +122,63 @@
       if (kind != Core::NodeView::Not) view.operands.push_back(right);
       return synthetic(std::move(view));
     };
-    Core proof([&](Node id, unsigned) -> FailureOr<Node> {
-      if (id >= nodes.size() || failed(budget.debit(1, state.storage))) return failure();
-      return id;
-    }, [&](Node id) -> FailureOr<Core::NodeView> {
+    std::map<std::pair<Node, const void *>, Node> projections;
+    std::function<FailureOr<Node>(Node, unsigned)> canonical = [&](Node id, unsigned depth) -> FailureOr<Node> {
+      if (depth >= 128 || id >= nodes.size() || failed(budget.debit(1, state.storage))) return failure();
+      if (!nodes[id].endpoint) return id;
+      auto endpoint = *nodes[id].endpoint;
+      if (failed(payScope(endpoint.scope, budget, state.storage))) return failure();
+      auto bindings = scopeBindings(endpoint.scope, analysis, budget, state.storage);
+      if (failed(bindings)) return failure();
+      Value input;
+      if (auto toBits = endpoint.value.getDefiningOp<EnumToBitsOp>()) {
+        if (failed(analysis.verifyResolvedOperation(toBits, *bindings))) return failure();
+        input = toBits.getInput();
+      } else if (auto fromBits = endpoint.value.getDefiningOp<EnumFromBitsOp>();
+                 fromBits && endpoint.value == fromBits.getValue()) {
+        if (failed(analysis.verifyResolvedOperation(fromBits, *bindings))) return failure();
+        input = fromBits.getInput();
+      } else if (auto field = endpoint.value.getDefiningOp<StructGetOp>()) {
+        if (failed(analysis.verifyResolvedOperation(field, *bindings))) return failure();
+        auto source = normal(field.getValue(), endpoint.scope);
+        if (failed(source)) return failure();
+        auto raw = bind(*source); if (failed(raw)) return failure();
+        auto base = canonical(*raw, depth + 1); if (failed(base)) return failure();
+        auto aggregate = nodes[*base].endpoint;
+        if (auto create = aggregate ? aggregate->value.getDefiningOp<StructCreateOp>() : StructCreateOp()) {
+          auto aggregateBindings = scopeBindings(aggregate->scope, analysis, budget, state.storage);
+          if (failed(aggregateBindings) || failed(analysis.verifyResolvedOperation(create, *aggregateBindings))) return failure();
+          auto decl = analysis.lookupStruct(cast<StructType>(create.getResult().getType()));
+          if (!decl) return failure();
+          for (auto [ordinal, member] : llvm::enumerate(decl.getFields())) {
+            if (failed(budget.debit(1, state.storage))) return failure();
+            if (cast<DictionaryAttr>(member).getAs<StringAttr>("name") == field.getFieldAttr()) {
+              auto actual = normal(create->getOperand(ordinal), aggregate->scope);
+              if (failed(actual)) return failure();
+              auto child = bind(*actual); if (failed(child)) return failure();
+              return canonical(*child, depth + 1);
+            }
+          }
+          return failure();
+        }
+        auto key = std::make_pair(*base, field.getFieldAttr().getAsOpaquePointer());
+        if (failed(budget.debit(orderedLookupCost(projections.size()), state.storage))) return failure();
+        auto found = projections.find(key); if (found != projections.end()) return found->second;
+        Core::NodeView view;
+        if (isa<BitsType, EnumType>(endpoint.resolvedType)) {
+          auto width = analysis.getPackedWidth(endpoint.resolvedType, *bindings, state.storage);
+          if (failed(width)) return failure(); view.width = *width;
+        }
+        auto result = synthetic(view);
+        if (failed(result) || failed(charge(budget, state.storage, 1, 8 * sizeof(void *)))) return failure();
+        projections.emplace(key, *result); return *result;
+      }
+      if (!input) return id;
+      auto actual = normal(input, endpoint.scope); if (failed(actual)) return failure();
+      auto child = bind(*actual); if (failed(child)) return failure();
+      return canonical(*child, depth + 1);
+    };
+    Core proof(canonical, [&](Node id) -> FailureOr<Core::NodeView> {
       if (id >= nodes.size() || failed(budget.debit(1, state.storage))) return failure();
       if (!nodes[id].endpoint) return nodes[id].view;
       // Copy before binding operands: appending nodes may reallocate the vector.
@@ -134,7 +187,7 @@
       auto bindings = scopeBindings(endpoint.scope, analysis, budget, state.storage);
       if (failed(bindings)) return failure();
       Core::NodeView view;
-      if (!isa<BitsType>(endpoint.resolvedType)) return view;
+      if (!isa<BitsType, EnumType>(endpoint.resolvedType)) return view;
       auto width = analysis.getPackedWidth(endpoint.resolvedType, *bindings, state.storage);
       if (failed(width)) return failure(); view.width = *width;
       auto *operation = endpoint.value.getDefiningOp();
@@ -148,6 +201,19 @@
           if (!number.isNegative() && number.getActiveBits() <= *width)
             view.fullyKnown = Core::Constant{integer, *width};
         }
+        return view;
+      }
+      if (auto create = dyn_cast_or_null<EnumCreateOp>(operation)) {
+        if (failed(analysis.verifyResolvedOperation(create, *bindings))) return failure();
+        auto enumeration = analysis.resolveEnum(cast<EnumType>(endpoint.resolvedType), create);
+        if (failed(enumeration)) return failure();
+        for (const auto &member : enumeration->members) {
+          if (failed(budget.debit(1 + member.code.getCanonicalValue().size(), create))) return failure();
+          if (member.name == create.getMemberAttr()) {
+            view.fullyKnown = Core::Constant{member.code, enumeration->width}; break;
+          }
+        }
+        if (!view.fullyKnown) return failure();
         return view;
       }
       if (auto unary = dyn_cast_or_null<BitsUnaryOp>(operation); unary && unary.getOpcode() == "not") view.kind = Core::NodeView::Not;

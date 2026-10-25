@@ -4,6 +4,8 @@
 #include "llvm/ADT/DenseSet.h"
 #include <string>
 #include <limits>
+#include <map>
+#include <tuple>
 
 using namespace mlir;
 namespace acir::ac::detail {
@@ -43,12 +45,17 @@ struct HardwareGrantProof::Impl {
       fail("owner-enable proof adapter uses a reserved node identity");
       return failure();
     }
+    if (auto found = canonicalNodes.find(node); found != canonicalNodes.end())
+      return found->second;
     auto canonical = canonicalize(node, depth);
     if (failed(canonical)) return failure();
     if (*canonical >= std::numeric_limits<Node>::max() - 1) {
       fail("owner-enable proof adapter returns a reserved node identity");
       return failure();
     }
+    if (!charge(4)) return failure();
+    canonicalNodes.try_emplace(node, *canonical);
+    canonicalNodes.try_emplace(*canonical, *canonical);
     return *canonical;
   }
   FailureOr<const NodeView *> describe(Node node) {
@@ -100,7 +107,11 @@ struct HardwareGrantProof::Impl {
     auto right = required(second, true, 0);
     auto together = conjunction(left, right);
     if (together.kind == Result::Failure) return failure();
-    return together.kind == Result::Impossible;
+    if (together.kind == Result::Impossible) return true;
+    // Address collision is a possible-alias relation, not known equality.
+    // Keep its existing conservative algebra until the bit proof models it.
+    if (collision) return false;
+    return bitDisjoint(first, second);
   }
   FailureOr<bool> disjointAtAddress(Node first, Node second, Node firstIndex, Node secondIndex) {
     auto left = canonical(firstIndex, 0), right = canonical(secondIndex, 0);
@@ -373,6 +384,8 @@ struct HardwareGrantProof::Impl {
     }
     return result;
   }
+  #include "HardwareGrantBitProof.inc"
+
   Canonicalize canonicalize;
   Inspect inspect;
   Charge debit;
@@ -382,6 +395,7 @@ struct HardwareGrantProof::Impl {
   llvm::DenseMap<QueryKey, Result> cache;
   llvm::DenseSet<QueryKey> visiting;
   llvm::DenseMap<Node, NodeView> views;
+  llvm::DenseMap<Node, Node> canonicalNodes;
 };
 HardwareGrantProof::HardwareGrantProof(Canonicalize canonicalize, Inspect inspect, Charge charge)
     : impl(std::make_unique<Impl>(std::move(canonicalize), std::move(inspect), std::move(charge))) {}
