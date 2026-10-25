@@ -55,11 +55,14 @@ setup(
         include=[
             "pycircuit",
             "pycircuit.*",
+            "arch_primitives",
+            "arch_primitives.*",
         ],
         exclude=["pycircuit._toolchain*"],
     ),
     package_data={
         "pycircuit": package_files(PACKAGE_ROOT / "_toolchain", PACKAGE_ROOT),
+        "arch_primitives": ["README.md", "ORIGIN.json"],
     },
     # Toolchain files are enumerated explicitly in package_data above.
     include_package_data=False,

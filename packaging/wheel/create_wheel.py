@@ -133,6 +133,10 @@ def _stage_installed_python(install_dir: Path, package_dir: Path) -> None:
     if not source.is_dir() or not (source / "cli.py").is_file():
         raise SystemExit(f"toolchain is missing installed pycircuit Python: {source}")
     _copytree(source, package_dir)
+    extension = source.parent / "arch_primitives"
+    if not extension.is_dir() or not (extension / "__init__.py").is_file():
+        raise SystemExit(f"toolchain is missing installed architecture extensions: {extension}")
+    _copytree(extension, package_dir.parent / "arch_primitives")
 
 
 def _drop_bundled_python_copy(package_dir: Path) -> None:

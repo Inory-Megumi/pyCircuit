@@ -1,0 +1,25 @@
+# Preserve exact qualification source bytes across Windows and Linux checkouts.
+python/arch_primitives/** -text
+compiler/include/pycircuit/Dialect/ACIR/SourceMethodAnalysis.h -text
+compiler/lib/Dialect/ACIR/HardwareGrantBitProof.inc -text
+compiler/lib/Dialect/ACIR/HardwareGrantProof.cpp -text
+compiler/lib/Dialect/ACIR/HardwareQueueProspectiveRoutingProof.inc -text
+compiler/lib/Dialect/ACIR/HardwareQueueResources.cpp -text
+compiler/lib/Dialect/ACIR/HardwareQueueTypedGrantProof.inc -text
+compiler/lib/Dialect/ACIR/HardwareSampledAdmission.cpp -text
+compiler/lib/Dialect/ACIR/HardwareSampledAdmission.h -text
+compiler/lib/Dialect/ACIR/HardwareSampledAdmissionCache.inc -text
+compiler/lib/Dialect/ACIR/HardwareSourceCheckPreflight.cpp -text
+compiler/lib/Dialect/ACIR/HardwareWriteDomainProof.inc -text
+compiler/lib/Dialect/ACIR/SourceMethodResolution.cpp -text
+compiler/lib/Transforms/LowerTransactions.cpp -text
+compiler/lib/Transforms/TransactionSourceGrantProof.inc -text
+docs/rfcs/serial-rule-method/sampled-admission.md -text
+docs/rfcs/serial-rule-method/sampled-body-effects.md -text
+tests/compiler/IR/HardwareGrantProofTest.cpp -text
+tests/compiler/IR/HardwareResourceDemandTest.cpp -text
+tests/compiler/IR/HardwareSampledAdmissionTest.cpp -text
+tests/compiler/IR/HardwareWriteDomainsTest.cpp -text
+tests/compiler/IR/MethodSummaryAuthorityTest.cpp -text
+tests/compiler/IR/SampledTransactionLoweringTest.cpp -text
+tests/compiler/lit/Source/Inputs/source_check_execution/resource_demand_typed_paths.py -text

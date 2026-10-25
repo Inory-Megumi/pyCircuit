@@ -9,6 +9,7 @@ verification; similar names do not imply duplicate implementations.
 | Change | Start here |
 | --- | --- |
 | Python syntax capture, CLI or publication | `python/pycircuit/` |
+| Architecture extension definitions and source expansion | `python/arch_primitives/` |
 | Types, hardware semantics or source lowering | `compiler/lib/Compiler/` and `compiler/lib/Dialect/ACIR/` |
 | Common IR transformations | `compiler/lib/Transforms/` |
 | Generated C++ or Verilog | Existing emitters in `compiler/lib/Compiler/` |
@@ -36,7 +37,7 @@ and retired compiler paths are absent from the active tree.
 | `examples/` | Flat, independently buildable hardware designs and their verification assets. | [Example catalog](https://github.com/PTO-ISA/pyCircuit/blob/main/examples/README.md) |
 | `include/` | Installed C++ Runtime interfaces/templates and standard Verilog storage leaves. | [Runtime semantics](../architecture/simulation.md) |
 | `packaging/` | SDK identity, relocation, platform/release validation and wheel assembly. | [Build profiles](../getting-started/installation.md) |
-| `python/` | The single importable `pycircuit` package, directly under `python/`. | [Source-unit workflow](source-unit-workflow.md) |
+| `python/` | The `pycircuit` package and the downstream `arch_primitives` extension package. | [Source-unit workflow](source-unit-workflow.md), [Extensions](../extensions/architecture.md) |
 | `schemas/` | Current SDK, consumer-lock, release-index and version-map JSON formats. | [SDK contracts](https://github.com/PTO-ISA/pyCircuit/tree/main/schemas) |
 | `runtime/` | Compiled implementation of the shared Runtime library. | [System execution](../architecture/system-execution.md) |
 | `tests/` | Compiler, Runtime, public-flow, packaging and unit verification. | [Test ownership below](#test-ownership) |

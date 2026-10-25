@@ -13,6 +13,27 @@ class _UniqueCycles(argparse.Action):
         setattr(namespace, self.dest, values)
 
 
+def _cmd_elaborate(args: argparse.Namespace) -> int:
+    import json
+    from pathlib import Path
+
+    from arch_primitives import ElaborationError, elaborate
+
+    try:
+        output = Path(args.output)
+        manifest_path = output.with_suffix(".components.json")
+        if not args.replace and (output.exists() or manifest_path.exists()):
+            raise ValueError("output already exists; use --replace to overwrite it")
+        if manifest_path.resolve() == Path(args.source).resolve():
+            raise ValueError("component manifest must not overwrite the authored source")
+        manifest = elaborate(args.source, output)
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    except (ElaborationError, OSError, SyntaxError, UnicodeError, ValueError) as error:
+        print(f"pycircuit elaborate: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _cmd_emit(args: argparse.Namespace) -> int:
     from ._driver import _DriverError
     from ._emit import emit_command
@@ -131,6 +152,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="pycircuit", allow_abbrev=False)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    elaborate = sub.add_parser(
+        "elaborate", help="Expand architecture extensions into ordinary Python source."
+    )
+    elaborate.add_argument("source", help="Authored source using architecture extensions")
+    elaborate.add_argument("-o", dest="output", required=True, help="Expanded Python source")
+    elaborate.add_argument("--replace", action="store_true")
+    elaborate.set_defaults(fn=_cmd_elaborate)
 
     compile_units = sub.add_parser(
         "compile",

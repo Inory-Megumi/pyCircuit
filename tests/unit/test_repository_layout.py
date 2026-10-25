@@ -26,6 +26,7 @@ def test_active_product_roots_are_documented() -> None:
     )
     for root in (
         "python/pycircuit/",
+        "python/arch_primitives/",
         "compiler/",
         "runtime/",
         "examples/hello_counter/",
@@ -43,7 +44,7 @@ def test_package_discovery_excludes_retired_siblings_and_namespace_debris(
     config = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     discovery = config["tool"]["setuptools"]["packages"]["find"]
     source = tmp_path / discovery["where"][0]
-    for name in ("pycircuit", "agentic_circuit", "semantic_core"):
+    for name in ("pycircuit", "arch_primitives", "arch_primitives/components", "agentic_circuit", "semantic_core"):
         package = source / name
         package.mkdir(parents=True)
         (package / "__init__.py").write_text("", encoding="utf-8")
@@ -60,7 +61,7 @@ def test_package_discovery_excludes_retired_siblings_and_namespace_debris(
         include=discovery.get("include", ["*"]),
         exclude=discovery.get("exclude", []),
     )
-    assert packages == ["pycircuit"]
+    assert set(packages) == {"pycircuit", "arch_primitives", "arch_primitives.components"}
 
 
 def test_ruff_per_file_ignores_match_existing_python_sources() -> None:
@@ -97,14 +98,20 @@ def test_retired_documentation_is_not_part_of_the_product_tree() -> None:
     assert (ROOT / "docs/development/known-limitations.md").is_file()
 
 
-def test_wheel_exposes_only_the_py_circuit_distribution_and_driver() -> None:
+def test_wheel_exposes_compiler_extensions_and_one_public_driver() -> None:
     setup = (ROOT / "packaging/wheel/setup.py").read_text(encoding="utf-8")
 
     assert 'name="pycircuit-hisi"' in setup
-    assert (
-        'include=[\n            "pycircuit",\n            "pycircuit.*",\n        ]'
-        in setup
+    tree = ast.parse(setup)
+    discovery = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "find_namespace_packages"
     )
+    includes = next(item.value for item in discovery.keywords if item.arg == "include")
+    assert set(ast.literal_eval(includes)) == {
+        "pycircuit", "pycircuit.*", "arch_primitives", "arch_primitives.*"
+    }
     assert '"pycircuit=pycircuit.cli:main"' in setup
     assert '"acc=' not in setup
     assert '"pycc=' not in setup

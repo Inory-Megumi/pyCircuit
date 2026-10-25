@@ -1,0 +1,21 @@
+{
+  "schema": "architecture-extension-origin/v1",
+  "repository": "https://github.com/Inory-Megumi/PyCircuit-Architecture-Lab",
+  "commit": "31e197b5d708dc03bd418850bd7c27f3f4efb23a",
+  "path": "python/arch_primitives",
+  "source_sha256": {
+    "__init__.py": "eaa062494b78bf105cca07f9b9839031fa0f20c23ae757f6fe6374daac62524a",
+    "__main__.py": "e641947a25e03105a9cf0a8077ededbebaaca854e24242a61e9cb8d44e9572f5",
+    "analysis/__init__.py": "63ad8e81cfb06ffaa7f913be435fca0b3a171197442b0df92d8e3e22fdbd83a6",
+    "analysis/fsm.py": "c19866216fc39f4e59e0bd0cce164d92171c21df1c32372b783ce9199de27935",
+    "components/__init__.py": "bb428a5b4426790e652128b32a441b37449a0fc6d65b9f71e8070b8ba79d6bd5",
+    "components/arbiter.py": "62b35033a9d86fc3e6c6e7b279997a64f40d04195f583ccd4cba6ffbfaf46139",
+    "components/fsm.py": "bce65df9b2fd81ab98ff4806273adf0a391931bf576a203aefcdba1653684560",
+    "components/fsm_composite.py": "24ba81ff4a5fa662a94fd9a1ebf70bcf4b922c54d2ebc262a390aa40a185f7e6",
+    "components/pipe.py": "36308b961db1b89e4b67ea5f9f4cd2546c6e07c3f831fa1f86c2d881667a86f7",
+    "components/table.py": "1b59f23841a1bc341eec57f9602da7e02a0ffb2052ca774abcdf4d00a91222ff",
+    "elaborate.py": "714dcc93af527424e9fb60e559bc91994580dd184fa12d78acd6cb339707a757",
+    "errors.py": "99d081eae1deb9c3995e1e85a57cb68352ab3a5018bea9e68925016ee9d28997",
+    "registry.py": "090ba05733b977c26060eb3d5b48b64a1f574ab140b7821474342873c493893f"
+  }
+}

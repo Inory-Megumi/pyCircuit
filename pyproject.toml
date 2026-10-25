@@ -59,11 +59,12 @@ pycircuit = "pycircuit.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]
-include = ["pycircuit", "pycircuit.*"]
+include = ["pycircuit", "pycircuit.*", "arch_primitives", "arch_primitives.*"]
 namespaces = false
 
 [tool.setuptools.package-data]
 pycircuit = ["**/*.py", "**/*.md"]
+arch_primitives = ["README.md", "ORIGIN.json"]
 
 [tool.black]
 line-length = 88

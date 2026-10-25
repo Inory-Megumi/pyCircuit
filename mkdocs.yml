@@ -88,6 +88,7 @@ nav:
       - Structs and Tables: reference/spec-collections.md
       - Enums: reference/spec-enums.md
       - Queues: reference/spec-queues.md
+      - Architecture Extensions: extensions/architecture.md
   - Architecture:
       - Overview: architecture/overview.md
       - Compiler Pipeline: architecture/compiler-pipeline.md
