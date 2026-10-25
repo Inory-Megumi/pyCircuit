@@ -1896,11 +1896,19 @@ private:
       if (!charge(budget, module, 8 + writer.ownerPath.size() + writer.transactionPath.size()))
         return failure();
       auto ownerKey = key(writer.ownerPath, writer.state);
+      // One writer summary represents every write of this exact transaction
+      // occurrence to this owner. Its first insertion checks all write pairs.
+      // Detect a repeated owner before comparing it with earlier writers again.
+      for (const auto &prior : summary) {
+        if (!charge(budget, module, 3 + prior.ownerPath.size() +
+                    prior.transactionPath.size())) return failure();
+        if (prior.plan == writer.plan &&
+            prior.transactionPath == writer.transactionPath &&
+            ownerKey == key(prior.ownerPath, prior.state)) return success();
+      }
       for (const auto &prior : summary) {
         if (!charge(budget, module)) return failure();
         if (ownerKey != key(prior.ownerPath, prior.state)) continue;
-        if (prior.plan == writer.plan &&
-            prior.transactionPath == writer.transactionPath) return success();
         bool sameScope = prior.transactionPath == writer.transactionPath;
         bool pairOrdered = sameScope &&
             (ordered(prior.plan, writer.plan) ||
@@ -2322,9 +2330,10 @@ public:
                    IRMapping &packageMap, MaterializationRoutes &routes,
                    ArrayRef<MaterializedTransaction> predecessors,
                    const PreparedTransactionLowering &lowering,
-                   SourceCheckBudget &budget)
+                   SourceCheckBudget &budget,
+                   BranchTypeAdmissionCache &branchTypes)
       : prepared(prepared), plan(*prepared.plan), packageMap(packageMap),
-        routes(routes), predecessors(predecessors), lowering(lowering), budget(budget), frames(plan.frames.size()),
+        routes(routes), predecessors(predecessors), lowering(lowering), budget(budget), branchTypes(branchTypes), frames(plan.frames.size()),
         versions(plan.versions.size()),
         branchResults(plan.branchResults.size()), stateJoins(plan.joins.size()),
         conditionalWrites(plan.writes.size()),
@@ -3190,7 +3199,7 @@ private:
   ArrayRef<MaterializedTransaction> predecessors;
   const PreparedTransactionLowering &lowering;
   SourceCheckBudget &budget;
-  BranchTypeAdmissionCache branchTypes;
+  BranchTypeAdmissionCache &branchTypes;
   llvm::DenseMap<LexicalKey, Value> lexical;
   SmallVector<IRMapping, 0> frames;
   SmallVector<MaterializedVersion, 0> versions;
@@ -3543,9 +3552,16 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   };
   SmallVector<Replacement> replacements;
   records.resize(prepared.transactions.size());
+  // Every RuleMaterializer asks about the same immutable original package and
+  // stable plan bindings. Share type admission within this materialization;
+  // independent source verification owns its own fresh cache.
+  if (!charge(budget, prepared.original,
+              SourceCheckBudget::bytes(sizeof(BranchTypeAdmissionCache))))
+    return failure();
+  BranchTypeAdmissionCache branchTypes;
   for (uint64_t transactionIndex : prepared.transactionSchedule) {
     const auto &transaction = prepared.transactions[transactionIndex];
-    RuleMaterializer builder(transaction, mapping, routes, records, prepared, budget);
+    RuleMaterializer builder(transaction, mapping, routes, records, prepared, budget, branchTypes);
     auto rule = builder.run();
     if (failed(rule))
       return failure();
@@ -4392,6 +4408,63 @@ private:
            << "transaction original-source proof failed: " << message;
   }
 
+  // Candidate IR is immutable for this independent proof. Index terminals by
+  // their actual module and identity once; duplicates remain in the bucket so
+  // the occurrence proof still enforces exactly one matching terminal. Never
+  // use the materializer's locator vectors to construct this inventory.
+  struct TerminalInventory {
+    using Index = std::map<const void *, SmallVector<Operation *, 0>>;
+    Index expects, observations;
+  };
+  std::map<Operation *, TerminalInventory> terminalInventories;
+
+  template <typename Map>
+  bool payTerminalLookup(const Map &map, Operation *site) {
+    for (uint64_t count = map.size() + 1; count; count >>= 1)
+      if (!charge(budget, site, 2)) return false;
+    return true;
+  }
+
+  template <typename Map>
+  bool payTerminalInsert(const Map &map, Operation *site) {
+    return charge(budget, site, 8 + SourceCheckBudget::bytes(
+        sizeof(typename Map::value_type) + 4 * sizeof(void *)));
+  }
+
+  FailureOr<ArrayRef<Operation *>> terminals(ac::ModuleOp module,
+                                            Attribute identity,
+                                            bool observation = false) {
+    if (!payTerminalLookup(terminalInventories, module)) return failure();
+    auto found = terminalInventories.find(module);
+    if (found == terminalInventories.end()) {
+      if (!payTerminalInsert(terminalInventories, module)) return failure();
+      found = terminalInventories.try_emplace(module).first;
+      for (Operation &operation : module.getBody().front()) {
+        if (!charge(budget, &operation)) return failure();
+        bool expect = isa<ac::SourceExpectOp>(operation);
+        bool observe = isa<ac::SourceObserveOp>(operation);
+        if (!expect && !observe) continue;
+        if (!charge(budget, &operation, 8)) return failure();
+        auto &index = observe ? found->second.observations : found->second.expects;
+        Attribute id = operation.getAttr(observe ? "ac.observation_id" : "ac.check_id");
+        const void *key = id ? id.getAsOpaquePointer() : nullptr;
+        if (!payTerminalLookup(index, &operation)) return failure();
+        auto entry = index.find(key);
+        if (entry == index.end()) {
+          if (!payTerminalInsert(index, &operation)) return failure();
+          entry = index.try_emplace(key).first;
+        }
+        if (!prepayAppend(budget, &operation, entry->second)) return failure();
+        entry->second.push_back(&operation);
+      }
+    }
+    auto &index = observation ? found->second.observations : found->second.expects;
+    if (!payTerminalLookup(index, module)) return failure();
+    auto entry = index.find(identity ? identity.getAsOpaquePointer() : nullptr);
+    if (entry == index.end()) return ArrayRef<Operation *>();
+    return ArrayRef<Operation *>(entry->second);
+  }
+
   std::unique_ptr<ac::SourceTransactionStateAnalysis> originalOrderAnalysis;
 
   FailureOr<ArrayRef<uint64_t>> originalPredecessors(
@@ -4528,10 +4601,12 @@ private:
       return failure();
     counting.push_back({resolvedRoot, 0});
     uint64_t expectedCount = 0;
+    unsigned expectedDepth = 0;
     while (!counting.empty()) {
       auto next = counting.pop_back_val();
       if (next.depth > 128 || !charge(budget, branch))
         return failure();
+      expectedDepth = std::max(expectedDepth, next.depth + 1);
       if (isa<ac::BitsType>(next.type)) {
         expectedCount = SourceCheckBudget::add(expectedCount, 1);
       } else if (isa<ac::EnumType>(next.type)) {
@@ -4585,11 +4660,13 @@ private:
       SmallVector<Value, 0> joinedFields;
     };
     SmallVector<Frame, 0> stack;
-    if (!charge(budget, branch, SourceCheckBudget::bytes(129 * sizeof(Frame))))
+    if (!charge(budget, branch, SourceCheckBudget::bytes(expectedDepth * sizeof(Frame))))
       return failure();
-    stack.reserve(129);
+    // The independent type walk established the exact maximum depth. Reserve
+    // only that storage, while retaining the same 128-level rejection bound.
+    stack.reserve(expectedDepth);
     auto push = [&](Type type, Value t, Value f) -> LogicalResult {
-      if (stack.size() >= 129 || !charge(budget, branch, 4))
+      if (stack.size() >= expectedDepth || !charge(budget, branch, 4))
         return failure();
       Frame frame{type, t, f, {}, 0, 0, {}};
       if (auto structure = dyn_cast<ac::StructType>(type)) {
@@ -7936,12 +8013,11 @@ private:
       if (guardRows[ordinal] != expectedGuard)
         return reject("original guard admission metadata differs");
       unsigned matches = 0;
-      for (auto expect :
-           module.getBody().front().getOps<ac::SourceExpectOp>()) {
-        if (!charge(budget, expect, 8))
-          return failure();
-        if (expect->getAttr("ac.check_id") != check.get("id"))
-          continue;
+      auto matchesByIdentity = terminals(module, check.get("id"));
+      if (failed(matchesByIdentity)) return failure();
+      for (Operation *terminal : *matchesByIdentity) {
+        if (!charge(budget, terminal, 8)) return failure();
+        auto expect = cast<ac::SourceExpectOp>(terminal);
         ++matches;
         if (expect.getKind() != "guard_known" ||
             expect->getAttr("location") != location ||
@@ -8008,12 +8084,11 @@ private:
             preparation.checkBase + 2 * (preparation.controls.size() + id);
         ac::SourceExpectOp found;
         unsigned matches = 0;
-        for (auto expect :
-             module.getBody().front().getOps<ac::SourceExpectOp>()) {
-          if (!charge(budget, expect, 8))
-            return failure();
-          if (expect->getAttr("ac.check_id") != identity)
-            continue;
+        auto matchesByIdentity = terminals(module, identity);
+      if (failed(matchesByIdentity)) return failure();
+      for (Operation *terminal : *matchesByIdentity) {
+        if (!charge(budget, terminal, 8)) return failure();
+        auto expect = cast<ac::SourceExpectOp>(terminal);
           ++matches;
           found = expect;
           NamedAttrList attrs;
@@ -8072,12 +8147,11 @@ private:
           operands.push_back(rule->getResult(pathResult + 1 + ordinal));
         ac::SourceObserveOp found;
         unsigned matches = 0;
-        for (auto observe :
-             module.getBody().front().getOps<ac::SourceObserveOp>()) {
-          if (!charge(budget, observe, 8))
-            return failure();
-          if (observe->getAttr("ac.observation_id") != identity)
-            continue;
+        auto matchesByIdentity = terminals(module, identity, true);
+      if (failed(matchesByIdentity)) return failure();
+      for (Operation *terminal : *matchesByIdentity) {
+        if (!charge(budget, terminal, 8)) return failure();
+        auto observe = cast<ac::SourceObserveOp>(terminal);
           ++matches;
           found = observe;
           if (observe.getKindAttr() != source.kind ||

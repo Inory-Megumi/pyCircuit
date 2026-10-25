@@ -107,6 +107,23 @@
             if (failed(knownLeft) || failed(knownRight)) return failure();
             disjoint |= *knownLeft && *knownRight;
           }
+        // Different predicates over the same scoped state can be exclusive
+        // without being syntactic opposites. Only retained branch selectors
+        // qualify: raw expressions and excluded controls never imply knownness.
+        if (!disjoint) for (const auto &x : (*a)->atoms) {
+          auto knownLeft = retainedSelector(*left.view, *left.proposal, x.value, left.scope);
+          if (failed(knownLeft)) return failure();
+          if (!*knownLeft) continue;
+          for (const auto &y : (*b)->atoms) {
+            auto knownRight = retainedSelector(*right.view, *right.proposal, y.value, right.scope);
+            if (failed(knownRight)) return failure();
+            if (!*knownRight) continue;
+            auto result = typedSelectorsDisjoint(x, y);
+            if (failed(result)) return failure();
+            if (*result) { disjoint = true; break; }
+          }
+          if (disjoint) break;
+        }
         if (!disjoint)
           return module->emitOpError() << "queue port conflict: actual-instance proposals lack opposite paths with retained selector knownness";
       }

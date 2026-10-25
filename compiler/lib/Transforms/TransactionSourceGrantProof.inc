@@ -47,6 +47,16 @@ public:
       if (bool(lf) != bool(rf)) break;
       if (!lf) bothIndexed = true;
     }
+    // A write can occur only on its authored branch path. Prove that necessary
+    // condition first, before adding Method admission predicates. Dropping
+    // conjuncts over-approximates the write enable, so disjointness remains
+    // sufficient; an inconclusive result falls back to the complete path.
+    auto branchLeft = path(first, firstPrefix, a, false);
+    auto branchRight = path(second, secondPrefix, c, false);
+    if (failed(branchLeft) || failed(branchRight)) return failure();
+    auto branchesDisjoint = core.disjoint(*branchLeft, *branchRight);
+    if (failed(branchesDisjoint)) return failure();
+    if (*branchesDisjoint) return true;
     auto lp = path(first, firstPrefix, a), rp = path(second, secondPrefix, c);
     if (failed(lp) || failed(rp)) return failure();
     if (bothIndexed && left.indices.size() == 1 && right.indices.size() == 1) {
@@ -360,7 +370,7 @@ private:
     endpoint.synthetic = std::move(view); return save(std::move(endpoint));
   }
   FailureOr<Node> path(const ac::TransactionStatePlan &plan, ArrayRef<ac::InstanceOp> prefix,
-                       ac::StateWriteId id) {
+                       ac::StateWriteId id, bool includeGuards = true) {
     const auto &write = plan.writes[id];
     auto result = bind(plan, prefix, write.authoredPath); if (failed(result)) return failure();
     auto ancestry = plan.versions[write.version].validity.path;
@@ -374,7 +384,7 @@ private:
       }
       return failure();
     };
-    for (const auto &guard : plan.guards) {
+    if (includeGuards) for (const auto &guard : plan.guards) {
       auto reached = dominates(plan.controls[guard.control].path);
       if (failed(reached)) return failure();
       if (!*reached) continue;

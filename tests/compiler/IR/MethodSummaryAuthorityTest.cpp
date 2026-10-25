@@ -3339,5 +3339,46 @@ TEST_F(MethodSummaryAuthorityTest,
   EXPECT_EQ(found->getVisibility(), builder.getStringAttr("private"));
 }
 
+TEST_F(MethodSummaryAuthorityTest,
+       ReceiverMethodSyntaxCacheIsLocalAndDoesNotRememberFailures) {
+    auto file = parse();
+    ASSERT_TRUE(file);
+    auto child = module(*file, "Child");
+    auto method = named<SourceMethodOp>(child, "act");
+    unsigned selected = 0;
+    bool refuse = true;
+    auto moduleMiss = [&](mlir::Operation *, mlir::Operation *) { return mlir::success(); };
+    auto selectedMethod = [&](SourceMethodOp, mlir::Operation *) {
+        ++selected;
+        return refuse ? mlir::failure() : mlir::success();
+    };
+    auto workStorage = [&](mlir::Operation *, uint64_t, uint64_t) { return mlir::success(); };
+    auto instanceBinding = [&](mlir::Operation *, mlir::Operation *, mlir::Operation *, mlir::Operation *) { return mlir::success(); };
+    SourceReceiverProofFees fees{moduleMiss, selectedMethod, workStorage, instanceBinding};
+    {
+        SourceReceiverProofContext proof;
+        EXPECT_TRUE(mlir::failed(capture([&] { return proof.method(child, "act", child, fees); })));
+        EXPECT_EQ(selected, 1u);
+        refuse = false;
+        ASSERT_TRUE(mlir::succeeded(capture([&] { return proof.method(child, "act", child, fees); }))) << diagnostics;
+        EXPECT_EQ(selected, 2u);
+        EXPECT_TRUE(mlir::succeeded(capture([&] { return proof.method(child, "act", child, fees); }))) << diagnostics;
+        EXPECT_EQ(selected, 2u);
+    }
+    auto oldForm = method->getAttr("ac.return_form");
+    method->setAttr("ac.return_form", builder.getStringAttr("invalid_return_form"));
+    {
+        SourceReceiverProofContext proof;
+        EXPECT_TRUE(mlir::failed(capture([&] { return proof.method(child, "act", child, fees); })));
+        EXPECT_EQ(selected, 3u);
+        EXPECT_TRUE(mlir::failed(capture([&] { return proof.method(child, "act", child, fees); })));
+        EXPECT_EQ(selected, 4u);
+    }
+    method->setAttr("ac.return_form", oldForm);
+    SourceReceiverProofContext proof;
+    EXPECT_TRUE(mlir::succeeded(capture([&] { return proof.method(child, "act", child, fees); }))) << diagnostics;
+    EXPECT_EQ(selected, 5u);
+}
+
 } // namespace
 } // namespace acir::ac

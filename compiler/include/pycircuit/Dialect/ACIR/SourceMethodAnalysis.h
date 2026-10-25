@@ -123,7 +123,8 @@ struct ResolvedSourceMethod {
 };
 
 /// A borrowed budget interface for one immutable receiver proof invocation.
-/// No callable, parameter binding, effect or actual-call verdict is cached.
+/// No parameter binding, effect or actual-call verdict is cached. Immutable
+/// Method declaration syntax is verified once per context.
 struct SourceReceiverProofFees {
   llvm::function_ref<mlir::LogicalResult(mlir::Operation *, mlir::Operation *)>
       moduleMiss;
@@ -151,6 +152,7 @@ public:
     std::unique_ptr<Instance[]> instances;
     size_t instanceCount = 0;
     std::unique_ptr<SourceMethodView[]> methods;
+    std::unique_ptr<bool[]> methodSyntaxVerified;
     size_t methodCount = 0;
     bool hasSummary = false;
   };

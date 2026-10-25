@@ -7,6 +7,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 
 using namespace mlir;
@@ -854,6 +855,7 @@ private:
     }
     return false;
   }
+#include "HardwareQueueTypedGrantProof.inc"
 #include "HardwareQueueProspectiveRoutingProof.inc"
   LogicalResult resourcePath(const SampledAdmissionView &view,
                              const SampledControlView &control, Value condition,

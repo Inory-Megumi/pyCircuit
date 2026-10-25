@@ -206,15 +206,18 @@ SourceReceiverProofContext::prepare(Operation *module, Operation *site,
     }
   }
   uint64_t bytes = inventory.instanceCount * sizeof(Instance) +
-                   inventory.methodCount * sizeof(SourceMethodView);
+                   inventory.methodCount * (sizeof(SourceMethodView) + sizeof(bool));
   if (failed(fees.workStorage(
           site, inventory.instanceCount + inventory.methodCount, bytes)))
     return failure();
   if (inventory.instanceCount)
     inventory.instances = std::make_unique<Instance[]>(inventory.instanceCount);
-  if (inventory.methodCount)
+  if (inventory.methodCount) {
     inventory.methods =
         std::make_unique<SourceMethodView[]>(inventory.methodCount);
+    inventory.methodSyntaxVerified =
+        std::make_unique<bool[]>(inventory.methodCount);
+  }
   size_t instanceIndex = 0, methodIndex = 0;
   auto instance = [&](StringAttr name, DictionaryAttr occurrence,
                       Operation *allocation,
@@ -306,10 +309,15 @@ SourceReceiverProofContext::method(Operation *module, StringRef name,
       continue;
     if (selected.definition || selected.row)
       return site->emitOpError() << "callee receiver method is ambiguous";
-    if (candidate.definition &&
-        (failed(fees.selectedMethod(candidate.definition, site)) ||
-         failed(candidate.definition.verify())))
-      return failure();
+    // The context borrows immutable IR. This verifier checks only the Method
+    // declaration; actual receiver bindings, call arguments and effects are
+    // resolved independently for every call below the lookup layer.
+    if (candidate.definition && !(**inventory).methodSyntaxVerified[i]) {
+      if (failed(fees.selectedMethod(candidate.definition, site)) ||
+          failed(candidate.definition.verify()))
+        return failure();
+      (**inventory).methodSyntaxVerified[i] = true;
+    }
     selected = candidate;
   }
   if (!selected.definition && !selected.row)

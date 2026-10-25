@@ -1854,5 +1854,63 @@ TEST_F(SampledTransactionLoweringTest,
   }
 }
 
+TEST_F(SampledTransactionLoweringTest,
+       TerminalInventoryRejectsDuplicatesAcrossIndependentProofSessions) {
+    for (bool observation : {false, true}) {
+        SCOPED_TRACE(observation);
+        auto staged = stage([&](mlir::ModuleOp file) { addAuthoredEffects(file); });
+        ASSERT_TRUE(staged);
+        ASSERT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+        auto index = transactionIndex(*staged, "run");
+        auto &record = staged->candidate.transactions[index];
+        mlir::Operation *terminal = observation
+            ? record.observations.front().getOperation()
+            : record.controls.front().terminal.getOperation();
+        auto *duplicate = terminal->clone();
+        auto *block = terminal->getBlock();
+        block->getOperations().insert(block->getTerminator()->getIterator(), duplicate);
+        rejects(*staged, "transaction original-source proof failed");
+        duplicate->erase();
+        EXPECT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+        expectOriginalUnchanged(*staged);
+    }
+}
+
+TEST_F(SampledTransactionLoweringTest,
+       TerminalInventoryKeepsExpectAndObservationIdentitiesSeparate) {
+    auto staged = stage([&](mlir::ModuleOp file) { addAuthoredEffects(file); });
+    ASSERT_TRUE(staged);
+    ASSERT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+    auto index = transactionIndex(*staged, "run");
+    auto &record = staged->candidate.transactions[index];
+    auto observation = record.observations.front();
+    auto original = observation->getAttr("ac.observation_id");
+    observation->setAttr("ac.observation_id", record.bodyChecks.front()->getAttr("ac.check_id"));
+    rejects(*staged, "original observation terminal inventory differs");
+    observation->setAttr("ac.observation_id", original);
+    EXPECT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+}
+
+TEST_F(SampledTransactionLoweringTest,
+       TerminalInventoryRejectsIdentityMutationAfterSuccessfulProof) {
+    for (bool observation : {false, true}) {
+        SCOPED_TRACE(observation);
+        auto staged = stage([&](mlir::ModuleOp file) { addAuthoredEffects(file); });
+        ASSERT_TRUE(staged);
+        ASSERT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+        auto index = transactionIndex(*staged, "run");
+        auto &record = staged->candidate.transactions[index];
+        mlir::Operation *terminal = observation
+            ? record.observations.front().getOperation()
+            : record.controls.front().terminal.getOperation();
+        auto name = observation ? "ac.observation_id" : "ac.check_id";
+        auto identity = terminal->getAttr(name);
+        terminal->removeAttr(name);
+        rejects(*staged, observation ? "original observation terminal inventory differs" : "original guard expect inventory differs");
+        terminal->setAttr(name, identity);
+        EXPECT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+    }
+}
+
 } // namespace
 } // namespace acir::ac

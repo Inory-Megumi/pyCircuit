@@ -62,8 +62,8 @@ protected:
   }
   OwningOpRef<ModuleOp> fixture(bool pureState = false, bool localPath = false,
                                bool prospective = false, bool rawBound = false,
-                               unsigned wrapper = 0) {
-    std::string fixtureName = wrapper ? "resource_demand_wrapper.py"
+                               unsigned wrapper = 0, unsigned typedPaths = 0) {
+    std::string fixtureName = typedPaths ? "resource_demand_typed_paths.py" : wrapper ? "resource_demand_wrapper.py"
         : rawBound ? "resource_demand_raw_bound_bits1.py"
         : prospective ? "resource_demand_prospective.py"
         : localPath ? "resource_demand_local_path.py"
@@ -88,6 +88,13 @@ else:
     if name == "resource_demand_wrapper.py" and sys.argv[4] == "2":
         assert text.count("child.push(7)") == 1
         text = text.replace("child.push(7)", "value = child.take()")
+if name == "resource_demand_typed_paths.py":
+    if sys.argv[5] == "2":
+        text = text.replace("if state.phase == Phase.BUSY and state.count != 3:",
+                            "if state.phase == Phase.EMPTY and state.count != 3:")
+    if sys.argv[5] == "3":
+        text = text.replace("if state.phase == Phase.BUSY and state.count != 3:",
+                            "if other.phase == Phase.BUSY and state.count != 3:")
 source = output.with_name(name)
 source.write_text(text)
 output.write_text(_emit_source_transport(_capture_source_file(source, source_root=source.parent)), encoding="utf-8")
@@ -95,7 +102,7 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
     std::vector<std::string> owned{
         PYCIRCUIT_TEST_PYTHON, "-c",
         script.str(),          PYCIRCUIT_TEST_REPO_ROOT,
-        path("capture.mlir"), fixtureName, std::to_string(wrapper)};
+        path("capture.mlir"), fixtureName, std::to_string(wrapper), std::to_string(typedPaths)};
     SmallVector<StringRef> arguments;
     for (auto &value : owned)
       arguments.push_back(value);
@@ -151,13 +158,14 @@ output.write_text(_emit_source_transport(_capture_source_file(source, source_roo
     }
     auto final =
         compiler::linkSourceUnits({{*unit->body, *unit->interface}},
-                                    wrapper ? "execution.resource_demand_wrapper.Top"
+                                    typedPaths ? "execution.resource_demand_typed_paths.Top" : wrapper ? "execution.resource_demand_wrapper.Top"
                   : rawBound ? "execution.resource_demand_raw_bound_bits1.Top"
                   : prospective ? "execution.resource_demand_prospective.ExerciseQueueHierarchy"
                   : localPath ? "execution.resource_demand_local_path.Top"
                   : pureState ? "execution.resource_demand_pure_state.Top"
                               : "execution.resource_demand.Top", error());
-    EXPECT_TRUE(succeeded(final)) << diagnostics;
+    if (typedPaths > 1) EXPECT_TRUE(failed(final)) << diagnostics;
+    else EXPECT_TRUE(succeeded(final)) << diagnostics;
     return succeeded(final) ? std::move(*final) : OwningOpRef<ModuleOp>{};
   }
   LogicalResult verifyFinal(ModuleOp file) {
@@ -938,4 +946,57 @@ TEST_F(HardwareResourceDemandTest, ChildPopSuffixStillRequiresParentQueueWiring)
   ASSERT_TRUE(changed);
   rejects(*file);
 }
+TEST_F(HardwareResourceDemandTest, TypedQueueSelectorsAcceptSharedEnumStructState) {
+    auto file = fixture(false, false, false, false, 0, 1);
+    ASSERT_TRUE(file) << diagnostics;
+    EXPECT_TRUE(succeeded(verifyFinal(*file))) << diagnostics;
+}
+
+TEST_F(HardwareResourceDemandTest, TypedQueueSelectorsRejectOverlapAndDistinctState) {
+    for (unsigned mode : {2u, 3u}) {
+        SCOPED_TRACE(mode);
+        diagnostics.clear();
+        auto file = fixture(false, false, false, false, 0, mode);
+        EXPECT_FALSE(file);
+        EXPECT_NE(diagnostics.find("queue port conflict"), std::string::npos) << diagnostics;
+    }
+}
+
+TEST_F(HardwareResourceDemandTest, TypedQueueSelectorsStillRequireRetainedKnownness) {
+    auto file = fixture(false, false, false, false, 0, 1);
+    ASSERT_TRUE(file) << diagnostics;
+    bool changed = false;
+    file->walk([&](ac::RuleOp rule) {
+        if (changed) return;
+        auto admission = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+        auto controls = admission ? admission.getAs<ArrayAttr>("controls") : ArrayAttr();
+        auto proposals = admission ? admission.getAs<ArrayAttr>("queue_proposals") : ArrayAttr();
+        if (!controls || !proposals || proposals.empty()) return;
+        SmallVector<Attribute> excluded;
+        for (auto [i, control] : llvm::enumerate(controls))
+            if (cast<DictionaryAttr>(control).getAs<StringAttr>("kind").getValue() == "branch_select")
+                excluded.push_back(attrs.getI64IntegerAttr(i));
+        if (excluded.empty()) return;
+        SmallVector<Attribute> rows(proposals.begin(), proposals.end());
+        NamedAttrList proposal(cast<DictionaryAttr>(rows[0]));
+        proposal.set("excluded_controls", attrs.getArrayAttr(excluded));
+        rows[0] = proposal.getDictionary(&context);
+        NamedAttrList updated(admission);
+        updated.set("queue_proposals", attrs.getArrayAttr(rows));
+        rule->setAttr("ac.sampled_admission", updated.getDictionary(&context));
+        changed = true;
+    });
+    ASSERT_TRUE(changed);
+    ac::HardwareAnalysis analysis(*file);
+    SmallVector<std::pair<ac::ModuleOp, ac::HardwareBindings>> scopes;
+    for (auto module : file->getBody()->getOps<ac::ModuleOp>()) {
+        ac::HardwareBindings bindings; bindings.owner = module;
+        scopes.push_back({module, bindings});
+    }
+    ac::detail::SourceCheckBudget budget({1 << 22});
+    diagnostics.clear();
+    EXPECT_TRUE(failed(ac::detail::verifyQueueResourceWiring(analysis, scopes, budget)));
+    EXPECT_NE(diagnostics.find("queue port conflict"), std::string::npos) << diagnostics;
+}
+
 } // namespace
