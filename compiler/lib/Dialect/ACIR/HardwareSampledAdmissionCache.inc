@@ -13,7 +13,6 @@ uint64_t sampledViewCopyWork(const SampledAdmissionView &view) {
     vector(view.controls);
     vector(view.bodyChecks);
     vector(view.observations);
-    vector(view.ehrEntries);
     vector(view.requirements);
     vector(view.resources);
     vector(view.queueProposals);
@@ -21,8 +20,6 @@ uint64_t sampledViewCopyWork(const SampledAdmissionView &view) {
     vector(view.writeDomains);
     for (const auto &observation : view.observations)
         vector(observation.values);
-    for (const auto &entry : view.ehrEntries)
-        vector(entry.predecessors);
     for (const auto &resource : view.resources)
         if (resource.prospective)
             vector(resource.prospective->priorPops);
@@ -91,7 +88,7 @@ FailureOr<SampledAdmissionView> SampledAdmissionParseScope::parse(
     if (failed(parsed))
         return failure();
     uint64_t copySizingWork = SourceCheckBudget::add(
-        SourceCheckBudget::add(parsed->observations.size(), parsed->ehrEntries.size()),
+        parsed->observations.size(),
         SourceCheckBudget::add(parsed->resources.size(), SourceCheckBudget::add(
             parsed->queueProposals.size(), parsed->memoryProposals.size())));
     if (failed(budget.debit(copySizingWork, rule)))

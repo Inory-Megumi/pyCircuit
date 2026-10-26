@@ -17,5 +17,27 @@
     "elaborate.py": "714dcc93af527424e9fb60e559bc91994580dd184fa12d78acd6cb339707a757",
     "errors.py": "99d081eae1deb9c3995e1e85a57cb68352ab3a5018bea9e68925016ee9d28997",
     "registry.py": "090ba05733b977c26060eb3d5b48b64a1f574ab140b7821474342873c493893f"
+  },
+  "source_updates": {
+    "components/arbiter.py": {
+      "sha256": "c38c5c8e1f794ff189297b60a364a1df41bec7ff9c308129bad618a546153e7e",
+      "reason": "Upstream integration and pinned Python style.",
+      "upstream_commit": "16453e2bdd39fdf72a65834f0c7e9857c505030e"
+    },
+    "components/arbiter_lru.py": {
+      "sha256": "0da536388402cf53783f3261458f7275a36aca093bc69c234c7f6fad8b5729b5",
+      "reason": "Upstream integration and pinned Python style.",
+      "upstream_commit": "16453e2bdd39fdf72a65834f0c7e9857c505030e"
+    },
+    "components/pipe.py": {
+      "sha256": "09bdd3cc57a042b95787efc3108dcb7640fe09cb9b4c929840194eaf8100e808",
+      "reason": "Upstream integration and pinned Python style.",
+      "upstream_commit": "16453e2bdd39fdf72a65834f0c7e9857c505030e"
+    },
+    "elaborate.py": {
+      "sha256": "877575ec25cd9e9bd97641edf4e3da46fc272317bb7cd9389c3887dba76388e5",
+      "reason": "Upstream integration and pinned Python style.",
+      "upstream_commit": "16453e2bdd39fdf72a65834f0c7e9857c505030e"
+    }
   }
 }

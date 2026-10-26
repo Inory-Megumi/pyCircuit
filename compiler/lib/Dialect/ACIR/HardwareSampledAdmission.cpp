@@ -425,7 +425,9 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
   auto row = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
   NamedAttrList core;
   if (row) core.assign(row.getValue());
-  core.erase("ehr_entries");
+  if ((row && row.get("ehr_entries")) || rule->hasAttr("ac.after") ||
+      rule->hasAttr("ac.callable_after"))
+    return rule->emitOpError() << "after ordering and EHR entry forwarding are retired";
   core.erase("requirements");
   core.erase("resources");
   core.erase("queue_proposals");
@@ -446,9 +448,6 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
   auto requirements = row ? row.getAs<ArrayAttr>("requirements") : ArrayAttr();
   if (row && row.get("requirements") && (!requirements || requirements.empty()))
     return rule->emitOpError() << "requirements requires a nonempty array";
-  auto ehrEntries = row ? row.getAs<ArrayAttr>("ehr_entries") : ArrayAttr();
-  if (row && row.get("ehr_entries") && (!ehrEntries || ehrEntries.empty()))
-    return rule->emitOpError() << "ehr_entries requires a nonempty array";
   if (!module || rule->getNumRegions() != 1 || !rule.getBody().hasOneBlock() ||
       failed(exact(core.getDictionary(rule.getContext()),
                    {"clock_capture", "reset_capture", "fire_result", "controls",
@@ -489,7 +488,7 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
       SourceCheckBudget::add(controls.size(), bodyChecks.size());
   uint64_t legacyTotal = SourceCheckBudget::add(
       checkBase, SourceCheckBudget::multiply(2, checkCount));
-  uint64_t total = SourceCheckBudget::add(legacyTotal, ehrEntries ? ehrEntries.size() : 0);
+  uint64_t total = legacyTotal;
   if (queueProposals)
     for (Attribute raw : queueProposals) {
       auto proposal = dyn_cast<DictionaryAttr>(raw);
@@ -996,44 +995,7 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
     result.observations.push_back(std::move(observation));
     path += 1 + *count;
   }
-  if (ehrEntries) {
-    for (auto [ordinal, raw] : llvm::enumerate(ehrEntries)) {
-      auto row = dyn_cast<DictionaryAttr>(raw);
-      if (failed(exact(row, {"state", "old_q_capture", "predecessors", "result"},
-                       rule, "EHR entry"))) return failure();
-      auto state = row.getAs<DictionaryAttr>("state");
-      auto oldQ = index(row, "old_q_capture", rule);
-      auto output = index(row, "result", rule);
-      auto predecessors = row.getAs<ArrayAttr>("predecessors");
-      if (failed(oldQ) || failed(output) || !predecessors || predecessors.empty() ||
-          failed(wholeStateID(state, rule)) ||
-          uint64_t(*oldQ) >= rule->getNumOperands() || uint64_t(*output) != legacyTotal + ordinal)
-        return rule->emitOpError() << "EHR entry has invalid owner/capture/result";
-      SampledEhrEntry entry{state, uint64_t(*oldQ), uint64_t(*output),
-          rule->getOperand(*oldQ), yielded->getOperand(*output), {}};
-      for (auto prior : predecessors) {
-        auto item = dyn_cast<DictionaryAttr>(prior);
-        if (failed(exact(item, {"registration", "data_capture", "enable_capture"},
-                         rule, "EHR predecessor"))) return failure();
-        auto registration = item.getAs<DictionaryAttr>("registration");
-        auto data = index(item, "data_capture", rule);
-        auto enable = index(item, "enable_capture", rule);
-        if (failed(data) || failed(enable) ||
-            failed(verifyOccurrence(registration, [&] { return rule->emitOpError(); })) ||
-            uint64_t(*data) >= rule->getNumOperands() || uint64_t(*enable) != uint64_t(*data) + 1 ||
-            uint64_t(*enable) >= rule->getNumOperands() ||
-            failed(bitOne(rule->getOperand(*enable), analysis, bindings, rule, budget)))
-          return rule->emitOpError() << "EHR predecessor has invalid proposal captures";
-        if (failed(charge(budget, rule, 1, sizeof(SampledEhrPredecessor)))) return failure();
-        entry.predecessors.push_back({registration, uint64_t(*data), uint64_t(*enable),
-                                      rule->getOperand(*data), rule->getOperand(*enable)});
-      }
-      if (failed(charge(budget, rule, 1, sizeof(SampledEhrEntry)))) return failure();
-      result.ehrEntries.push_back(std::move(entry));
-    }
-  }
-  uint64_t queueResult = SourceCheckBudget::add(legacyTotal,
-      ehrEntries ? ehrEntries.size() : 0);
+  uint64_t queueResult = legacyTotal;
   if (queueProposals && failed(charge(budget, rule, queueProposals.size(),
                                       sizeof(SampledQueueProposalView)))) return failure();
   if (queueProposals) for (Attribute raw : queueProposals) {
@@ -1479,28 +1441,45 @@ resolveTransactionState(ModuleOp relativeTo, DictionaryAttr stateID,
   return result;
 }
 
-FailureOr<HardwareIdentityEndpoint>
-makeIdentityEndpoint(Value value, const HardwareIdentityScope &scope,
+static FailureOr<HardwareIdentityEndpoint>
+makeIdentityEndpointImpl(Value value, const HardwareIdentityScope &scope,
                      const HardwareAnalysis &analysis,
-                     SourceCheckBudget &budget) {
+                     SourceCheckBudget &budget,
+                     const HardwareBindings *preparedBindings) {
   Operation *site =
       value ? valueSite(value) : analysis.getPackage().getOperation();
   if (!value ||
       failed(charge(budget, site, 1, sizeof(HardwareIdentityEndpoint))))
     return failure();
-  auto bound = scopeBindings(scope, analysis, budget, site);
-  if (failed(bound))
-    return failure();
+  std::optional<HardwareBindings> ownedBindings;
+  if (!preparedBindings) {
+      auto bound = scopeBindings(scope, analysis, budget, site);
+      if (failed(bound))
+          return failure();
+      ownedBindings = std::move(*bound);
+      preparedBindings = &*ownedBindings;
+  }
+  // Private proof callers supply bindings already established for this exact
+  // immutable scope. Public endpoint construction always binds fresh.
+  if (preparedBindings->owner != scopeOwner(scope, analysis))
+      return site->emitOpError() << "identity prepared bindings have the wrong owner";
   if (valueModule(value) != scopeOwner(scope, analysis))
     return site->emitOpError()
            << "identity SSA value does not belong to its actual owner scope";
   if (failed(budget.debit(1, site)))
     return failure();
-  auto type = analysis.resolveType(value.getType(), *bound, site);
+  auto type = analysis.resolveType(value.getType(), *preparedBindings, site);
   auto copied = copyScope(scope, budget, site);
   if (failed(type) || failed(copied))
     return failure();
   return HardwareIdentityEndpoint{value, std::move(*copied), *type};
+}
+
+FailureOr<HardwareIdentityEndpoint>
+makeIdentityEndpoint(Value value, const HardwareIdentityScope &scope,
+                     const HardwareAnalysis &analysis,
+                     SourceCheckBudget &budget) {
+    return makeIdentityEndpointImpl(value, scope, analysis, budget, nullptr);
 }
 
 namespace {
@@ -1513,9 +1492,11 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
                               const HardwareIdentityStopPolicy &stops,
                               const HardwareAnalysis &analysis,
                               SourceCheckBudget &budget,
-                              const IdentityStopIndex *stopIndex) {
+                              const IdentityStopIndex *stopIndex,
+                              const HardwareBindings *preparedBindings = nullptr) {
   auto checked =
-      makeIdentityEndpoint(endpoint.value, endpoint.scope, analysis, budget);
+      makeIdentityEndpointImpl(endpoint.value, endpoint.scope, analysis, budget,
+                               preparedBindings);
   if (failed(checked))
     return failure();
   if (!areEquivalentHardwareTypes(checked->resolvedType, endpoint.resolvedType))
@@ -1523,6 +1504,10 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
            << "stale identity endpoint resolved type";
   SmallVector<HardwareIdentityEndpoint> seen;
   HardwareIdentityEndpoint current = std::move(*checked);
+  // Bind an immutable actual scope once while following same-owner SSA edges.
+  // A hierarchy change discards this binding and takes the full endpoint path.
+  std::optional<HardwareBindings> ownedBindings;
+  const HardwareBindings *currentBindings = preparedBindings;
   for (;;) {
     Operation *site = valueSite(current.value);
     auto matchesStop = [&](const HardwareIdentityEndpoint &stop)
@@ -1571,21 +1556,28 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
         failed(payScope(current.scope, budget, site)))
       return failure();
     seen.push_back(current);
-    auto bound = scopeBindings(current.scope, analysis, budget, site);
-    if (failed(bound))
-      return failure();
-    Value next;
-    auto nextScope = copyScope(current.scope, budget, site);
-    if (failed(nextScope))
-      return failure();
-    if (auto extract = current.value.getDefiningOp<BitsExtractOp>()) {
-      if (failed(analysis.verifyResolvedOperation(extract, *bound)))
+    if (!currentBindings) {
+        auto bound = scopeBindings(current.scope, analysis, budget, site);
+        if (failed(bound))
+            return failure();
+        ownedBindings = std::move(*bound);
+        currentBindings = &*ownedBindings;
+    } else if (failed(budget.debit(1, site))) {
         return failure();
-      auto low = analysis.evaluateStatic(extract.getLow(), *bound, extract);
-      auto input = analysis.getPackedWidth(extract.getInput().getType(), *bound,
+    }
+    Value next;
+    // Same-owner captures/results do not change the scope. Borrow it until
+    // an actual hierarchy edge needs an owned path to edit.
+    const HardwareIdentityScope *nextScope = &current.scope;
+    std::optional<HardwareIdentityScope> changedScope;
+    if (auto extract = current.value.getDefiningOp<BitsExtractOp>()) {
+      if (failed(analysis.verifyResolvedOperation(extract, *currentBindings)))
+        return failure();
+      auto low = analysis.evaluateStatic(extract.getLow(), *currentBindings, extract);
+      auto input = analysis.getPackedWidth(extract.getInput().getType(), *currentBindings,
                                            extract);
       auto output =
-          analysis.getPackedWidth(current.resolvedType, *bound, extract);
+          analysis.getPackedWidth(current.resolvedType, *currentBindings, extract);
       if (failed(low) || failed(input) || failed(output))
         return failure();
       auto integer = dyn_cast<MathIntAttr>(*low);
@@ -1607,7 +1599,12 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
           return instance->emitOpError()
                  << "identity actual input ordinal is out of bounds";
         next = instance->getOperand(argument.getArgNumber());
-        nextScope->path.pop_back();
+        auto copied = copyScope(current.scope, budget, site);
+        if (failed(copied))
+            return failure();
+        changedScope = std::move(*copied);
+        changedScope->path.pop_back();
+        nextScope = &*changedScope;
       }
     } else if (auto result = dyn_cast<OpResult>(current.value)) {
       if (auto rule = dyn_cast<RuleOp>(result.getOwner())) {
@@ -1639,7 +1636,8 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
             auto nested = childScope(current.scope, instance, budget);
             if (failed(nested))
               return failure();
-            nextScope = std::move(nested);
+            changedScope = std::move(*nested);
+            nextScope = &*changedScope;
             next = yielded->getOperand(result.getResultNumber());
           }
         }
@@ -1647,6 +1645,25 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
     }
     if (!next)
       return current;
+    if (!changedScope) {
+        // No scope or binding copy is needed to replace the SSA payload.
+        // Preserve the complete ownership and resolved-type checks per edge.
+        Operation *nextSite = valueSite(next);
+        if (failed(budget.debit(1, nextSite)))
+            return failure();
+        if (valueModule(next) != scopeOwner(current.scope, analysis))
+            return nextSite->emitOpError()
+                   << "identity SSA value does not belong to its actual owner scope";
+        auto type = analysis.resolveType(next.getType(), *currentBindings, nextSite);
+        if (failed(type))
+            return failure();
+        if (!areEquivalentHardwareTypes(current.resolvedType, *type))
+            return site->emitOpError()
+                   << "hardware identity route changes resolved payload type";
+        current.value = next;
+        current.resolvedType = *type;
+        continue;
+    }
     auto resolved = makeIdentityEndpoint(next, *nextScope, analysis, budget);
     if (failed(resolved))
       return failure();
@@ -1655,6 +1672,8 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
       return site->emitOpError()
              << "hardware identity route changes resolved payload type";
     current = std::move(*resolved);
+    currentBindings = nullptr;
+    ownedBindings.reset();
   }
 }
 
@@ -1696,8 +1715,9 @@ public:
   IdentityMemo(const HardwareAnalysis &analysis, SourceCheckBudget &budget,
                HardwareIdentityStopPolicy policy)
       : analysis(analysis), budget(budget), policy(policy) {}
-  FailureOr<HardwareIdentityEndpoint>
-  normalize(Value value, const HardwareIdentityScope &scope) {
+  FailureOr<const HardwareIdentityEndpoint *>
+  borrow(Value value, const HardwareIdentityScope &scope,
+            const HardwareBindings *preparedBindings = nullptr) {
     if (!value)
       return failure();
     Operation *site = valueSite(value);
@@ -1730,26 +1750,46 @@ public:
       // SSA value in the full same scope resolve to the same payload type.
       if (!sameScope(entry.input.scope, scope))
         continue;
-      if (failed(charge(budget, site, 1, sizeof(HardwareIdentityEndpoint))) ||
-          failed(payScope(entry.output.scope, budget, site)))
-        return failure();
-      return entry.output;
+      return &entry.output;
     }
-    auto input = makeIdentityEndpoint(value, scope, analysis, budget);
+    // Both endpoint construction and its immediate normalization use the same
+    // immutable actual scope. Resolve its full bindings once for this miss.
+    std::optional<HardwareBindings> ownedBindings;
+    if (!preparedBindings) {
+        auto bound = scopeBindings(scope, analysis, budget, site);
+        if (failed(bound))
+            return failure();
+        ownedBindings = std::move(*bound);
+        preparedBindings = &*ownedBindings;
+    }
+    auto input = makeIdentityEndpointImpl(value, scope, analysis, budget,
+                                          preparedBindings);
     if (failed(input))
       return failure();
     auto output = normalizeIdentityEndpointImpl(*input, policy, analysis, budget,
-                                                &stopIndex);
+                                                &stopIndex, preparedBindings);
     if (failed(output) ||
         failed(
             charge(budget, valueSite(value), 1, entryStorageBytes())) ||
         failed(budget.debit(3, site)) ||
-        failed(payScope(input->scope, budget, valueSite(value))) ||
-        failed(payScope(output->scope, budget, valueSite(value))))
+        failed(payScope(input->scope, budget, valueSite(value))))
       return failure();
-    cache.emplace_hint(position, key,
-                       IdentityMemoEntry{std::move(*input), *output});
-    return std::move(*output);
+    auto saved = cache.emplace_hint(position, key,
+        IdentityMemoEntry{std::move(*input), std::move(*output)});
+    // std::map nodes remain stable across insertions; this memo never erases.
+    // Borrowers cannot change the endpoint or outlive the validation owner.
+    return &saved->second.output;
+  }
+
+  FailureOr<HardwareIdentityEndpoint>
+  normalize(Value value, const HardwareIdentityScope &scope,
+            const HardwareBindings *preparedBindings = nullptr) {
+    auto endpoint = borrow(value, scope, preparedBindings);
+    if (failed(endpoint) ||
+        failed(charge(budget, valueSite(value), 1, sizeof(HardwareIdentityEndpoint))) ||
+        failed(payScope((**endpoint).scope, budget, valueSite(value))))
+        return failure();
+    return **endpoint;
   }
 
   static uint64_t entryStorageBytes() {
@@ -3077,6 +3117,9 @@ struct State {
   bool commitProven = false;
   std::optional<bool> unordered;
   StateEndpoint endpoint;
+  // The complete candidate set is immutable after writers(). This theorem is
+  // state-wide; incoming-stage and physical D/E proofs remain per connection.
+  bool writeDomainsProven = false;
 };
 struct PrivateRoute {
   HardwareIdentityEndpoint endpoint;
@@ -3145,8 +3188,6 @@ public:
     budget.setPhase("sampled wiring writers");
     if (failed(writers()))
       return failure();
-    budget.setPhase("sampled wiring ordered entries");
-    if (failed(orderedEntries())) return failure();
     budget.setPhase("sampled wiring external inputs");
     if (failed(externalInputs()))
       return failure();
@@ -3435,8 +3476,8 @@ private:
   HardwareIdentityStopPolicy policy() const {
     return {HardwareIdentityTraversal::OrdinaryInstances, stops};
   }
-  FailureOr<HardwareIdentityEndpoint>
-  normal(Value value, const HardwareIdentityScope &scope) {
+  FailureOr<const HardwareIdentityEndpoint *>
+  normalBorrowed(Value value, const HardwareIdentityScope &scope) {
     if (!identity) {
       if (failed(charge(budget, valueSite(value), 1, sizeof(IdentityMemo))))
         return failure();
@@ -3445,7 +3486,22 @@ private:
           return failure();
       identity.emplace(analysis, budget, policy());
     }
-    return identity->normalize(value, scope);
+    auto owner = occurrenceFor(scope);
+    if (failed(owner))
+        return failure();
+    // expand() established this complete binding under the immutable root.
+    // occurrenceFor() authenticates the actual path, including same-callee
+    // siblings; no binding or verdict is shared with another proof root.
+    return identity->borrow(value, scope, &occurrences[*owner].bindings);
+  }
+  FailureOr<HardwareIdentityEndpoint>
+  normal(Value value, const HardwareIdentityScope &scope) {
+    auto endpoint = normalBorrowed(value, scope);
+    if (failed(endpoint) ||
+        failed(charge(budget, valueSite(value), 1, sizeof(HardwareIdentityEndpoint))) ||
+        failed(payScope((**endpoint).scope, budget, valueSite(value))))
+        return failure();
+    return **endpoint;
   }
   LogicalResult typeMatches(const HardwareIdentityEndpoint &endpoint, Type type,
                             Operation *site) {
@@ -3489,14 +3545,14 @@ private:
         *rst >= logical.terminal->getRegion(0).front().getNumArguments())
       return terminal->emitOpError() << "sampled effect logical owner requires "
                                         "declared clock/reset domain";
-    auto receiverClock = normal(
+    auto receiverClock = normalBorrowed(
         logical.terminal->getRegion(0).front().getArgument(*clk), *receiver);
-    auto receiverReset = normal(
+    auto receiverReset = normalBorrowed(
         logical.terminal->getRegion(0).front().getArgument(*rst), *receiver);
     if (failed(receiverClock) || failed(receiverReset))
       return failure();
-    if (!sameEndpoint(*receiverClock, clock) ||
-        !sameEndpoint(*receiverReset, reset))
+    if (!sameEndpoint(**receiverClock, clock) ||
+        !sameEndpoint(**receiverReset, reset))
       return terminal->emitOpError()
              << "sampled effect receiver domain differs from actual writer "
                 "physical clock/reset";
@@ -3679,50 +3735,6 @@ private:
       return failure();
     return effectDomain(entry, **logical, clock, reset, terminal);
   }
-  FailureOr<SmallVector<RuleOp>> finalPredecessors(RuleOp rule) {
-    SmallVector<RuleOp> result;
-    llvm::DenseSet<Operation *> active, seen;
-    std::function<LogicalResult(RuleOp, unsigned)> visit =
-        [&](RuleOp current, unsigned depth) -> LogicalResult {
-      if (depth > 128 || failed(budget.debit(1, current))) return failure();
-      if (!active.insert(current).second)
-        return current->emitOpError() << "final transaction after graph is cyclic";
-      if (Attribute raw = current->getAttr("ac.after")) {
-        auto after = dyn_cast<ArrayAttr>(raw);
-        if (!after) return current->emitOpError() << "final after requires an array";
-        llvm::DenseSet<Attribute> distinct;
-        auto module = cast<ModuleOp>(current->getParentOp());
-        for (Attribute identity : after) {
-          if (!distinct.insert(identity).second ||
-              failed(verifyOccurrence(dyn_cast<DictionaryAttr>(identity),
-                                      [&] { return current->emitOpError(); })))
-            return current->emitOpError() << "final after requires distinct registrations";
-          RuleOp predecessor;
-          unsigned count = 0;
-          for (auto possible : module.getBody().front().getOps<RuleOp>()) {
-            if (failed(budget.debit(1, current))) return failure();
-            if (possible->hasAttr("ac.sampled_admission") &&
-                identical(possible->getAttr("occurrence"), identity)) {
-              predecessor = possible;
-              ++count;
-            }
-          }
-          if (count != 1 || predecessor == current)
-            return current->emitOpError() << "final after requires one other local outer registration";
-          if (!seen.contains(predecessor)) {
-            if (failed(visit(predecessor, depth + 1))) return failure();
-            seen.insert(predecessor);
-            result.push_back(predecessor);
-          }
-        }
-      }
-      active.erase(current);
-      return success();
-    };
-    if (failed(visit(rule, 0))) return failure();
-    return result;
-  }
-
   LogicalResult allowUse(const HardwareIdentityScope &scope, Operation *operation,
                          unsigned operand, size_t state, PrivateRoute::Kind kind) {
     auto occurrence = occurrenceFor(scope);
@@ -3731,169 +3743,105 @@ private:
     return success();
   }
 
-  FailureOr<HardwareIdentityEndpoint> projectionRoot(
-      Value value, const HardwareIdentityScope &scope, ArrayRef<Attribute> path,
-      size_t state) {
-    auto current = normal(value, scope);
-    if (failed(current)) return failure();
-    for (Attribute step : llvm::reverse(path)) {
-      if (auto field = dyn_cast<StringAttr>(step)) {
-        auto get = current->value.getDefiningOp<StructGetOp>();
-        if (!get || get.getFieldAttr() != field)
-          return valueSite(current->value)->emitOpError() << "EHR field projection differs";
-        if (failed(allowUse(current->scope, get, 0, state, PrivateRoute::Data))) return failure();
-        current = normal(get.getValue(), current->scope);
-      } else {
-        auto expected = cast<IntegerAttr>(step).getValue().getZExtValue();
-        auto get = current->value.getDefiningOp<TableGetOp>();
-        if (!get) return valueSite(current->value)->emitOpError() << "EHR Table projection differs";
-        auto index = normal(get.getIndex(), current->scope);
-        if (failed(index)) return failure();
-        auto constant = index->value.getDefiningOp<BitsConstantOp>();
-        auto bound = scopeBindings(index->scope, analysis, budget, get);
-        if (!constant || failed(bound)) return get->emitOpError() << "EHR Table index must be static";
-        auto number = analysis.evaluateStatic(constant.getValue(), *bound, get);
-        if (failed(number)) return failure();
-        auto integer = dyn_cast<MathIntAttr>(*number);
-        if (!integer) return get->emitOpError() << "EHR Table index must be an integer";
-        llvm::APSInt actual(integer.getCanonicalValue());
-        if (actual.isNegative() || actual.getActiveBits() > 64 || actual.getZExtValue() != expected)
-          return get->emitOpError() << "EHR Table element ordinal differs";
-        if (failed(allowUse(current->scope, get, 0, state, PrivateRoute::Data))) return failure();
-        current = normal(get.getInput(), current->scope);
-      }
-      if (failed(current)) return failure();
-    }
-    return *current;
-  }
-
 #include "HardwareWriteDomainProof.inc"
 
-  FailureOr<HardwareIdentityEndpoint> peelSelection(
-      const HardwareIdentityEndpoint &selected,
-      const HardwareIdentityEndpoint &condition,
-      const HardwareIdentityEndpoint &whenTrue, size_t state) {
-    std::optional<HardwareIdentityEndpoint> whenFalse;
-    SmallVector<Attribute> path;
-    std::function<LogicalResult(Value, Type, const HardwareIdentityScope &, unsigned)> visit =
-        [&](Value value, Type type, const HardwareIdentityScope &scope, unsigned depth) -> LogicalResult {
-      if (depth > 128 || failed(budget.debit(1, valueSite(value)))) return failure();
-      auto actual = normal(value, scope);
-      if (failed(actual)) return failure();
-      if (auto structure = dyn_cast<StructType>(type)) {
-        auto create = actual->value.getDefiningOp<StructCreateOp>();
-        auto declaration = analysis.lookupStruct(structure);
-        if (!create || !declaration || create->getNumOperands() != declaration.getFields().size())
-          return valueSite(actual->value)->emitOpError() << "EHR Struct selection reconstruction differs";
-        for (auto [ordinal, raw] : llvm::enumerate(declaration.getFields())) {
-          auto field = cast<DictionaryAttr>(raw);
-          path.push_back(field.getAs<StringAttr>("name"));
-          auto bindings = scopeBindings(actual->scope, analysis, budget, create);
-          if (failed(bindings)) return failure();
-          auto fieldType = analysis.resolveType(field.getAs<TypeAttr>("type").getValue(), *bindings, create);
-          if (failed(fieldType) ||
-              failed(allowUse(actual->scope, create, ordinal, state, PrivateRoute::Data)) ||
-              failed(visit(create->getOperand(ordinal), *fieldType, actual->scope, depth + 1))) return failure();
-          path.pop_back();
-        }
-        return success();
-      }
-      if (auto table = dyn_cast<TableType>(type)) {
-        auto create = actual->value.getDefiningOp<TableCreateOp>();
-        auto bindings = scopeBindings(actual->scope, analysis, budget, valueSite(actual->value));
-        if (!create || failed(bindings))
-          return valueSite(actual->value)->emitOpError() << "EHR Table selection reconstruction differs";
-        auto count = analysis.getTableSize(table, *bindings, create);
-        if (failed(count) || create->getNumOperands() != *count) return failure();
-        Builder b(create.getContext());
-        for (uint64_t ordinal = 0; ordinal < *count; ++ordinal) {
-          path.push_back(b.getI64IntegerAttr(ordinal));
-          if (failed(allowUse(actual->scope, create, ordinal, state, PrivateRoute::Data)) ||
-              failed(visit(create->getOperand(ordinal), table.getElementType(), actual->scope, depth + 1))) return failure();
-          path.pop_back();
-        }
-        return success();
-      }
-      Value carrier = actual->value;
-      if (isa<EnumType>(type)) {
-        auto conversion = carrier.getDefiningOp<EnumFromBitsOp>();
-        if (!conversion || failed(allowUse(actual->scope, conversion, 0, state, PrivateRoute::Data)))
-          return valueSite(carrier)->emitOpError() << "EHR Enum selection reconstruction differs";
-        carrier = conversion.getInput();
-      }
-      auto chosen = normal(carrier, actual->scope);
-      if (failed(chosen)) return failure();
-      auto select = chosen->value.getDefiningOp<BitsSelectOp>();
-      if (!select) return valueSite(chosen->value)->emitOpError() << "EHR selection requires a four-state select";
-      auto predicate = normal(select.getCondition(), chosen->scope);
-      if (failed(predicate) || !sameEndpoint(*predicate, condition))
-        return select->emitOpError() << "EHR selection must use predecessor final enable";
-      if (failed(allowUse(chosen->scope, select, 0, state, PrivateRoute::Enable)) ||
-          failed(allowUse(chosen->scope, select, 1, state, PrivateRoute::Data)) ||
-          failed(allowUse(chosen->scope, select, 2, state, PrivateRoute::Data))) return failure();
-      Value trueValue = select.getTrueValue(), falseValue = select.getFalseValue();
-      if (isa<EnumType>(type)) {
-        auto t = trueValue.getDefiningOp<EnumToBitsOp>();
-        auto f = falseValue.getDefiningOp<EnumToBitsOp>();
-        if (!t || !f || failed(allowUse(chosen->scope, t, 0, state, PrivateRoute::Data)) ||
-            failed(allowUse(chosen->scope, f, 0, state, PrivateRoute::Data)))
-          return select->emitOpError() << "EHR Enum carrier inputs differ";
-        trueValue = t.getInput();
-        falseValue = f.getInput();
-      }
-      auto t = projectionRoot(trueValue, chosen->scope, path, state);
-      auto f = projectionRoot(falseValue, chosen->scope, path, state);
-      if (failed(t) || failed(f) || !sameEndpoint(*t, whenTrue))
-        return select->emitOpError() << "EHR selection data origin differs";
-      if (whenFalse && !sameEndpoint(*whenFalse, *f))
-        return select->emitOpError() << "EHR aggregate selection mixes fallback owners";
-      whenFalse = *f;
-      return success();
-    };
-    if (failed(visit(selected.value, states[state].payload, selected.scope, 0)) || !whenFalse)
-      return failure();
-    return *whenFalse;
-  }
+  using IndexedWriteEndpoints =
+      std::pair<HardwareIdentityEndpoint, HardwareIdentityEndpoint>;
 
-  FailureOr<HardwareIdentityEndpoint> peelEnableOr(
-      const HardwareIdentityEndpoint &combined,
-      const HardwareIdentityEndpoint &latest, size_t state) {
-    auto binary = combined.value.getDefiningOp<BitsBinaryOp>();
-    if (!binary || binary.getOpcode() != "or")
-      return valueSite(combined.value)->emitOpError() << "EHR commit enable requires admitted-write OR";
-    auto lhs = normal(binary.getLhs(), combined.scope);
-    auto rhs = normal(binary.getRhs(), combined.scope);
-    if (failed(lhs) || failed(rhs)) return failure();
-    if (failed(allowUse(combined.scope, binary, 0, state, PrivateRoute::Enable)) ||
-        failed(allowUse(combined.scope, binary, 1, state, PrivateRoute::Enable))) return failure();
-    if (sameEndpoint(*rhs, latest)) return *lhs;
-    if (sameEndpoint(*lhs, latest)) return *rhs;
-    return binary->emitOpError() << "EHR commit enable misses predecessor final enable";
-  }
-
-  LogicalResult proveOrderedCommit(const HardwareIdentityEndpoint &data,
-                                   const HardwareIdentityEndpoint &enable, size_t stateIndex) {
-    auto &state = states[stateIndex];
-    if (state.commitProven)
-      return success(state.data && state.enable && sameEndpoint(*state.data, data) &&
-                     sameEndpoint(*state.enable, enable));
-    HardwareIdentityEndpoint selected = data, combined = enable;
-    for (uint64_t index = state.candidates.size(); index > 1; --index) {
-      const auto &latest = state.candidates[index - 1];
-      auto fallback = peelSelection(selected, latest.enable, latest.data, stateIndex);
-      auto earlier = peelEnableOr(combined, latest.enable, stateIndex);
-      if (failed(fallback) || failed(earlier)) return failure();
-      if (failed(privateRoute(selected.value, selected.scope, stateIndex, PrivateRoute::Data)) ||
-          failed(privateRoute(combined.value, combined.scope, stateIndex, PrivateRoute::Enable))) return failure();
-      selected = *fallback;
-      combined = *earlier;
+  // Both producers retain the same raw ancestry/assignment path. Compare its
+  // complete canonical tree; a false factor never erases a reached index use.
+  FailureOr<bool> sameRequiredWritePath(
+      const HardwareIdentityEndpoint &actual,
+      const HardwareIdentityEndpoint &expected, Operation *site,
+      unsigned depth = 0) {
+    if (depth > 128)
+      return site->emitOpError() << "indexed required-use raw path exceeds the structural depth bound";
+    if (failed(charge(budget, site, 1,
+                      2 * sizeof(HardwareIdentityEndpoint *) + sizeof(unsigned))) ||
+        failed(payScope(actual.scope, budget, site)) ||
+        failed(payScope(expected.scope, budget, site))) return failure();
+    if (sameEndpoint(actual, expected)) return true;
+    if (!sameScope(actual.scope, expected.scope) ||
+        !areEquivalentHardwareTypes(actual.resolvedType, expected.resolvedType))
+      return false;
+    auto a = literal(actual, analysis, budget),
+         e = literal(expected, analysis, budget);
+    if (failed(a) || failed(e)) return failure();
+    if (a->has_value() || e->has_value())
+      return a->has_value() && e->has_value() && **a == **e;
+    auto actualAnd = actual.value.getDefiningOp<BitsBinaryOp>();
+    auto expectedAnd = expected.value.getDefiningOp<BitsBinaryOp>();
+    if (actualAnd && expectedAnd && actualAnd.getOpcode() == "and" &&
+        expectedAnd.getOpcode() == "and") {
+      auto al = normal(actualAnd.getLhs(), actual.scope),
+           el = normal(expectedAnd.getLhs(), expected.scope);
+      if (failed(al) || failed(el)) return failure();
+      auto left = sameRequiredWritePath(*al, *el, site, depth + 1);
+      if (failed(left) || !*left) return left;
+      auto ar = normal(actualAnd.getRhs(), actual.scope),
+           er = normal(expectedAnd.getRhs(), expected.scope);
+      if (failed(ar) || failed(er)) return failure();
+      return sameRequiredWritePath(*ar, *er, site, depth + 1);
     }
-    const auto &first = state.candidates.front();
-    if (!sameEndpoint(selected, first.data) || !sameEndpoint(combined, first.enable))
-      return state.storage->emitOpError() << "EHR physical commit chain has a wrong first writer";
-    state.data = data;
-    state.enable = enable;
-    state.commitProven = true;
+    auto actualNot = actual.value.getDefiningOp<BitsUnaryOp>();
+    auto expectedNot = expected.value.getDefiningOp<BitsUnaryOp>();
+    if (actualNot && expectedNot && actualNot.getOpcode() == "not" &&
+        expectedNot.getOpcode() == "not") {
+      auto ai = normal(actualNot.getInput(), actual.scope),
+           ei = normal(expectedNot.getInput(), expected.scope);
+      if (failed(ai) || failed(ei)) return failure();
+      return sameRequiredWritePath(*ai, *ei, site, depth + 1);
+    }
+    return false;
+  }
+
+  LogicalResult indexedWriteRequirements(
+      const SampledAdmissionView &sampled, const HardwareIdentityScope &scope,
+      ArrayRef<std::optional<IndexedWriteEndpoints>> domains) {
+    // Total-availability lowering intentionally omits all required-use rows.
+    if (sampled.requirements.empty()) return success();
+    auto isIndex = [&](const SampledValueRequirement &requirement)
+        -> FailureOr<bool> {
+      if (failed(budget.debit(1, sampled.rule))) return failure();
+      auto kind = requirement.kind.getValue();
+      if ((kind == "state_write" && requirement.operand > 2) ||
+          (kind == "formal_write" && requirement.operand > 3))
+        return sampled.rule->emitOpError() << "indexed write requirement exceeds the admitted single address";
+      return (kind == "state_write" && requirement.operand == 2) ||
+             (kind == "formal_write" && requirement.operand == 3);
+    };
+    uint64_t next = 0;
+    // Slots preserve the original whole-writer domain ordinal, including
+    // interleaved owners and writes overwritten by later source statements.
+    for (const auto &domain : domains) {
+      if (failed(budget.debit(1, sampled.rule))) return failure();
+      if (!domain) continue;
+      bool found = false;
+      while (next < sampled.requirements.size()) {
+        auto index = isIndex(sampled.requirements[next]);
+        if (failed(index)) return failure();
+        if (*index) { found = true; break; }
+        ++next;
+      }
+      if (!found)
+        return sampled.rule->emitOpError() << "indexed write domain lacks its ordered required-use witness";
+      const auto &requirement = sampled.requirements[next++];
+      auto payload = normal(requirement.operation->getOperand(0), scope);
+      auto path = normal(requirement.operation->getOperand(2), scope);
+      if (failed(payload) || failed(path) ||
+          failed(payScope(domain->first.scope, budget, sampled.rule)))
+        return failure();
+      auto samePath = sameRequiredWritePath(*path, domain->second, sampled.rule);
+      if (failed(samePath)) return failure();
+      if (!sameEndpoint(*payload, domain->first) || !*samePath)
+        return sampled.rule->emitOpError() << "indexed write required-use address or raw path differs from actual selected write";
+    }
+    for (; next < sampled.requirements.size(); ++next) {
+      auto index = isIndex(sampled.requirements[next]);
+      if (failed(index)) return failure();
+      if (*index)
+        return sampled.rule->emitOpError() << "indexed write requirement lacks its ordered actual domain";
+    }
     return success();
   }
 
@@ -3932,91 +3880,6 @@ private:
     writerAdmissions.emplace_hint(position, key, sampled);
     return sampled;
   }
-  FailureOr<const SampledAdmissionView *>
-  existingWriterAdmission(const Occurrence &entry, RuleOp rule) {
-    // writers() immediately precedes orderedEntries() in this immutable proof
-    // invocation and authenticates every writer at every exact occurrence.
-    // Reuse that current parsed view instead of recursively replaying sampled
-    // admission and queue wiring for the same key.
-    PrefixIndexKey key{rule.getOperation(),
-                       static_cast<uint64_t>(&entry - occurrences.data())};
-    if (failed(budget.debit(orderedLookupCost(writerAdmissions.size()), rule)))
-      return failure();
-    auto found = writerAdmissions.find(key);
-    if (found == writerAdmissions.end())
-      return rule->emitOpError()
-             << "ordered entry lacks its current authenticated writer view";
-    return found->second;
-  }
-  LogicalResult orderedEntries() {
-    for (const auto &entry : occurrences) {
-      if (!entry.wiring) continue;
-      for (const auto &writer : entry.wiring->writers) {
-        auto ancestors = finalPredecessors(writer.rule);
-        auto parsed = existingWriterAdmission(entry, writer.rule);
-        if (failed(ancestors) || failed(parsed)) return failure();
-        const auto *sampled = *parsed;
-        auto clock = normal(sampled->clock, entry.scope), reset = normal(sampled->reset, entry.scope);
-        if (failed(clock) || failed(reset)) return failure();
-        for (auto predecessor : *ancestors) {
-          auto priorView = existingWriterAdmission(entry, predecessor);
-          if (failed(priorView)) return failure();
-          const auto *prior = *priorView;
-          auto c = normal(prior->clock, entry.scope), r = normal(prior->reset, entry.scope);
-          if (failed(c) || failed(r) || !sameEndpoint(*c, *clock) || !sameEndpoint(*r, *reset))
-            return writer.rule->emitOpError() << "EHR predecessor physical domain differs";
-        }
-        llvm::DenseSet<size_t> seen;
-        for (const auto &visible : sampled->ehrEntries) {
-          if (!writer.rule->getResult(visible.result).use_empty())
-            return writer.rule->emitOpError() << "private EHR entry witness escapes";
-          auto state = target(entry, visible.stateID);
-          if (failed(state) || !seen.insert(*state).second)
-            return writer.rule->emitOpError() << "duplicate EHR entry owner";
-          auto oldQ = normal(visible.oldQ, entry.scope);
-          auto physical = normal(states[*state].storage->getResult(0), states[*state].scope);
-          auto selected = normal(visible.selected, entry.scope);
-          if (failed(oldQ) || failed(physical) || failed(selected) || !sameEndpoint(*oldQ, *physical))
-            return writer.rule->emitOpError() << "EHR entry must start from its owner's old Q";
-          SmallVector<std::pair<RuleOp, const TransactionCandidateView *>> expected;
-          for (auto predecessor : *ancestors)
-            for (const auto &prior : entry.wiring->writers) {
-              if (prior.rule != predecessor) continue;
-              for (const auto &candidate : prior.candidates) {
-                auto destination = target(entry, candidate.stateID);
-                if (failed(destination)) return failure();
-                if (*destination == *state) expected.push_back({predecessor, &candidate});
-              }
-            }
-          if (expected.size() != visible.predecessors.size() || expected.empty())
-            return writer.rule->emitOpError() << "EHR entry misses its declared predecessor writers";
-          for (auto [ordinal, actual] : llvm::enumerate(visible.predecessors)) {
-            auto [predecessor, candidate] = expected[ordinal];
-            auto data = normal(actual.data, entry.scope), enable = normal(actual.enable, entry.scope);
-            auto d = normal(candidate->data, entry.scope), e = normal(candidate->enable, entry.scope);
-            if (failed(data) || failed(enable) || failed(d) || failed(e) ||
-                !identical(actual.registration, predecessor->getAttr("occurrence")) ||
-                !sameEndpoint(*data, *d) || !sameEndpoint(*enable, *e))
-              return writer.rule->emitOpError() << "EHR entry captures the wrong predecessor proposal";
-            if (failed(allowUse(entry.scope, writer.rule, actual.dataCapture, *state, PrivateRoute::Data)) ||
-                failed(allowUse(entry.scope, writer.rule, actual.enableCapture, *state, PrivateRoute::Enable))) return failure();
-          }
-          for (uint64_t ordinal = visible.predecessors.size(); ordinal > 0; --ordinal) {
-            const auto &predecessor = visible.predecessors[ordinal - 1];
-            auto data = normal(predecessor.data, entry.scope), enable = normal(predecessor.enable, entry.scope);
-            if (failed(data) || failed(enable)) return failure();
-            auto fallback = peelSelection(*selected, *enable, *data, *state);
-            if (failed(fallback)) return failure();
-            selected = *fallback;
-          }
-          if (!sameEndpoint(*selected, *oldQ))
-            return writer.rule->emitOpError() << "EHR entry fallback differs from old Q";
-        }
-      }
-    }
-    return success();
-  }
-
   LogicalResult writers() {
     for (const auto &entry : occurrences) {
       if (!entry.wiring)
@@ -4117,6 +3980,13 @@ private:
                    << "statefree sampled pins differ from its owning module "
                       "domain";
         }
+        SmallVector<std::optional<IndexedWriteEndpoints>, 0> indexedDomains;
+        if (!sampled->requirements.empty()) {
+          if (failed(charge(budget, writer.rule, sampled->writeDomains.size(),
+                            sizeof(std::optional<IndexedWriteEndpoints>))))
+            return failure();
+          indexedDomains.resize(sampled->writeDomains.size());
+        }
         for (auto [candidateOrdinal, candidate] : llvm::enumerate(writer.candidates)) {
           auto stateIndex = target(entry, candidate.stateID);
           auto data = normal(candidate.data, entry.scope);
@@ -4124,35 +3994,17 @@ private:
           if (failed(stateIndex) || failed(data) || failed(enable))
             return failure();
           auto &state = states[*stateIndex];
-          auto ancestors = finalPredecessors(writer.rule);
-          if (failed(ancestors)) return failure();
           uint64_t position = state.candidates.size();
-          for (auto [ordinal, prior] : llvm::enumerate(state.candidates)) {
-            auto previous = finalPredecessors(prior.rule);
-            if (failed(previous)) return failure();
-            bool sameActualScope = prior.occurrence ==
-                                   size_t(&entry - occurrences.data());
-            bool follows = sameActualScope && llvm::is_contained(*ancestors, prior.rule);
-            bool precedes = sameActualScope && llvm::is_contained(*previous, writer.rule);
-            if (!sameActualScope) {
-              if (!ancestors->empty() || !previous->empty())
-                return writer.rule->emitOpError()
-                       << "cross-scope writers cannot participate in after composition";
-              // Unordered cross-scope writers are admitted by the independent
-              // write-domain grant proof below: different fields are disjoint
-              // and same-field/index pairs must prove exclusive enables.
-            } else if (prior.rule == writer.rule && prior.ordinal == candidateOrdinal) {
+          for (const auto &prior : state.candidates) {
+            if (failed(budget.debit(1, writer.rule))) return failure();
+            if (prior.occurrence == size_t(&entry - occurrences.data()) &&
+                prior.rule == writer.rule && prior.ordinal == candidateOrdinal)
               return writer.rule->emitOpError() << "duplicate actual transaction contributor";
-            }
-            bool unordered = !follows && !precedes;
-            if (state.unordered && *state.unordered != unordered)
-              return writer.rule->emitOpError() << "mixed ordered and unordered writers require a declared composition route";
-            state.unordered = unordered;
-            if (precedes) position = std::min(position, uint64_t(ordinal));
+            state.unordered = true;
           }
           if (state.clock && (!sameEndpoint(*state.clock, *clock) ||
                               !sameEndpoint(*state.reset, *reset)))
-            return writer.rule->emitOpError() << "ordered writers have different physical domains";
+            return writer.rule->emitOpError() << "independent writers have different physical domains";
           if (failed(typeMatches(*data, state.payload, writer.rule)))
             return failure();
           if (failed(payScope(data->scope, budget, writer.rule)) ||
@@ -4169,11 +4021,17 @@ private:
           state.enable = state.candidates.back().enable;
           state.clock = *clock;
           state.reset = *reset;
-          for (const auto &domain : sampled->writeDomains) {
+          for (auto [ordinal, domain] : llvm::enumerate(sampled->writeDomains)) {
             if (domain.candidate != candidateOrdinal) continue;
             auto checked = finalWriteDomain(domain, writer.rule, entry.scope, *stateIndex);
             if (failed(checked) || failed(privateRoute(writer.rule->getResult(domain.maskResult),
                   entry.scope, *stateIndex, PrivateRoute::Mask))) return failure();
+            if (!indexedDomains.empty() && checked->index) {
+              if (failed(payScope(checked->index->scope, budget, writer.rule)) ||
+                  failed(payScope(checked->path.scope, budget, writer.rule)))
+                return failure();
+              indexedDomains[ordinal] = IndexedWriteEndpoints{*checked->index, checked->path};
+            }
           }
           bool dff = state.endpoint.form == StateEndpointForm::DFF;
           if (failed(privateRoute(candidate.data, entry.scope, *stateIndex,
@@ -4187,17 +4045,19 @@ private:
                                   PrivateRoute::Enable)))
             return failure();
         }
+        if (failed(indexedWriteRequirements(*sampled, entry.scope, indexedDomains)))
+          return failure();
         for (const auto &guard : sampled->controls) {
           auto found = checkTerminal(**terminals, guard.id, writer.rule);
           if (failed(found))
             return failure();
           SourceExpectOp match = *found;
-          auto condition = normal(match.getCondition(), entry.scope);
-          auto reached = normal(match.getPath(), entry.scope);
+          auto condition = normalBorrowed(match.getCondition(), entry.scope);
+          auto reached = normalBorrowed(match.getPath(), entry.scope);
           auto expectedCondition =
-              normal(writer.rule->getResult(guard.rawResult), entry.scope);
+              normalBorrowed(writer.rule->getResult(guard.rawResult), entry.scope);
           auto expectedReached =
-              normal(writer.rule->getResult(guard.reachedResult), entry.scope);
+              normalBorrowed(writer.rule->getResult(guard.reachedResult), entry.scope);
           auto required =
               writer.rule->getAttrOfType<ArrayAttr>("ac.required_checks");
           auto record = cast<DictionaryAttr>(
@@ -4208,18 +4068,18 @@ private:
           if (match.getKind() != "guard_known" ||
               match.getLocationAttr() !=
                   record.getAs<DictionaryAttr>("location") ||
-              !sameEndpoint(*condition, *expectedCondition) ||
-              !sameEndpoint(*reached, *expectedReached) ||
+              !sameEndpoint(**condition, **expectedCondition) ||
+              !sameEndpoint(**reached, **expectedReached) ||
               match.getSampling().size() != 2)
             return match->emitOpError()
                    << "sampled expect differs from corresponding guard "
                       "suffix/kind/span";
-          auto sampleClock = normal(match.getSampling()[0], entry.scope);
-          auto sampleReset = normal(match.getSampling()[1], entry.scope);
+          auto sampleClock = normalBorrowed(match.getSampling()[0], entry.scope);
+          auto sampleReset = normalBorrowed(match.getSampling()[1], entry.scope);
           if (failed(sampleClock) || failed(sampleReset))
             return failure();
-          if (!sameEndpoint(*sampleClock, *clock) ||
-              !sameEndpoint(*sampleReset, *reset))
+          if (!sameEndpoint(**sampleClock, *clock) ||
+              !sameEndpoint(**sampleReset, *reset))
             return match->emitOpError()
                    << "sampled expect pins differ from owning Rule captures";
           if (failed(checkOwner(entry, guard.id, guard.invocation,
@@ -4239,12 +4099,12 @@ private:
           if (failed(found))
             return failure();
           SourceExpectOp match = *found;
-          auto condition = normal(match.getCondition(), entry.scope);
-          auto path = normal(match.getPath(), entry.scope);
+          auto condition = normalBorrowed(match.getCondition(), entry.scope);
+          auto path = normalBorrowed(match.getPath(), entry.scope);
           auto expectedCondition =
-              normal(writer.rule->getResult(body.conditionResult), entry.scope);
+              normalBorrowed(writer.rule->getResult(body.conditionResult), entry.scope);
           auto expectedPath =
-              normal(writer.rule->getResult(body.pathResult), entry.scope);
+              normalBorrowed(writer.rule->getResult(body.pathResult), entry.scope);
           auto required =
               writer.rule->getAttrOfType<ArrayAttr>("ac.required_checks");
           auto record = cast<DictionaryAttr>(
@@ -4255,8 +4115,8 @@ private:
           if (match.getKind() != "assert" || !match.getSampling().empty() ||
               match.getLocationAttr() !=
                   record.getAs<DictionaryAttr>("location") ||
-              !sameEndpoint(*condition, *expectedCondition) ||
-              !sameEndpoint(*path, *expectedPath))
+              !sameEndpoint(**condition, **expectedCondition) ||
+              !sameEndpoint(**path, **expectedPath))
             return match->emitOpError() << "sampled body assertion differs "
                                            "from designated suffix/kind/span";
           if (failed(checkOwner(entry, body.id, body.invocation,
@@ -4294,11 +4154,11 @@ private:
           for (uint64_t ordinal = 0; ordinal <= observation.valueCount;
                ++ordinal) {
             uint64_t slot = observation.pathResult + ordinal;
-            auto actual = normal(match->getOperand(ordinal), entry.scope);
-            auto expected = normal(writer.rule->getResult(slot), entry.scope);
+            auto actual = normalBorrowed(match->getOperand(ordinal), entry.scope);
+            auto expected = normalBorrowed(writer.rule->getResult(slot), entry.scope);
             if (failed(actual) || failed(expected))
               return failure();
-            if (!sameEndpoint(*actual, *expected))
+            if (!sameEndpoint(**actual, **expected))
               return match->emitOpError() << "sampled observation must consume "
                                              "its designated operand slot";
             if (failed(privateRoute(writer.rule->getResult(slot), entry.scope,
@@ -4378,12 +4238,12 @@ private:
                          const HardwareIdentityScope &scope, size_t stateIndex,
                          bool storage, Operation *site,
                          std::optional<size_t> stageOccurrence = {}) {
-    auto data = normal(dataValue, scope);
-    auto enable = normal(enableValue, scope);
+    auto data = normalBorrowed(dataValue, scope);
+    auto enable = normalBorrowed(enableValue, scope);
     if (failed(data) || failed(enable))
       return failure();
     auto &state = states[stateIndex];
-    if (failed(typeMatches(*data, state.payload, site)))
+    if (failed(typeMatches(**data, state.payload, site)))
       return failure();
     auto stage = stageOccurrence ? FailureOr<size_t>(*stageOccurrence)
                                  : occurrenceFor(scope);
@@ -4391,17 +4251,15 @@ private:
     auto staged = hasIncomingStage(*stage, stateIndex);
     if (failed(staged)) return failure();
     if (*staged) {
-      // The contributor inventory authenticates after edges only within one
-      // actual occurrence and rejects mixed composition. Ordered local writers
-      // retain their existing priority semantics, even when their owner is
-      // reached through a child incoming route.
+      // Independent contributors require disjoint write domains even when
+      // their owner is reached through a child incoming route.
       if (state.unordered.value_or(false) &&
           failed(proveWriteDomainsDisjoint(stateIndex))) return failure();
-      return proveStagedCommit(*data, *enable, *stage, stateIndex, storage);
+      return proveStagedCommit(**data, **enable, *stage, stateIndex, storage);
     }
     // Appended child ports may remain an unused zero pair while a descendant
     // Rule owns its state. Such a pair is never counted as a writer.
-    auto enLiteral = literal(*enable, analysis, budget);
+    auto enLiteral = literal(**enable, analysis, budget);
     if (failed(enLiteral))
       return failure();
     if (enLiteral->has_value() && !**enLiteral) {
@@ -4409,13 +4267,13 @@ private:
         return site->emitOpError()
                << "transaction writer has a missing live D/E route";
       if (storage) {
-        auto q = normal(state.storage->getResult(0), state.scope);
+        auto q = normalBorrowed(state.storage->getResult(0), state.scope);
         if (failed(q))
           return failure();
-        if (!sameEndpoint(*data, *q)) {
+        if (!sameEndpoint(**data, **q)) {
           if (state.endpoint.form == StateEndpointForm::Logical)
             return site->emitOpError() << "unwritten logical state requires candidate Q and false intent";
-          auto dataLiteral = literal(*data, analysis, budget);
+          auto dataLiteral = literal(**data, analysis, budget);
           if (failed(dataLiteral))
             return failure();
           auto incomingHold =
@@ -4428,10 +4286,10 @@ private:
                       "incoming D=zero, with E=zero";
         }
       } else {
-        auto q = normal(state.storage->getResult(0), state.scope);
+        auto q = normalBorrowed(state.storage->getResult(0), state.scope);
         if (failed(q)) return failure();
-        if (sameEndpoint(*data, *q)) return success();
-        auto dataLiteral = literal(*data, analysis, budget);
+        if (sameEndpoint(**data, **q)) return success();
+        auto dataLiteral = literal(**data, analysis, budget);
         if (failed(dataLiteral))
           return failure();
         if (!dataLiteral->has_value() || **dataLiteral)
@@ -4441,15 +4299,13 @@ private:
       return success();
     }
     if (state.candidates.size() > 1)
-      return state.unordered.value_or(false)
-          ? proveUnorderedCommit(*data, *enable, stateIndex)
-          : proveOrderedCommit(*data, *enable, stateIndex);
+      return proveUnorderedCommit(**data, **enable, stateIndex);
     if (state.candidates.size() == 1 &&
         state.candidates.front().occurrence != *stage)
-      return proveSingleCandidate(*data, *enable, stateIndex,
+      return proveSingleCandidate(**data, **enable, stateIndex,
                                   state.candidates.front());
-    if (!state.data || !state.enable || !sameEndpoint(*data, *state.data) ||
-        !sameEndpoint(*enable, *state.enable))
+    if (!state.data || !state.enable || !sameEndpoint(**data, *state.data) ||
+        !sameEndpoint(**enable, *state.enable))
       return site->emitOpError()
              << "transaction D/E origin differs from corresponding "
                 "candidate D/E or incoming pair";
@@ -4461,9 +4317,9 @@ private:
         continue;
       for (const auto &incoming : entry.wiring->incoming) {
         auto stateIndex = target(entry, incoming.stateID);
-        auto endpoint = normal(incoming.data, entry.scope);
+        auto endpoint = normalBorrowed(incoming.data, entry.scope);
         if (failed(stateIndex) || failed(endpoint) ||
-            failed(typeMatches(*endpoint, states[*stateIndex].payload,
+            failed(typeMatches(**endpoint, states[*stateIndex].payload,
                                entry.module)))
           return failure();
         if (entry.parent) {
@@ -4517,12 +4373,12 @@ private:
           return failure();
       }
       if (state.writer) {
-        auto clock = normal(endpoint.clock, state.scope);
-        auto reset = normal(endpoint.reset, state.scope);
+        auto clock = normalBorrowed(endpoint.clock, state.scope);
+        auto reset = normalBorrowed(endpoint.reset, state.scope);
         if (failed(clock) || failed(reset))
           return failure();
-        if (!sameEndpoint(*clock, *state.clock) ||
-            !sameEndpoint(*reset, *state.reset))
+        if (!sameEndpoint(**clock, *state.clock) ||
+            !sameEndpoint(**reset, *state.reset))
           return state.storage->emitOpError()
                  << "transaction sampled domain differs from target storage "
                     "physical pins";
@@ -4658,12 +4514,12 @@ private:
       return true;
     if (candidate >= states.size() || !states[candidate].enable)
       return false;
-    auto origin = normal(route.endpoint.value, route.endpoint.scope);
+    auto origin = normalBorrowed(route.endpoint.value, route.endpoint.scope);
     if (failed(origin))
       return failure();
     for (const auto &writer : states[candidate].candidates)
-      if (sameEndpoint(*origin, writer.enable)) return true;
-    return sameEndpoint(*origin, *states[candidate].enable);
+      if (sameEndpoint(**origin, writer.enable)) return true;
+    return sameEndpoint(**origin, *states[candidate].enable);
   }
   FailureOr<size_t> occurrenceFor(const HardwareIdentityScope &scope) {
     if (occurrences.empty())
@@ -4760,15 +4616,15 @@ private:
         return consumer->emitOpError() << "private write-domain mask escapes its verified composition";
 
       if (auto extract = dyn_cast<BitsExtractOp>(consumer)) {
-        auto next = makeIdentityEndpoint(extract->getResult(0), endpoint.scope,
-                                         analysis, budget);
+        auto next = makeIdentityEndpointImpl(extract->getResult(0), endpoint.scope,
+                                            analysis, budget, &owner.bindings);
         if (failed(next))
           return failure();
-        auto canonical = normal(extract->getResult(0), endpoint.scope);
-        auto original = normal(endpoint.value, endpoint.scope);
+        auto canonical = normalBorrowed(extract->getResult(0), endpoint.scope);
+        auto original = normalBorrowed(endpoint.value, endpoint.scope);
         if (failed(canonical) || failed(original))
           return failure();
-        if (!sameEndpoint(*canonical, *original))
+        if (!sameEndpoint(**canonical, **original))
           return extract->emitOpError() << "private transaction value escapes "
                                            "through nonidentity extract";
         if (failed(visitPrivate(*next, route, seen, currentOccurrence)))
@@ -4786,7 +4642,8 @@ private:
       if (auto splat = dyn_cast<TableSplatOp>(consumer)) {
         if (route.kind != PrivateRoute::Enable)
           return splat->emitOpError() << "private transaction data escapes through splat";
-        auto next = makeIdentityEndpoint(splat.getResult(), endpoint.scope, analysis, budget);
+        auto next = makeIdentityEndpointImpl(splat.getResult(), endpoint.scope,
+                                            analysis, budget, &owner.bindings);
         if (failed(next) || failed(visitPrivate(*next, route, seen, currentOccurrence)))
           return failure();
         continue;
@@ -4913,7 +4770,8 @@ private:
         Value next = route.kind == PrivateRoute::Data ? Value(matched->data)
                                                       : Value(matched->enable);
         auto nextEndpoint =
-            makeIdentityEndpoint(next, *nested, analysis, budget);
+            makeIdentityEndpointImpl(next, *nested, analysis, budget,
+                                     &childEntry.bindings);
         if (failed(nextEndpoint) ||
             failed(visitPrivate(*nextEndpoint, route, seen, *childIndex)))
           return failure();
@@ -4928,8 +4786,9 @@ private:
                  << "private transaction value escapes through "
                     "public/unterminated Module or Rule output";
         const auto &parent = occurrences[*owner.parent];
-        auto next = makeIdentityEndpoint(owner.allocation->getResult(operand),
-                                         parent.scope, analysis, budget);
+        auto next = makeIdentityEndpointImpl(owner.allocation->getResult(operand),
+                                            parent.scope, analysis, budget,
+                                            &parent.bindings);
         if (failed(next) ||
             failed(visitPrivate(*next, route, seen, *owner.parent)))
           return failure();

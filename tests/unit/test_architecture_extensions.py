@@ -16,9 +16,8 @@ from pathlib import Path
 from arch_primitives import elaborate
 from pycircuit.cli import main
 
-
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = '''import pycircuit as ac
+SOURCE = """import pycircuit as ac
 from arch_primitives import Pipe, Table
 
 @ac.module
@@ -31,8 +30,7 @@ def ExtensionFixture():
         pipe.push(7)
         table.write(0, 7)
 
-    transfer()
-'''
+"""
 
 
 class ArchitectureExtensionTests(unittest.TestCase):
@@ -55,7 +53,9 @@ class ArchitectureExtensionTests(unittest.TestCase):
         self.assertEqual(self.output.read_bytes(), expected.read_bytes())
         actual = json.loads(self.output.with_suffix(".components.json").read_text())
         self.assertEqual(actual, expected_manifest)
-        self.assertEqual({item["component"] for item in actual["instances"]}, {"Pipe", "Table"})
+        self.assertEqual(
+            {item["component"] for item in actual["instances"]}, {"Pipe", "Table"}
+        )
         self.assertFalse(actual["compiler_builtin"])
         ast.parse(self.output.read_text())
 
@@ -85,18 +85,29 @@ class ArchitectureExtensionTests(unittest.TestCase):
     def test_source_expansion_never_executes_author_code(self):
         marker = self.source.with_name("executed")
         self.source.write_text(
-            f'from pathlib import Path\nPath({str(marker)!r}).write_text("executed")\n' + SOURCE,
+            f'from pathlib import Path\nPath({str(marker)!r}).write_text("executed")\n'
+            + SOURCE,
             encoding="ascii",
         )
         self.assertEqual(self.call(), (0, ""))
         self.assertFalse(marker.exists())
 
-    def test_imported_extension_source_preserves_recorded_qualification_bytes(self):
+    def test_extension_source_preserves_import_identity_and_records_later_updates(self):
         package = ROOT / "python/arch_primitives"
         origin = json.loads((package / "ORIGIN.json").read_text())
-        for relative, expected in origin["source_sha256"].items():
+        current = dict(origin["source_sha256"])
+        current.update(
+            {
+                relative: update["sha256"]
+                for relative, update in origin.get("source_updates", {}).items()
+            }
+        )
+        for relative, expected in current.items():
             with self.subTest(relative=relative):
-                self.assertEqual(hashlib.sha256((package / relative).read_bytes()).hexdigest(), expected)
+                self.assertEqual(
+                    hashlib.sha256((package / relative).read_bytes()).hexdigest(),
+                    expected,
+                )
 
     def test_wheel_stages_extensions_from_the_installed_sdk(self):
         sys.path.insert(0, str(ROOT / "packaging/wheel"))
@@ -110,7 +121,10 @@ class ArchitectureExtensionTests(unittest.TestCase):
         python_root = prefix / "share/pycircuit/python"
         for name, files in {
             "pycircuit": {"cli.py": "# installed compiler driver\n"},
-            "arch_primitives": {"__init__.py": "# installed extension\n", "ORIGIN.json": "{}\n"},
+            "arch_primitives": {
+                "__init__.py": "# installed extension\n",
+                "ORIGIN.json": "{}\n",
+            },
         }.items():
             for relative, content in files.items():
                 target = python_root / name / relative

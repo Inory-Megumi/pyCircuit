@@ -46,9 +46,3 @@ def Top():
             count=state.count + 1)
         other = Control(phase=Phase.BUSY if other.phase == Phase.EMPTY else Phase.EMPTY,
             count=other.count + 1)
-
-    first()
-    second()
-    take_first()
-    take_second()
-    tick()

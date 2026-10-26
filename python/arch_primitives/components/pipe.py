@@ -1,9 +1,10 @@
 """Pipe marker, configuration, method checks and native module generation."""
 
 import ast
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
+
 from ..errors import ElaborationError
 from ..registry import ComponentDefinition
 
@@ -15,7 +16,9 @@ class Pipe:
         return cls
 
     def __new__(cls, *args, **kwargs):
-        raise TypeError("Pipe is a hardware source construct; use arch_primitives.elaborate")
+        raise TypeError(
+            "Pipe is a hardware source construct; use arch_primitives.elaborate"
+        )
 
 
 class PipeError(ElaborationError):
@@ -40,8 +43,13 @@ def pipe_definition(config):
     name, payload, count = config.name, config.payload, config.stages
     lines = []
     if config.flow != "none":
-        lines += ["@ac.struct", f"class {name}Sample:", "    valid: ac.u1",
-                  f"    payload: {payload}", ""]
+        lines += [
+            "@ac.struct",
+            f"class {name}Sample:",
+            "    valid: ac.u1",
+            f"    payload: {payload}",
+            "",
+        ]
     if config.flow == "none":
         lines += ["@ac.module", f"def {name}(incoming: {payload}) -> {payload}:"]
         for index in range(count):
@@ -49,36 +57,50 @@ def pipe_definition(config):
         lines += ["", "    @ac.rule", "    def advance() -> None:"]
         for index in reversed(range(1, count)):
             lines.append(f"        saved{index} = saved{index - 1}")
-        lines += ["        saved0 = incoming", "", "    advance()",
-                  f"    return saved{count - 1}"]
-    elif config.flow == "valid_only":
-        lines += ["@ac.module", f"def {name}():"]
-        for index in range(count):
-            lines += [f"    saved{index}: {payload} = 0", f"    valid{index}: ac.u1 = 0"]
-        lines += ["", "    @ac.rule", "    def advance() -> None:"]
-        for index in reversed(range(1, count)):
-            lines += [f"        valid{index} = valid{index - 1}",
-                      f"        if valid{index - 1}:", f"            saved{index} = saved{index - 1}"]
-        lines += ["        valid0 = 0", "", "    @ac.method(after=(advance,))",
-                  f"    def push(value: {payload}) -> None:",
-                  "        saved0 = value", "        valid0 = 1", "",
-                  "    @ac.method", f"    def view() -> {name}Sample:",
-                  f"        return {name}Sample(valid=valid{count - 1}, payload=saved{count - 1})",
-                  "", "    advance()"]
+        lines += ["        saved0 = incoming", f"    return saved{count - 1}"]
     else:
         lines += ["@ac.module", f"def {name}():"]
         for index in range(count):
-            lines.append(f'    slot{index} = ac.queue[{payload}](depth=1, latency=1, ready_policy="downstream_pop")')
+            lines.append(
+                f'    slot{index} = ac.queue[{payload}](depth=1, latency=1, ready_policy="downstream_pop")'
+            )
         for index in range(count - 1):
-            lines += ["", "    @ac.rule", f"    def transfer{index}() -> None:",
-                      f"        value = slot{index}.pop()", f"        slot{index + 1}.push(value)"]
-        lines += ["", "    @ac.method", f"    def push(value: {payload}) -> None:",
-                  "        slot0.push(value)", "", "    @ac.method",
-                  f"    def pop() -> {payload}:", f"        return slot{count - 1}.pop()",
-                  "", "    @ac.method", f"    def view() -> {name}Sample:",
-                  f"        return {name}Sample(valid=slot{count - 1}.valid, payload=slot{count - 1}.data)"]
-        for index in range(count - 1):
-            lines += ["", f"    transfer{index}()"]
+            lines += [
+                "",
+                "    @ac.rule",
+                f"    def transfer{index}() -> None:",
+                f"        value = slot{index}.pop()",
+                f"        slot{index + 1}.push(value)",
+            ]
+        if config.flow == "valid_only":
+            # Every occupied stage advances each epoch. The unconditional sink
+            # drains the final stage, so native downstream-pop credit permits
+            # simultaneous replacement without an author-visible ready guard.
+            lines += [
+                "",
+                "    @ac.rule",
+                "    def retire() -> None:",
+                f"        expired = slot{count - 1}.pop()",
+            ]
+        lines += [
+            "",
+            "    @ac.method",
+            f"    def push(value: {payload}) -> None:",
+            "        slot0.push(value)",
+        ]
+        if config.flow == "valid_ready":
+            lines += [
+                "",
+                "    @ac.method",
+                f"    def pop() -> {payload}:",
+                f"        return slot{count - 1}.pop()",
+            ]
+        lines += [
+            "",
+            "    @ac.method",
+            f"    def view() -> {name}Sample:",
+            f"        return {name}Sample(valid=slot{count - 1}.valid, payload=slot{count - 1}.data)",
+        ]
     return ast.parse("\n".join(lines) + "\n").body
 
 
@@ -101,65 +123,111 @@ class PipeLowerer(ast.NodeTransformer):
         if unknown:
             self.error(call, "unsupported Pipe option: " + ", ".join(sorted(unknown)))
         flow = keywords.get("flow")
-        if not isinstance(flow, ast.Constant) or flow.value not in ("none", "valid_only", "valid_ready"):
+        if not isinstance(flow, ast.Constant) or flow.value not in (
+            "none",
+            "valid_only",
+            "valid_ready",
+        ):
             self.error(call, "flow must be a literal none, valid_only or valid_ready")
         stages = keywords.get("stages", ast.Constant(value=1))
-        if not isinstance(stages, ast.Constant) or type(stages.value) is not int or not 1 <= stages.value <= 16:
+        if (
+            not isinstance(stages, ast.Constant)
+            or type(stages.value) is not int
+            or not 1 <= stages.value <= 16
+        ):
             self.error(call, "stages must be a static integer in [1, 16]")
         payload = call.func.slice
-        if not isinstance(payload, (ast.Name, ast.Attribute, ast.Subscript)):
+        if not isinstance(payload, ast.Name | ast.Attribute | ast.Subscript):
             self.error(call, "T must name a concrete pyCircuit hardware type")
         if flow.value == "none":
             if len(call.args) != 1 or "reset_value" not in keywords:
-                self.error(call, "none requires one fixed input and an explicit reset_value of type T")
+                self.error(
+                    call,
+                    "none requires one fixed input and an explicit reset_value of type T",
+                )
         elif call.args or "reset_value" in keywords:
-            self.error(call, "valid modes accept input through push, without a reset_value option")
+            self.error(
+                call,
+                "valid modes accept input through push, without a reset_value option",
+            )
         reset = keywords.get("reset_value", ast.Constant(value=0))
-        config = PipeConfiguration(ast.unparse(payload), flow.value, stages.value, ast.unparse(reset))
+        config = PipeConfiguration(
+            ast.unparse(payload), flow.value, stages.value, ast.unparse(reset)
+        )
         self.specifications.setdefault(config, pipe_definition(config))
         return config
 
     def pipe_call(self, node):
-        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Subscript)
-                and isinstance(node.func.value, ast.Name) and node.func.value.id in self.markers)
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Subscript)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in self.markers
+        )
 
-    def visit_Assign(self, node):
+    def visit_Assign(self, node):  # noqa: N802
         if self.pipe_call(node.value):
-            if id(node) not in self.module_assignments or len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
-                self.error(node, "Pipe must be assigned once to a name directly in a Module body")
+            if (
+                id(node) not in self.module_assignments
+                or len(node.targets) != 1
+                or not isinstance(node.targets[0], ast.Name)
+            ):
+                self.error(
+                    node,
+                    "Pipe must be assigned once to a name directly in a Module body",
+                )
             target = node.targets[0].id
             if target in self.bindings:
                 self.error(node, "Pipe instances cannot be rebound")
             config = self.configuration(node.value)
             self.bindings[target] = config
-            self.instances.append({"instance": target, "line": node.lineno,
-                                   "specialization": config.name, **config.__dict__})
-            node.value = ast.copy_location(ast.Call(
-                func=ast.Name(id=config.name, ctx=ast.Load()),
-                args=node.value.args if config.flow == "none" else [], keywords=[]), node.value)
+            self.instances.append(
+                {
+                    "instance": target,
+                    "line": node.lineno,
+                    "specialization": config.name,
+                    **config.__dict__,
+                }
+            )
+            node.value = ast.copy_location(
+                ast.Call(
+                    func=ast.Name(id=config.name, ctx=ast.Load()),
+                    args=node.value.args if config.flow == "none" else [],
+                    keywords=[],
+                ),
+                node.value,
+            )
             return node
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             target = node.targets[0].id
             if target in self.bindings:
                 self.error(node, "Pipe instances cannot be rebound")
             if isinstance(node.value, ast.Name) and node.value.id in self.bindings:
-                self.error(node, "Pipe instance aliases are not supported; use the original name")
+                self.error(
+                    node,
+                    "Pipe instance aliases are not supported; use the original name",
+                )
         return self.generic_visit(node)
 
-    def visit_Name(self, node):
-        if isinstance(node.ctx, (ast.Store, ast.Del)) and node.id in self.bindings:
+    def visit_Name(self, node):  # noqa: N802
+        if isinstance(node.ctx, ast.Store | ast.Del) and node.id in self.bindings:
             self.error(node, "Pipe instances cannot be rebound or deleted")
         return node
 
-    def visit_arg(self, node):
+    def visit_arg(self, node):  # noqa: N802
         if node.arg in self.bindings:
             self.error(node, "Pipe instances cannot be shadowed by a parameter")
         return node
 
-    def visit_Call(self, node):
+    def visit_Call(self, node):  # noqa: N802
         if self.pipe_call(node):
-            self.error(node, "Pipe construction is only allowed in a named Module-body assignment")
-        if isinstance(node.func, ast.Attribute) and isinstance(node.func.value, ast.Name):
+            self.error(
+                node,
+                "Pipe construction is only allowed in a named Module-body assignment",
+            )
+        if isinstance(node.func, ast.Attribute) and isinstance(
+            node.func.value, ast.Name
+        ):
             instance, method = node.func.value.id, node.func.attr
             if instance in self.bindings:
                 config = self.bindings[instance]
@@ -169,16 +237,23 @@ class PipeLowerer(ast.NodeTransformer):
                 if config.flow == "valid_ready":
                     allowed.add("pop")
                 if method not in allowed:
-                    self.error(node, f"{instance}.{method} is forbidden for flow={config.flow}")
+                    self.error(
+                        node, f"{instance}.{method} is forbidden for flow={config.flow}"
+                    )
                 expected = 1 if method == "push" else 0
                 if len(node.args) != expected or node.keywords:
-                    self.error(node, f"{method} requires {expected} positional arguments")
+                    self.error(
+                        node, f"{method} requires {expected} positional arguments"
+                    )
                 if config.flow == "none":
-                    return ast.copy_location(ast.Name(id=instance, ctx=ast.Load()), node)
+                    return ast.copy_location(
+                        ast.Name(id=instance, ctx=ast.Load()), node
+                    )
         return self.generic_visit(node)
 
 
-
 PIPE_COMPONENT = ComponentDefinition(
-    name="Pipe", module=__name__, lowerer=PipeLowerer,
+    name="Pipe",
+    module=__name__,
+    lowerer=PipeLowerer,
 )

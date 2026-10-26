@@ -692,6 +692,20 @@ Importer::lowerReturn(const ModuleDecl &decl, const AstNode &node,
     outputs.push_back(*converted);
     return outputs;
   }
+  if (node.kind() == "Name") {
+    if (auto *binding = nestedRuleBinding(node.string("id"))) {
+      if (failed(requireNestedRuleDataVisible(node.string("id"), node))) return failure();
+      if (binding->results.size() != decl.outputs.size())
+        return error() << "Rule result arity differs from Module output signature";
+      for (auto [result, output] : llvm::zip(binding->results, decl.outputs)) {
+        auto converted = applyBindingBoundary(result, BindingBoundary{output, true},
+                                               node, at, decl.symbol);
+        if (failed(converted)) return failure();
+        outputs.push_back(*converted);
+      }
+      return outputs;
+    }
+  }
   bool tuple = decl.returnShape == ReturnShape::Tuple;
   if (tuple) {
     if (node.kind() != "Tuple" || node.array("elts").size() != decl.outputs.size())
@@ -780,11 +794,13 @@ LogicalResult Importer::bindProposals(ArrayRef<StateOwner> states,
         auto declaration =
             record ? analysis.lookupStruct(record) : ac::StructOp();
         Type selected;
+        DictionaryAttr selectedField;
         if (declaration)
           for (Attribute raw : declaration.getFields()) {
             auto field = cast<DictionaryAttr>(raw);
             if (field.getAs<StringAttr>("name") == name) {
               selected = field.getAs<TypeAttr>("type").getValue();
+              selectedField = field;
               break;
             }
           }
@@ -795,6 +811,7 @@ LogicalResult Importer::bindProposals(ArrayRef<StateOwner> states,
             createOp(builder, loc, ac::StructGetOp::getOperationName(), {value},
                      TypeRange{selected}, {builder.getNamedAttr("field", name)})
                 ->getResult(0);
+        rememberStructField(value, selectedField, state.node);
       }
       return value;
     };

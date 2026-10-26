@@ -22,6 +22,7 @@
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Transforms/SourceControlFlow.h"
 #include "pycircuit/Dialect/ACIR/SourceMethodAnalysis.h"
+#include "pycircuit/Dialect/ACIR/SourceIdentifier.h"
 #include "pycircuit/Dialect/ACIR/SourceHelperAnalysis.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -81,6 +82,8 @@ struct NestedRuleBinding {
   NestedRulePhase phase = NestedRulePhase::Future;
   bool registered = false;
   bool protectedOuterRule = false;
+  SmallVector<Value> results;
+  ReturnShape returnShape = ReturnShape::None;
 };
 struct NestedRuleScope {
   ModuleDecl *owner;
@@ -100,6 +103,7 @@ struct SourceCallableDecl {
   bool inferResults = false;
   bool lexical = true;
   bool privateSpecialization = false;
+  bool autonomous = false;
   SmallVector<Value> actualFacts;
   SmallVector<DictionaryAttr> specializationAncestry;
 };
@@ -129,6 +133,13 @@ struct Import {
   bool builtin = false;
   BindingCategory category = BindingCategory::Module;
   std::string importedModule;
+};
+// A source selector only. It has no allocation, ports, result or runtime value.
+struct StaticInstanceReference {
+  FlatSymbolRefAttr expectedModule;
+  uint64_t ancestorDepth = 0;
+  SmallVector<StringAttr> childNames;
+  AstNode declaration;
 };
 struct Instance {
   std::string name;
@@ -499,6 +510,9 @@ private:
                llvm::StringMap<SmallVector<Value>> *captures = nullptr);
   LogicalResult scanModules();
   LogicalResult scanSourceCallables();
+  LogicalResult scanStaticInstanceReferences();
+  llvm::StringMap<llvm::StringMap<StaticInstanceReference>> staticInstanceReferences;
+  llvm::DenseSet<DictionaryAttr> staticReferenceAssignments;
   bool intrinsic(const AstNode &node, StringRef name) const;
   FailureOr<StringRef> fourStatePattern(const AstNode &node);
   bool fixedAnnotation(const AstNode &node) const;
@@ -514,14 +528,15 @@ private:
                   llvm::StringMap<SmallVector<Value>> *captures);
   FailureOr<Value> replaceField(Value value, StringRef field, Value replacement,
                                 const AstNode &node, OpBuilder &at,
-                                FlatSymbolRefAttr symbol);
+                                FlatSymbolRefAttr symbol, bool preserveProjectionWitnesses);
   StringRef assignmentRoot(const AstNode &target) const;
   AstNode indexedFieldTarget(const AstNode &target) const;
   LogicalResult
   updateAssignment(const AstNode &target, Value value, const AstNode &node,
                    OpBuilder &at, FlatSymbolRefAttr symbol,
                    llvm::StringMap<Value> &values,
-                   SmallVectorImpl<Value> *boundIndices = nullptr);
+                   SmallVectorImpl<Value> *boundIndices = nullptr,
+                   bool preserveProjectionWitnesses = false);
   FailureOr<std::optional<SmallVector<StringRef, 2>>>
   fixedResultTargets(const AstNode &assignment);
   StringRef fixedResultCall(const AstNode &node) const;
@@ -573,6 +588,11 @@ private:
   FailureOr<DictionaryAttr> sourceConstraint(const Port &port);
   Port sourceCallPort(DictionaryAttr constraint, StringRef name,
                       const AstNode &callSite) const;
+  Port structFieldPort(DictionaryAttr field, const AstNode &site) const;
+  void rememberStructField(Value value, DictionaryAttr field,
+                           const AstNode &site);
+  FailureOr<Value> structFieldZero(DictionaryAttr field, const AstNode &site,
+                                    OpBuilder &at, FlatSymbolRefAttr symbol);
   LogicalResult serializeSourceCall(ModuleDecl &decl);
   LogicalResult inferModuleGraph();
   StringRef memoryReference(const AstNode &node) const;
@@ -679,6 +699,9 @@ private:
   LogicalResult preflightProposals(const AstNode &module);
   void bindState(const StateOwner &state, Value next, Value en, OpBuilder &at,
                  llvm::StringMap<Value> &values);
+  LogicalResult predeclareStructuralInstances(
+      ModuleDecl &decl, OpBuilder &at, SmallVectorImpl<Instance> &storage,
+      llvm::StringMap<Instance *> &instances);
   LogicalResult emitBehavioral(ModuleDecl &decl);
   LogicalResult emitSourceTransactions(ModuleDecl &decl);
   FailureOr<std::optional<Value>> sourceEffectExpression(
@@ -857,6 +880,10 @@ private:
   LogicalResult structuralBinding(const AstNode &call, OpBuilder &at,
                                   FlatSymbolRefAttr owner,
                                   BranchEnvironment &environment);
+  FailureOr<bool> moduleInstanceBinding(
+      const AstNode &call, OpBuilder &at, FlatSymbolRefAttr owner,
+      const llvm::StringMap<Value> &values,
+      llvm::StringMap<Instance *> &instances);
 
   FailureOr<ModuleDecl> signature(const AstNode &node);
   FailureOr<Type> portType(const AstNode &node, FlatSymbolRefAttr owner);
@@ -928,7 +955,8 @@ private:
   FailureOr<Type> expressionType(const AstNode &node,
                                  llvm::StringMap<Value> &values,
                                  llvm::StringMap<Instance *> &instances,
-                                 FlatSymbolRefAttr owner);
+                                 FlatSymbolRefAttr owner,
+                                 DictionaryAttr *projectedField = nullptr);
   FailureOr<Value> trueValue(const AstNode &node, OpBuilder &at,
                              FlatSymbolRefAttr owner);
   LogicalResult emitInstrumentation(const ModuleDecl &module,
@@ -993,6 +1021,10 @@ private:
   SmallVector<OwnerProposal> ownerProposals;
   std::unique_ptr<OwnerEnableProof> grantProof;
   TableQueryBudget queryBudget;
+  // Nominal declarations are frozen before body emission. Successful
+  // admissions belong to the exact source type and actual lexical Module.
+  SmallVector<std::pair<std::pair<Type, Operation *>, Type>, 0>
+      admittedBranchPayloads;
   bool activeValueHelper = false;
   ValueHelperDecl *activeHelperFrame = nullptr;
   FlatSymbolRefAttr activeHelperLexicalOwner;
@@ -1515,21 +1547,41 @@ FailureOr<Type> Importer::resolveBranchPayloadType(
   ac::HardwareBindings bindings;
   bindings.owner = isa<ac::ModuleOp>(parent)
                        ? parent : parent->getParentOfType<ac::ModuleOp>().getOperation();
+  auto chargeAdmission = [&](uint64_t work, uint64_t bytes) -> LogicalResult {
+    TableQueryCharge charge;
+    std::string reason;
+    bool fits = TableQueryBudget::add(charge, TableQueryResource::Work, work) &&
+                TableQueryBudget::add(charge, TableQueryResource::Slots,
+                                      bytes / 8 + (bytes % 8 != 0));
+    if (!fits || !queryBudget.reserve(charge, reason))
+      return mlir::emitError(node.location(b.getContext(), source.path))
+             << "source nominal payload: "
+             << (fits ? reason : "closure cost counter exhausted");
+    return success();
+  };
+  if (failed(chargeAdmission(admittedBranchPayloads.size() + 1, 0)))
+    return failure();
+  auto key = std::make_pair(type, bindings.owner);
+  for (const auto &entry : admittedBranchPayloads)
+    if (entry.first == key) return entry.second;
   ac::HardwareAnalysis analysis(*body);
-  return ac::detail::resolveSourceBranchResultType(
-      type, analysis, bindings, bindings.owner,
-      [&](uint64_t work, uint64_t bytes) -> LogicalResult {
-        TableQueryCharge charge;
-        std::string reason;
-        bool fits = TableQueryBudget::add(charge, TableQueryResource::Work, work) &&
-                    TableQueryBudget::add(charge, TableQueryResource::Slots,
-                                          bytes / 8 + (bytes % 8 != 0));
-        if (!fits || !queryBudget.reserve(charge, reason))
-          return mlir::emitError(node.location(b.getContext(), source.path))
-                 << "source nominal payload: "
-                 << (fits ? reason : "closure cost counter exhausted");
-        return success();
-      });
+  auto result = ac::detail::resolveSourceBranchResultType(
+      type, analysis, bindings, bindings.owner, chargeAdmission);
+  if (failed(result)) return failure();
+  if (admittedBranchPayloads.size() == admittedBranchPayloads.capacity()) {
+    uint64_t old = admittedBranchPayloads.capacity();
+    if (old > (admittedBranchPayloads.max_size() - 1) / 2)
+      return error() << "source nominal admission cache storage overflow";
+    uint64_t capacity = old * 2 + 1;
+    using Entry = typename decltype(admittedBranchPayloads)::value_type;
+    if (capacity > std::numeric_limits<uint64_t>::max() / sizeof(Entry))
+      return error() << "source nominal admission cache storage overflow";
+    if (failed(chargeAdmission(admittedBranchPayloads.size(), capacity * sizeof(Entry))))
+      return failure();
+    admittedBranchPayloads.reserve(capacity);
+  }
+  admittedBranchPayloads.push_back({key, *result});
+  return *result;
 }
 
 FailureOr<PreparedNominalJoin> Importer::prepareNominalJoin(
@@ -1680,9 +1732,17 @@ FailureOr<Value> Importer::applyBindingBoundary(Value value,
     }
     return *converted;
   }
-  if (!ac::areEquivalentHardwareTypes(value.getType(), contract.type))
-    return mlir::emitError(node.location(b.getContext(), source.path))
-           << "binding boundary hardware type mismatch";
+  if (!ac::areEquivalentHardwareTypes(value.getType(), contract.type)) {
+    auto equivalent = equivalentBoundaryTypes(value.getType(), contract.type,
+                                             at.getBlock()->getParentOp());
+    if (failed(equivalent))
+      return failure();
+    if (!*equivalent)
+      return mlir::emitError(node.location(b.getContext(), source.path))
+             << "binding boundary hardware type mismatch";
+    if (isa<ac::TableType>(contract.type))
+      return exactHelperValue(value, contract.type, node, at, ownerSymbol);
+  }
   if (isa<ac::BitsType>(contract.type) && !contract.sourceKind)
     return mlir::emitError(node.location(b.getContext(), source.path))
            << "binding boundary requires authoritative source kind";
@@ -2012,7 +2072,7 @@ LogicalResult Importer::scanImports() {
               MarkerKind::None ||
           fixedBitsAliasWidth(module.getValue(), remote) ||
           (module.getValue() == "pycircuit" &&
-           llvm::is_contained(ArrayRef<StringRef>{"system", "log", "report"},
+           llvm::is_contained(ArrayRef<StringRef>{"system", "log", "report", "instance_ref"},
                               remote))) {
         names[name] = {{},
                        nullptr,
@@ -3795,7 +3855,10 @@ Importer::compareSourceValues(Value lhs, Value rhs, StringRef predicate,
 FailureOr<Type> Importer::expressionType(const AstNode &node,
                                          llvm::StringMap<Value> &values,
                                          llvm::StringMap<Instance *> &instances,
-                                         FlatSymbolRefAttr ownerSymbol) {
+                                         FlatSymbolRefAttr ownerSymbol,
+                                         DictionaryAttr *projectedField) {
+  if (projectedField)
+    *projectedField = {};
   if ((node.kind() == "Name" || node.kind() == "Attribute" || node.kind() == "Subscript") &&
       failed(requireNestedRuleDataVisible(assignmentRoot(node), node))) return failure();
 
@@ -3944,8 +4007,11 @@ FailureOr<Type> Importer::expressionType(const AstNode &node,
       return error() << "field projection requires a struct";
     for (Attribute raw : declaration.getFields()) {
       auto field = cast<DictionaryAttr>(raw);
-      if (field.getAs<StringAttr>("name").getValue() == node.string("attr"))
+      if (field.getAs<StringAttr>("name").getValue() == node.string("attr")) {
+        if (projectedField)
+          *projectedField = field;
         return field.getAs<TypeAttr>("type").getValue();
+      }
     }
     return error() << "unknown struct field";
   }
@@ -4292,6 +4358,35 @@ LogicalResult Importer::publishSourceChecks(Operation *rule,
   return success();
 }
 
+FailureOr<bool> Importer::moduleInstanceBinding(
+    const AstNode &call, OpBuilder &at, FlatSymbolRefAttr owner,
+    const llvm::StringMap<Value> &values,
+    llvm::StringMap<Instance *> &instances) {
+  if (call.kind() != "Call" || call.child("func").kind() != "Name")
+    return false;
+  auto found = instances.find(call.child("func").string("id"));
+  if (found == instances.end()) return false;
+  Instance &target = *found->second;
+  if (target.valueHandle)
+    return error() << "value Module inputs are bound at their constructor";
+  if (target.bound)
+    return error() << "each structural instance requires one complete binding";
+  RuleEvaluation evaluation;
+  evaluation.structural = true;
+  evaluation.target = &target;
+  evaluation.instances = &instances;
+  BranchEnvironment environment;
+  environment.values = values;
+  auto *previous = std::exchange(activeRule, &evaluation);
+  auto restore = llvm::scope_exit([&] { activeRule = previous; });
+  if (failed(structuralBinding(call, at, owner, environment))) return failure();
+  if (evaluation.bindingValues.size() != target.inputs.size())
+    return error() << "structural Module binding did not bind every input";
+  target.op->setOperands(evaluation.bindingValues);
+  target.bound = true;
+  return true;
+}
+
 LogicalResult Importer::structuralBinding(const AstNode &call, OpBuilder &at,
                                           FlatSymbolRefAttr symbol,
                                           BranchEnvironment &environment) {
@@ -4546,11 +4641,12 @@ LogicalResult Importer::requireNestedRuleDataVisible(StringRef name,
     return success();
   auto *binding = nestedRuleBinding(name);
   if (!binding) return success();
-  auto order = nestedRuleOrder(use, binding->declaration);
-  if (failed(order)) return failure();
-  if (*order != SourceDeclarationOrder::Before)
+  if (activeSourceEffects || activeValueHelper || activeHelperFrame)
     return mlir::emitError(use.location(b.getContext(), source.path))
-           << "Rule spelling is not an ordinary data value: '" << name << "'";
+           << "local Rule result is not a Rule input; wire through a child Module interface";
+  if (!binding->registered || binding->results.empty())
+    return mlir::emitError(use.location(b.getContext(), source.path))
+           << "autonomous Rule has no available result: '" << name << "'";
   return success();
 }
 
@@ -4558,22 +4654,8 @@ LogicalResult Importer::requireNestedRuleDataTarget(StringRef name,
                                                      const AstNode &assignment) {
   auto *binding = nestedRuleBinding(name);
   if (!binding) return success();
-  if (binding->protectedOuterRule)
-    return mlir::emitError(assignment.location(b.getContext(), source.path))
-           << "ordinary data cannot shadow an outer Rule declaration: '" << name << "'";
-  if (llvm::is_contained(ArrayRef<StringRef>{"pyc_clk", "pyc_rst", "module", "rule",
-          "system", "log", "report", "bool", "int", "range", "Annotated"}, name))
-    return mlir::emitError(assignment.location(b.getContext(), source.path))
-           << "ordinary data cannot shadow a reserved source binding: '" << name << "'";
-  auto order = nestedRuleOrder(assignment, binding->declaration);
-  if (failed(order)) return failure();
-  if (*order != SourceDeclarationOrder::Before || binding->registered ||
-      assignment.kind() != "Assign" ||
-      assignment.path.size() != activeNestedRuleScope->owner->node.path.size() + 2)
-    return mlir::emitError(assignment.location(b.getContext(), source.path))
-           << "ordinary data cannot replace a declared or registered Rule: '"
-           << name << "'";
-  return success();
+  return mlir::emitError(assignment.location(b.getContext(), source.path))
+         << "autonomous Rule declaration cannot be rebound: '" << name << "'";
 }
 
 void Importer::noteNestedRuleDataBinding(StringRef name) {
@@ -4614,7 +4696,7 @@ FailureOr<const SourceRuleCallPlan *> Importer::checkedRuleRegistration(
   if (failed(lookup)) return failure();
   const auto *plan = *lookup;
   if (!plan || !sameSourceSite(plan->module, module.node) ||
-      !sameSourceSite(plan->call, call) || !sameSourceSite(plan->rule, selectedDeclaration) ||
+      !sameSourceSite(plan->occurrence, call) || !sameSourceSite(plan->rule, selectedDeclaration) ||
       selectedDeclaration.fields().getAs<StringAttr>("name") != name)
     return error() << "Rule registration differs from its exact source write plan";
   auto found = activeNestedRuleScope->bindings.find(name);
@@ -4785,6 +4867,8 @@ LogicalResult Importer::emitModule(ModuleDecl &decl) {
 
   for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
     AstNode stmt = decl.node.item("body", i);
+    if (staticReferenceAssignments.contains(namespaceSite(stmt)))
+      continue;
     if (docstring(stmt))
       continue;
     if (stmt.kind() == "FunctionDef") {
@@ -5007,6 +5091,9 @@ LogicalResult Importer::emitModule(ModuleDecl &decl) {
     }
     if (stmt.kind() == "Expr") {
       AstNode call = stmt.child("value");
+      auto bound = moduleInstanceBinding(call, at, decl.symbol, values, instances);
+      if (failed(bound)) return failure();
+      if (*bound) continue;
       if (call.kind() == "Call") {
         auto helper = resolveValueHelper(call.child("func"), decl.symbol);
         if (failed(helper)) return failure();
@@ -5293,7 +5380,7 @@ LogicalResult Importer::preflightProposals(const AstNode &module) {
     if (proposal.domains.size() != indexedPaths)
       return error()
              << "address witness count differs from retained indexed paths";
-    auto call = site(proposal.callPlan->call),
+    auto call = site(proposal.callPlan->occurrence),
          owner = site(proposal.write->owner);
     if (!call || !owner)
       return error() << grantProof->failureReason();
@@ -5954,7 +6041,8 @@ LogicalResult Importer::prepare() {
                  item.second)),
          b.getNamedAttr("ac.declaration_role", b.getStringAttr("definition"))});
   }
-  if (failed(scanModules()) || failed(prepareMemoryBindings()) ||
+  if (failed(scanModules()) || failed(scanStaticInstanceReferences()) ||
+      failed(prepareMemoryBindings()) ||
       failed(inferModuleGraph()))
     return failure();
   (*body)->setAttr(

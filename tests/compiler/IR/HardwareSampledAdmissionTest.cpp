@@ -2119,4 +2119,117 @@ TEST_F(HardwareSampledAdmissionTest,
     }))) << diagnostics;
 }
 
+TEST_F(HardwareSampledAdmissionTest,
+       MeasuredSharedMetadataStillRequiresEveryControlProof) {
+    // Six sibling invocation paths reuse the same immutable occurrence pieces.
+    // Measuring them is not a proof that each SSA reached prefix is correct.
+    for (unsigned mutation = 0; mutation != 3; ++mutation) {
+        SCOPED_TRACE(mutation);
+        build(false, {}, 6);
+        b.setInsertionPointToEnd(package->getBody());
+        definition->setAttr("ac.transaction_wiring", wiring({d({
+            f("registration", occurrence(2)),
+            f("ordinary_results", b.getI64IntegerAttr(0)),
+            f("candidates", b.getArrayAttr({}))})}));
+        op(ac::SystemOp::getOperationName(), {}, {},
+           {f("domain", b.getStringAttr("default")),
+            f("entry", d({f("callee", FlatSymbolRefAttr::get(&context, "Sampled")),
+                          f("parameters", b.getArrayAttr({})),
+                          f("type_arguments", b.getArrayAttr({}))}))});
+        auto yielded = cast<ac::YieldOp>(rule.getBody().front().back());
+        if (mutation == 1)
+            yielded->setOperand(12, yielded.getOperand(2));
+        if (mutation == 2)
+            yielded->setOperand(0, yielded.getOperand(2));
+        auto before = printPackage();
+        auto plan = capture([&] {
+            return ac::HardwareAnalysis(*package).getSourceCheckPlan();
+        });
+        EXPECT_EQ(succeeded(plan), mutation == 0) << diagnostics;
+        EXPECT_EQ(before, printPackage());
+        if (mutation)
+            EXPECT_EQ(diagnostics.find("analysis work budget"), std::string::npos)
+                << diagnostics;
+    }
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       SameScopeIdentityWalkRechecksEveryPayloadEdge) {
+    // A valid starting result must not authenticate a later foreign owner,
+    // changed resolved type, or cycle after following its transparent yield.
+    for (unsigned mutation = 0; mutation != 4; ++mutation) {
+        SCOPED_TRACE(mutation);
+        build();
+        auto yielded = cast<ac::YieldOp>(rule.getBody().front().back());
+        if (mutation == 1) {
+            auto foreign = addPlainDefinition();
+            b.setInsertionPoint(foreign.getBody().front().getTerminator());
+            yielded->setOperand(0, constant(1));
+        } else if (mutation == 2) {
+            b.setInsertionPoint(yielded);
+            auto wide = op(ac::BitsConstantOp::getOperationName(), {},
+                           {ac::BitsType::get(&context, literal(2))},
+                           {f("value", literal(0))})->getResult(0);
+            yielded->setOperand(0, wide);
+        } else if (mutation == 3) {
+            yielded->setOperand(0, rule.getResult(0));
+        }
+        ac::HardwareAnalysis analysis(*package);
+        ac::HardwareBindings bindings;
+        bindings.owner = definition;
+        detail::HardwareIdentityScope scope{definition, bindings, {}};
+        detail::SourceCheckBudget budget({1 << 20});
+        auto endpoint = detail::makeIdentityEndpoint(rule.getResult(0), scope,
+                                                      analysis, budget);
+        ASSERT_TRUE(succeeded(endpoint));
+        auto before = printPackage();
+        auto result = capture([&] {
+            return detail::normalizeIdentityEndpoint(*endpoint,
+                {detail::HardwareIdentityTraversal::DefinitionLocal, {}},
+                analysis, budget);
+        });
+        EXPECT_EQ(succeeded(result), mutation == 0) << diagnostics;
+        EXPECT_EQ(before, printPackage());
+        if (mutation)
+            EXPECT_FALSE(diagnostics.empty());
+    }
+}
+
+TEST_F(HardwareSampledAdmissionTest,
+       MetadataMeasurementIsFreshAcrossPlansAndNeverWarmsATinyBudget) {
+    build(false, {}, 6);
+    b.setInsertionPointToEnd(package->getBody());
+    definition->setAttr("ac.transaction_wiring", wiring({d({
+        f("registration", occurrence(2)),
+        f("ordinary_results", b.getI64IntegerAttr(0)),
+        f("candidates", b.getArrayAttr({}))})}));
+    op(ac::SystemOp::getOperationName(), {}, {},
+       {f("domain", b.getStringAttr("default")),
+        f("entry", d({f("callee", FlatSymbolRefAttr::get(&context, "Sampled")),
+                      f("parameters", b.getArrayAttr({})),
+                      f("type_arguments", b.getArrayAttr({}))}))});
+    ac::HardwareAnalysis analysis(*package);
+    auto valid = capture([&] { return analysis.getSourceCheckPlan(); });
+    ASSERT_TRUE(succeeded(valid)) << diagnostics;
+    auto tiny = capture([&] { return analysis.getSourceCheckPlan({1}); });
+    EXPECT_TRUE(failed(tiny));
+    EXPECT_NE(diagnostics.find("analysis work budget"), std::string::npos);
+
+    auto metadata = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+    auto controls = metadata.getAs<ArrayAttr>("controls");
+    SmallVector<Attribute> rows(controls.begin(), controls.end());
+    NamedAttrList changed(cast<DictionaryAttr>(rows.back()));
+    // Equal-sized paths have different identity. The last callable must not
+    // borrow the earlier invocation's measured shape as an admission verdict.
+    changed.set("invocation", cast<DictionaryAttr>(rows[4]).get("invocation"));
+    rows.back() = changed.getDictionary(&context);
+    NamedAttrList fields(metadata);
+    fields.set("controls", b.getArrayAttr(rows));
+    rule->setAttr("ac.sampled_admission", fields.getDictionary(&context));
+    EXPECT_TRUE(failed(capture([&] { return analysis.getSourceCheckPlan(); })));
+    EXPECT_EQ(diagnostics.find("analysis work budget"), std::string::npos)
+        << diagnostics;
+    EXPECT_FALSE(diagnostics.empty());
+}
+
 } // namespace
