@@ -1,3 +1,5 @@
+# Captured state proposals and unused pop results are intentional DSL effects.
+# ruff: noqa: F823, F841
 from enum import Enum
 import pycircuit as ac
 

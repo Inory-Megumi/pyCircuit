@@ -77,7 +77,7 @@ Verilator models live in the Architecture Lab. Finite host checks are not
 native compile, four-state, formal, or PPA qualification.
 
 The imported extension source identities are retained in
-[`ORIGIN.json`](../../python/arch_primitives/ORIGIN.json). The Architecture Lab
+[`ORIGIN.json`](https://github.com/Inory-Megumi/pyCircuit/blob/e749c7e53dc4f0b1b292551a24358adbb1f4b2cc/python/arch_primitives/ORIGIN.json). The Architecture Lab
 keeps consumer demos, independent models, HNI RRT/RDT analysis and immutable
 qualification receipts. Its former library directory is a pinned consumer
 snapshot; future implementation changes belong here and update that pin.
@@ -111,8 +111,29 @@ read-only identity results are reused within their proof owners. Scope/type,
 ownership, admission, private-route and conflict checks remain independent;
 analysis caps are unchanged.
 
-Initial focused checks passed 504 native source/transaction tests and the bounded
-capture/publication plus extension unit selection (272 passed, three conditional
-skips). Migrated consumer C++/Verilator checks and full candidate gate outcomes
-are recorded separately; these initial results do not establish those outcomes,
-RTL four-state behavior, formal proof or PPA.
+Qualification of the local integration passed the official API gate (25 CTest
+entries, including the selected lit gate), examples gate (13 CTest entries for
+seven designs), strict documentation build, repository metadata checks, API
+hygiene and changed-file Ruff/Black checks. Focused native source/transaction
+checks passed 504 tests; that selection overlaps the API gate. The bounded
+capture/publication plus extension unit selection passed 272 tests with three
+conditional skips. SourceIdentifier's oracle uses CPython 3.14.6 / Unicode 16;
+the lit launcher requires its matching Python module path.
+
+Migrated Lab copies remove explicit Rule activation/result calls without
+changing ordered business Rule ASTs, original stimuli or independent models.
+Sixteen positive cases passed source compile/link, C++/Verilog emit, slang and
+known-0/1 C++/Verilator simulation: 23,664 field comparisons per backend with
+equal observations. Three genuine conflict cases retain expected link rejection.
+Coverage includes all Arbiter policies and LRU edges, Pipe bubbles/replacement,
+Table atomicity, shared FSM writers, and WriteExecution mixed/stress traffic.
+WriteExecution's old final beat and next committed control head remain in one
+outer Rule; there is no cross-Rule forwarding or empty-queue bypass.
+
+Three targeted Boolean-record execution tests and the official enum/Table smoke
+tests also passed their Icarus four-state checks. This does not qualify whole
+components or HNI for arbitrary X/Z inputs. Full nightly, VCS, reference RTL
+equivalence, formal proof and PPA were not run. The Lab retains the exact merge,
+source migration and qualification receipts separately from historical evidence.
+No remote push, release or default compiler activation follows from this local
+integration.
