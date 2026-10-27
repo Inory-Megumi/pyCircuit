@@ -20,7 +20,7 @@
   },
   "source_updates": {
     "components/arbiter.py": {
-      "sha256": "b010067b9f934b5a609cdcbf4896cd7d27f91344680dfead2f82fe18cfeca32c",
+      "sha256": "5d505145073f10967f6c8731546329804dd4db815bb2fb9c7d1971a2d21a5907",
       "reason": "Temporarily disable public LRU policy pending implementation and analysis-budget review, as requested by the maintainer on 2026-10-27.",
       "upstream_commit": "b986bb0ad721bc0834a71fc710dddca4bde339f4",
       "previous_sha256": "c38c5c8e1f794ff189297b60a364a1df41bec7ff9c308129bad618a546153e7e"

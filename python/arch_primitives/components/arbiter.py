@@ -9,7 +9,6 @@ from ..errors import ElaborationError
 from ..registry import ComponentDefinition
 from .arbiter_lru import constant_select
 
-
 _LRU_DISABLED = (
     "policy lru is temporarily disabled pending implementation and budget review; "
     "use round_robin or fixed_priority"
