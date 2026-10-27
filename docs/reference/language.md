@@ -45,16 +45,30 @@ no separate Signal resource or set/get interface in the language design. The
 compiler owns value availability and dependency checks; persistent state and
 Queue provide cross-cycle storage.
 
-Scalar fixed-Bits Modules and their tuple results may declare keyword-only
-static Integer parameters, for example
+Modules may declare keyword-only static Integer parameters, for example
 `def Identity(value: ac.bits[W], *, W: int = 8) -> ac.bits[W]`.
 Direct same-source and imported calls separate static keywords from hardware
 arguments and substitute each instance's actual widths. A caller may forward
 its own declared parameter. Root overrides use the existing link command's
 `--parameters` JSON file. Actual width, constant-fit and hardware-argument checks
 still run at the bound instance; defaults are not proof for every instance.
-This support does not add generic state initialization, typed-transaction static
-parameters, type parameters, symbolic Integer domains or `range(W)` expansion.
+The admitted transaction profile also preserves these parameters on state-owning
+Modules. State may use `ac.bits[W]` or rank-one `ac.table[N, ac.bits[W]]`, with
+zero or closed element-splat initialization. Initial values must fit every
+actual element width; widths and extents must be positive. Independent instances
+retain separate state even when they share the same parameter values. Typed
+static expressions such as `last: ac.u64 = N - 1` can select the final row;
+the actual index bound is checked at every occurrence and after anchor reload.
+Closed invalid initializer expressions are rejected even when their carrier
+width remains symbolic. Other existing element, state-update and control-flow
+restrictions still apply.
+
+Selecting a Module with parameterized state in its hierarchy as the public root
+also preserves ordinary retained callers of that definition. The compiler owns
+the additional entry routing boundary; authors keep the original top and ports.
+This does not add parameterized nominal types, arbitrary initializer programs,
+type parameters, symbolic Integer domains, `range(W)` expansion or a static
+divisor proof for `% N` when N is unresolved.
 
 The profiles below retain their shape, indexing, purity and control restrictions.
 General queue/resource admission and complex SCF loop-control combinations remain
@@ -108,6 +122,19 @@ registration and annotated declarations remain outside runtime-controlled Module
 branches. Protected ports, imports and instance bindings cannot be reassigned.
 An existing child or Rule does not select a different ordinary statement language.
 The current terminal-return and loop-admission restrictions still apply.
+
+Top-level `NAME = literal` declares a source-owned immutable Integer or Boolean
+constant. One unary `+` or `-` is permitted on an Integer literal. Definitions
+are captured before dependent types/signatures; no design or host function is
+executed. Direct, aliased, namespace and reexported imports consume the canonical
+published declaration through explicit `-I` units. Constants retain Integer or
+Boolean kind in ordinary expressions, widths and parameter defaults; Boolean
+widths reject. Existing helper-local/formal shadowing and protected Module/Rule
+binding rules apply. Reassignment, duplicate/protected bindings, annotated
+globals, chained/destructuring targets, aliases, expression/call initializers and
+other literal kinds reject. This is not general host Python evaluation. See the
+[constant publication contract](../rfcs/literal-provider-constants.md) for source
+authority and retirement before final hardware.
 
 The behavioral slice uses `import pycircuit as ac`, unsigned `ac.bits[W]`
 and `ac.u1` through `ac.u64`, and same-source `@ac.struct` declarations.
@@ -266,6 +293,10 @@ Boolean, non-power-of-two, zero, negative and singleton bounds remain rejected.
 `ac.concat(first, second, ...)` joins one or more unsigned fixed-bit values,
 with the first operand in the most significant positions. A singleton preserves
 its operand. Each operand retains its own width; the result width is their sum.
+Symbolic sums preserve operand order. Before actual binding, width compatibility
+uses the existing structural comparison: for widths `3`, `W`, `3`, an ordered
+result annotation is `ac.bits[(3 + W) + 3]`. Algebraic reassociation to `W + 6`
+is not established by this source profile.
 Existing destination conversion happens afterward, so a wider destination
 zero-extends the completed result and a narrower destination requires a slice.
 Concatenation preserves every value, known and Z bit, including payload bits
@@ -823,8 +854,8 @@ introduce writes to unrelated source variable owners.
 
 Clock/reset and transaction proposals remain compiler-owned. Queue presence
 propagates a hidden physical domain through ordinary module calls, including
-imported stateless parents. This does not add behavioral static parameters or
-general source collection allocation.
+imported stateless parents. Queue domain propagation does not establish general
+source collection allocation or parameter-dependent Queue configuration.
 
 Both source forms produce ordinary `ac.instance` nodes referring to canonical
 native FIFO Modules. Typed accesses use `ac.method.call`; the existing transaction

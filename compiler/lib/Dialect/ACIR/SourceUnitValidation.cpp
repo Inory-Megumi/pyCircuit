@@ -101,7 +101,7 @@ LogicalResult verifyDeclaration(Operation *operation, DictionaryAttr owner,
   if (role.getValue() == "definition") {
     if (declarationOwner != owner)
       return emitError() << "source definition has a foreign SourceOwner";
-    if (body ? !isa<ModuleOp, StructOp, EnumOp, func::FuncOp>(operation)
+    if (body ? !isa<ModuleOp, StructOp, EnumOp, ConstantOp, func::FuncOp>(operation)
              : !retainedDeclaration(operation))
       return emitError() << "unsupported source definition category";
   } else if (role.getValue() == "import_snapshot") {
@@ -129,6 +129,11 @@ FailureOr<SourceUnitStructure> verifyStructure(mlir::ModuleOp unit, bool body,
   if (!unit)
     return emitError() << "source unit is required";
   auto forged = unit.walk([&](Operation *operation) {
+    if (auto name = SymbolTable::getSymbolName(operation);
+        name && name.getValue() == "pycircuit.__link_entry__") {
+      operation->emitOpError("reserved compiler entry boundary symbol is forbidden in source units");
+      return WalkResult::interrupt();
+    }
     for (auto [name, allowed] : {
         std::pair<StringRef, bool>{"ac.reference_parameters", isa<ModuleOp, ModuleImportOp>(operation)},
         {"ac.reference_bindings", isa<InstanceOp>(operation)},
@@ -147,7 +152,7 @@ FailureOr<SourceUnitStructure> verifyStructure(mlir::ModuleOp unit, bool body,
           "ac.routed_output_validity", "ac.sampled_admission",
           "ac.execution_policy", "ac.transaction_wiring", "ac.queue_wiring",
           "ac.routed_contract", "ac.registration_path", "ac.lexical_registration",
-          "ac.registration_owner", "ac.transaction_returns"}) {
+          "ac.registration_owner", "ac.transaction_returns", "ac.entry_boundary"}) {
       if (!operation->hasAttr(name))
         continue;
       operation->emitOpError()
