@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 from ..errors import ElaborationError
 from ..registry import ComponentDefinition
-from .arbiter_lru import constant_select, lru_definition
+from .arbiter_lru import constant_select
+
+
+_LRU_DISABLED = (
+    "policy lru is temporarily disabled pending implementation and budget review; "
+    "use round_robin or fixed_priority"
+)
 
 
 class Arbiter:
@@ -43,7 +49,7 @@ class ArbiterConfiguration:
 
 def arbiter_definition(config):
     if config.policy == "lru":
-        return lru_definition(config)
+        raise ArbiterError(_LRU_DISABLED)
     name, count, index_type = config.name, config.inputs, config.index_type
     mask_type = f"ac.bits[{count}]"
     choose = name + "_index"
@@ -140,14 +146,13 @@ class ArbiterLowerer(ast.NodeTransformer):
         ):
             self.error(call, "inputs must be a static integer in [1, 32]")
         policy = keywords.get("policy")
+        if isinstance(policy, ast.Constant) and policy.value == "lru":
+            self.error(call, _LRU_DISABLED)
         if not isinstance(policy, ast.Constant) or policy.value not in (
             "round_robin",
             "fixed_priority",
-            "lru",
         ):
-            self.error(
-                call, "policy must be a literal round_robin, fixed_priority or lru"
-            )
+            self.error(call, "policy must be a literal round_robin or fixed_priority")
         initial = keywords.get("initial", ast.Constant(value=0))
         if (
             not isinstance(initial, ast.Constant)
@@ -157,8 +162,6 @@ class ArbiterLowerer(ast.NodeTransformer):
             self.error(call, "initial must be a static index in [0, inputs)")
         if policy.value == "fixed_priority" and "initial" in keywords:
             self.error(call, "fixed_priority has no initial RR state")
-        if policy.value == "lru" and "initial" in keywords:
-            self.error(call, "lru has a fixed initial order: 0, 1, ..., inputs-1")
         config = ArbiterConfiguration(count.value, policy.value, initial.value)
         self.specializations.setdefault(config, arbiter_definition(config))
         return config

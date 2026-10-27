@@ -1,4 +1,4 @@
-"""LRU extension admission and finite independent service-order checks."""
+"""Disabled public LRU admission and retained internal service-order checks."""
 
 import ast
 import tempfile
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from arch_primitives import ArbiterError, elaborate
 from arch_primitives.components.arbiter import ArbiterConfiguration, arbiter_definition
-from arch_primitives.components.arbiter_lru import constant_select
+from arch_primitives.components.arbiter_lru import constant_select, lru_definition
 
 
 class Bits(int):
@@ -52,9 +52,7 @@ class LruTests(unittest.TestCase):
     def test_generated_functions_match_all_small_service_lists(self):
         for count in range(1, 5):
             config = ArbiterConfiguration(count, "lru", 0)
-            pure = [
-                node for node in arbiter_definition(config) if not node.decorator_list
-            ]
+            pure = [node for node in lru_definition(config) if not node.decorator_list]
             namespace = {
                 "ac": SimpleNamespace(
                     bits=Bits,
@@ -101,24 +99,24 @@ class LruTests(unittest.TestCase):
                             update(age, Bits(1 << expected)), encode(successor)
                         )
 
-    def test_public_methods_and_rejections(self):
+    def test_public_policy_is_disabled_before_method_expansion(self):
         bodies = [
-            ('inputs=4, policy="lru"', "arb.select(15)\n    arb.grant(15)", None),
+            (f'inputs={count}, policy="lru"', "arb.select(1)\n    arb.grant(1)")
+            for count in (1, 2, 3, 4, 32)
+        ] + [
             (
                 'inputs=4, policy="lru", initial=0',
                 "arb.select(15)",
-                "fixed initial order",
             ),
-            ('inputs=4, policy="lru"', "arb.advance(0)", "forbidden"),
+            ('inputs=4, policy="lru"', "arb.advance(0)"),
             (
                 'inputs=4, policy="lru"',
                 "arb.grant(15)\n    arb.grant(3)",
-                "one lru update",
             ),
         ]
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / "author.py"
-            for options, body, error in bodies:
+            for options, body in bodies:
                 source.write_text(
                     "import pycircuit as ac\nfrom arch_primitives import Arbiter\n"
                     "@ac.module\ndef Example():\n"
@@ -126,16 +124,19 @@ class LruTests(unittest.TestCase):
                     "    @ac.rule\n    def issue():\n"
                     f'        {body.replace(chr(10), chr(10) + "    ")}\n'
                 )
-                if error:
-                    with self.assertRaisesRegex(ArbiterError, error):
+                with self.subTest(options=options, body=body):
+                    with self.assertRaisesRegex(
+                        ArbiterError, "lru is temporarily disabled"
+                    ):
                         elaborate(source, source.with_name("expanded.py"))
-                else:
-                    self.assertEqual(
-                        elaborate(source, source.with_name("expanded.py"))["instances"][
-                            0
-                        ]["policy"],
-                        "lru",
+                    self.assertFalse(source.with_name("expanded.py").exists())
+                    self.assertFalse(
+                        source.with_name("expanded.components.json").exists()
                     )
+
+    def test_definition_entry_also_rejects_disabled_policy(self):
+        with self.assertRaisesRegex(ArbiterError, "lru is temporarily disabled"):
+            arbiter_definition(ArbiterConfiguration(4, "lru", 0))
 
 
 if __name__ == "__main__":

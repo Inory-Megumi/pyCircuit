@@ -16,5 +16,7 @@ ordinary PyCircuit definitions plus an `arch-primitives/v1` component manifest.
 
 See [the extension guide](../../docs/extensions/architecture.md) for component
 contracts, compiler dependencies, validation evidence and remaining limits.
+Arbiter currently accepts `round_robin` and `fixed_priority`; `lru` is temporarily
+disabled pending implementation and analysis-budget review.
 Counter remains research-only and is not exported. Optional FSM graph analysis
 requires NetworkX; ordinary expansion has no new runtime dependency.

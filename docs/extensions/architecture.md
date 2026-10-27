@@ -20,7 +20,7 @@ from arch_primitives import Pipe, Table, Arbiter, FSM, Pattern, Edge, Next
 | --- | --- |
 | Pipe | Static payload type; `none`, `valid_only`, `valid_ready`; explicit stage count. `none` requires a reset value. Elastic stages use native Queues. |
 | Table | Register storage and routing with `read`, `write`, `update`, `match`. Match returns a bitmap and adds no arbitration. |
-| Arbiter | Fixed, round-robin or `lru` selection; guarded grant; advance is RR-only. LRU uses pairwise least-recently-served order and updates only with its caller's successful commit. |
+| Arbiter | Fixed or round-robin selection; guarded grant; advance is RR-only. The `lru` policy is temporarily disabled. |
 | FSM | Enum or bounded scalar Struct state, legal edges, committed snapshot, hierarchical Pattern/Edge/Next definitions. Outer rules own cross-resource atomic commits. |
 
 Counter is not exported. Automatic pipelining, arbitrary state types and a
@@ -49,7 +49,18 @@ Shared Struct FSM writers depend on the compiler fixes on this development line.
 
 ## Ownership and qualification
 
-### LRU service order
+### LRU service order (temporarily disabled)
+
+As of the 2026-10-27 upstream integration, `policy="lru"` is rejected during
+source expansion for every input count. Use `round_robin` or `fixed_priority`.
+The four-input concurrent Pipe consumer exceeds the unchanged 4M source-check
+work limit after the new entry-boundary checks. Implementation and analysis-cost
+review are deferred by the maintainer; neither the implementation nor the
+compiler has been established as the sole cause. The source, finite host model
+checks and historical qualification below are retained for that review. They do
+not enable LRU in the current package.
+
+The following describes the retained implementation:
 
 `Arbiter(inputs=4, policy="lru")` retains the existing `select` and `grant`
 interfaces. `select(requests)` is a read-only one-hot query (zero for no
@@ -137,3 +148,29 @@ equivalence, formal proof and PPA were not run. The Lab retains the exact merge,
 source migration and qualification receipts separately from historical evidence.
 No remote push, release or default compiler activation follows from this local
 integration.
+
+## Upstream integration on 2026-10-27
+
+This integration includes upstream `b986bb0a`: immutable literal provider
+constants, proof-stack reservation by actual depth, and static Integer
+parameters for stateful Modules, including the upstream entry adapter and
+checked Table reads. The prior downstream type-admission cache and independent
+source/materialization proofs remain in place; global and transaction analysis
+limits remain 4M and 1M.
+
+The pre-disable candidate passed API gate 25/25, examples gate 13/13, 134 focused
+parameter/constant tests, and 53 anchor-file tests. Native routed anchors,
+transaction effects and hardware source checks passed 39, 306 and 200 tests;
+these overlap the API gate. Fifteen Lab consumers passed C++/Verilator comparison
+and slang; three genuine write conflicts retained expected link rejection.
+The original four-input LRU consumer compiled its source unit but failed link
+at the 4M work limit, so it has no new simulation result. A local absence-cache
+experiment remained over budget and is excluded from this integration.
+
+The maintainer explicitly deferred LRU and disabled its public policy before
+publishing this integration. Both LRU consumer cases are deferred rather than
+counted as passing enabled features. The Table entry testbench also lets
+combinational initialization settle before its first reset-preparation sample;
+the generated DUT and all value assertions are unchanged. Final publication
+identity and post-disable checks are recorded with the Lab handoff receipts.
+Publishing source does not activate a different default SDK.
