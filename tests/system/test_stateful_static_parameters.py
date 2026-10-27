@@ -1594,7 +1594,8 @@ task step;
  permit=1;phase=2;#1;phase=0;permit=0;#1;
 endtask
 initial begin
- permit=1;phase=4;#1;phase=2;#1;phase=0;permit=0;#1;
+ // Let the combinational Table initializer settle before RESET_PREPARE.
+ #1;permit=1;phase=4;#1;phase=2;#1;phase=0;permit=0;#1;
  for(i=0;i<100;i=i+1)begin enable=(i%3!=1);clk=0;step();clk=1;step();last=(last+enable)&((1<<W)-1);end
  enable=1;clk=0;step();clk=1;rst=1;step();last=3;clk=0;rst=0;enable=0;step();
  $display("ENTRY_PROBE_RTL_OK");$finish;
