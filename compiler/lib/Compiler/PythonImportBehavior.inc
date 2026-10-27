@@ -2870,6 +2870,8 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       return error() << "declaration after module return is unsupported";
     if (stmt.kind() == "FunctionDef") {
       if (stmt.array("decorator_list").empty()) {
+        if (structuralInstances.contains(stmt.string("name")))
+          return error() << "pure helper cannot replace an instance binding";
         if (failed(declareValueHelper(stmt, decl.symbol, values))) return failure();
       } else if (!hasDecorator(stmt, "rule"))
         return error() << "nested callable requires Rule or ordinary typed helper";
@@ -2886,6 +2888,14 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
                                          structuralInstances);
       if (failed(bound)) return failure();
       if (*bound) continue;
+      if (moduleCall(call)) {
+        auto results = directModuleResults(call, at, decl.symbol, values,
+                                           structuralInstances);
+        if (failed(results)) return failure();
+        if (!results->empty())
+          return error() << "Module value results require an explicit binding";
+        continue;
+      }
       if (call.kind() == "Call") {
         auto helper = resolveValueHelper(call.child("func"), decl.symbol);
         if (failed(helper)) return failure();
@@ -3017,6 +3027,22 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
                           "binding or instance";
       if (failed(requireNestedRuleDataTarget(name, stmt)))
         return failure();
+      if (moduleCall(call)) {
+        auto contract = callable(call.child("func"));
+        if (failed(contract)) return failure();
+        if (contract->returnShape == ReturnShape::None) {
+          if (values.contains(name) || nestedRuleBinding(name) ||
+              behavioralRules.contains(name))
+            return error() << "Module instance binding requires a fresh ordinary Name";
+          auto results = directModuleResults(call, at, decl.symbol, values,
+                                             structuralInstances);
+          if (failed(results) ||
+              failed(registerDirectModuleHandle(name, stmt, *contract, at,
+                         decl.symbol, structuralStorage, structuralInstances)))
+            return failure();
+          continue;
+        }
+      }
       auto value =
           expression(call, at, decl.symbol, values, structuralInstances);
       if (failed(value))
@@ -3062,6 +3088,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
     if (target.kind() != "Name" || !initializer ||
         values.contains(target.string("id")) ||
         names.contains(target.string("id")) ||
+        structuralInstances.contains(target.string("id")) ||
         structs.contains(target.string("id")) ||
         behavioralRules.contains(target.string("id")))
       return error()
@@ -3233,7 +3260,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       return error() << "unbound instance '" << instance.name << "'";
   if (decl.system && returned && returned.child("value"))
     return error() << "@system cannot return a value";
-  if (!returned && !decl.system)
+  if (!returned && !decl.system && decl.returnShape != ReturnShape::None)
     return error() << "behavioral module requires a return";
   SmallVector<Value> outputs;
   auto node = returned ? returned.child("value") : AstNode();
