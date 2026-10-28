@@ -992,3 +992,12 @@ under `tests/fixtures/historical_examples/`; they are comparison assets, not
 current examples or passing results. Retained independent native/RTL oracles
 validate hardware behavior in the existing gate/nightly entrypoints; authoring
 and ordinary simulation do not establish those oracle results.
+
+## Method composition
+
+For shared state use the single [method composition contract](../extensions/compose.md).
+Keep ordinary updates in Methods, admission in leading `ops.<operation>.ready`
+declarations, and only overlapping successful updates in the composer return.
+The outer business Rules own cross-resource atomic commit. Do not introduce
+empty action schemas, request/commit buses, a separate commit Rule, or compatibility
+switches for the previous full-composer form.

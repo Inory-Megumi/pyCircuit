@@ -1,4 +1,5 @@
 #include "ACIRSourceContracts.h"
+#include "SourceCompose.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
@@ -896,6 +897,37 @@ LogicalResult StateUpdateOp::verify() {
                    "state update intent");
 }
 
+LogicalResult SourceAdmitOp::verify() {
+    auto method = dyn_cast<SourceMethodOp>((*this)->getParentOp());
+    if (!method || !method.getGuard().hasOneBlock() || (*this)->getBlock() != &method.getGuard().front())
+        return emitOpError() << "admit is only valid directly in a composed Method guard";
+    HardwareAnalysis analysis((*this)->getParentOfType<mlir::ModuleOp>());
+    if (failed(predicate(analysis, getLocal(), scope(*this), *this, "admit local readiness")) ||
+            !areEquivalentHardwareTypes(getLocal().getType(), getReady().getType()) ||
+            failed(occurrence(*this))) return failure();
+    auto module = method->getParentOfType<ModuleOp>();
+    SourceMethodOp composer;
+    for (auto other : module.getBody().front().getOps<SourceMethodOp>()) {
+        auto contract = other->getAttrOfType<DictionaryAttr>("ac.compose");
+        auto names = contract ? contract.getAs<ArrayAttr>("operations") : ArrayAttr();
+        if (names && llvm::is_contained(names, method.getSymNameAttr())) {
+            if (composer) return emitOpError() << "admit Method belongs to multiple compose groups";
+            composer = other;
+        }
+    }
+    if (!composer || getReleases().empty())
+        return emitOpError() << "admit requires nonempty releases in the same compose group";
+    auto names = composer->getAttrOfType<DictionaryAttr>("ac.compose").getAs<ArrayAttr>("operations");
+    llvm::StringSet<> seen;
+    for (Attribute raw : getReleases()) {
+        auto name = dyn_cast<StringAttr>(raw);
+        if (!name || !seen.insert(name.getValue()).second || name == method.getSymNameAttr() ||
+                !llvm::is_contained(names, name))
+            return emitOpError() << "admit releases must name distinct other operations in the same compose group";
+    }
+    return success();
+}
+
 LogicalResult SourceStateReadOp::verify() {
   if (failed(transactionPlacement(*this, true, true)))
     return failure();
@@ -1131,7 +1163,9 @@ LogicalResult SourceMethodOp::verifyRegions() {
   llvm::append_range(arguments, getCaptures().getTypes());
   if (failed(region(*this, 0, arguments, {})))
     return failure();
-  return region(*this, 1, arguments, getFunctionType().getResults());
+  if (failed(region(*this, 1, arguments, getFunctionType().getResults())))
+    return failure();
+  return detail::verifySourceCompose(*this);
 }
 
 LogicalResult SourceMethodCallOp::verify() {
@@ -1197,6 +1231,8 @@ LogicalResult SourceMethodCallOp::verifySymbolUses(SymbolTableCollection &) {
   if (failed(resolved))
     return failure();
   auto bindings = resolved->bindings;
+  if (resolved->method.definition && resolved->method.definition->hasAttr("ac.compose"))
+    return emitOpError() << "compose definitions cannot be called as Methods";
   auto signature = resolved->method.getFunctionType();
   if (getArguments().size() != signature.getNumInputs() ||
       getResults().size() != signature.getNumResults())

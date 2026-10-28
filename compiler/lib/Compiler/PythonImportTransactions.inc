@@ -1019,6 +1019,9 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
                  << "guard requires a Boolean or authoritative one-bit value";
         yielded.push_back(predicate->value);
       }
+      if (callable.composeReady) {
+#include "PythonImportComposeReadyGuard.inc"
+      }
       return yielded;
     }
     AstNode returned;
@@ -1030,7 +1033,7 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
     // A Rule's explicit parameter boundary applies to every assignment, even
     // when the actual argument is an ordinary value rather than an owner.
     for (const Port &port : callable.inputs)
-      if (!states.contains(port.name))
+      if (!callable.composition && !states.contains(port.name))
         environment.boundaries[port.name] = port.node.child("annotation")
             ? BindingBoundary{port, true}
             : inferredBoundary(port.name, environment.values.lookup(port.name), port.node, true);
@@ -1180,6 +1183,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
           : values.lookup(loopControls.back().continuing);
       for (size_t i = start; i < parent.array(field).size(); ++i) {
         AstNode statement = parent.item(field, i);
+        if (callable.composition && llvm::any_of(callable.composeReadyStatements,
+                [&](const AstNode &ready) { return sameSourceSite(ready, statement); })) continue;
         if (docstring(statement))
           continue;
         if (!loopControls.empty()) {
@@ -2374,6 +2379,9 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
     if (emittedMethods.contains(methodName)) return success();
     auto &entry = *methods.find(methodName);
     SourceCallableDecl &callable = entry.second;
+    auto previousComposeNames = activeComposeNames;
+    activeComposeNames = callable.composition ? &callable.composeNames : nullptr;
+    auto restoreComposeNames = llvm::scope_exit([&] { activeComposeNames = previousComposeNames; });
     for (const Port &port : callable.inputs) {
       if (states.contains(port.name) && callable.syntax.marker == MarkerKind::Method)
         return error() << "Method parameter shadows an owner state";
@@ -2437,6 +2445,10 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
         2);
 
     emittedMethods[methodName] = method;
+    if (callable.composition) {
+      method->setAttr("ac.compose", callable.composition);
+      method->setAttr("sym_visibility", at.getStringAttr("private"));
+    }
     for (auto [index, port] : llvm::enumerate(callable.inputs))
       if (callable.syntax.marker == MarkerKind::Rule &&
           callable.assignedFormals.contains(port.name) && !callable.stateFormals.contains(port.name))
@@ -2451,7 +2463,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
       llvm::StringMap<Value> values;
       for (auto [index, port] : llvm::enumerate(callable.inputs)) {
         Value argument = block->addArgument(port.type, method->getLoc());
-        values[port.name] = argument;
+        // Composer ports are compiler-owned views, not source-local names.
+        values[callable.composition ? "@" + port.name : port.name] = argument;
         if (callable.privateSpecialization && index < callable.actualFacts.size()) {
           auto facts = valueInfo(callable.actualFacts[index]);
           facts.value = argument;
@@ -2470,6 +2483,52 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
       auto yielded = emitStatements(callable, inside, values, regionIndex == 0);
       if (failed(yielded))
         return failure();
+      if (regionIndex == 1 && callable.composition) {
+#include "PythonImportComposeDefaults.inc"
+      }
+      if (regionIndex == 1 && !callable.composition) {
+        // A compose target is a candidate group, including fields unchanged by
+        // this operation. Close each root with its statement-time candidate.
+        // These identities add no state change; they give every group member
+        // the same invocation boundary, including derived scalar targets.
+        llvm::StringSet<> closedTargets;
+        for (const auto &definition : methods) {
+          auto contract = definition.second.composition;
+          if (!contract || !llvm::is_contained(contract.getAs<ArrayAttr>("operations"),
+                                               inside.getStringAttr(methodName))) continue;
+          for (Attribute raw : contract.getAs<ArrayAttr>("targets")) {
+            auto name = cast<StringAttr>(raw);
+            if (!closedTargets.insert(name.getValue()).second) continue;
+            bool complete = false;
+            ac::HardwareAnalysis analysis(*body);
+            for (auto write : block->getOps<ac::SourceStateWriteOp>()) {
+              if (write.getStateAttr() != name || !write.getSelectors().empty()) continue;
+              auto literal = write.getPath().getDefiningOp<ac::BitsConstantOp>();
+              if (!literal) continue;
+              auto evaluated = analysis.evaluateStatic(literal.getValue(), {}, literal);
+              auto integer = succeeded(evaluated) ? dyn_cast<ac::MathIntAttr>(*evaluated) : ac::MathIntAttr();
+              complete |= integer && integer.getCanonicalValue() == "1";
+            }
+            if (complete) continue;
+            auto state = states.find(name.getValue());
+            if (state == states.end()) return error() << "compose candidate root is unavailable";
+            auto path = trueValue(callable.declaration, inside, decl.symbol);
+            if (failed(path)) return failure();
+            auto origin = sourceOccurrence(inside, decl.symbol, callable.declaration);
+            auto read = createOp(inside, method->getLoc(), ac::SourceStateReadOp::getOperationName(),
+                {*path}, {state->second.type},
+                {inside.getNamedAttr("state", name),
+                 inside.getNamedAttr("selectors", inside.getArrayAttr({})),
+                 inside.getNamedAttr("occurrence", origin)});
+            createOp(inside, method->getLoc(), ac::SourceStateWriteOp::getOperationName(),
+                {*path, read->getResult(0)}, {},
+                {inside.getNamedAttr("state", name),
+                 inside.getNamedAttr("selectors", inside.getArrayAttr({})),
+                 inside.getNamedAttr("occurrence", origin),
+                 inside.getNamedAttr("ac.compose_hold", inside.getUnitAttr())});
+          }
+        }
+      }
       createOp(inside,
                callable.declaration.location(b.getContext(), source.path),
                ac::YieldOp::getOperationName(), *yielded, {}, {});
@@ -2809,6 +2868,11 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
       continue;
     if (statement.kind() == "FunctionDef") {
       StringRef name = statement.string("name");
+      auto decorator = statement.array("decorator_list").size() == 1
+                           ? statement.item("decorator_list", 0) : AstNode();
+      if (decorator.kind() == "Call" && intrinsic(decorator.child("func"), "compose")) {
+#include "PythonImportCompose.inc"
+      }
       if (statement.array("decorator_list").empty()) {
         if (instances.contains(name))
           return error() << "pure helper cannot replace an instance binding";
@@ -2821,7 +2885,7 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
                        << "' cannot be rebound before its Rule declaration";
       if (rules.contains(name) && rules[name].lexical &&
           failed(noteNestedRuleDeclaration(statement))) return failure();
-      if (methods.contains(name)) snapshot(methodCaptures[name]);
+      if (methods.contains(name) && !methods[name].composition) snapshot(methodCaptures[name]);
       if (rules.contains(name) && rules[name].lexical) {
         snapshot(ruleCaptures[name]);
         if (failed(registerRule(statement, statement))) return failure();

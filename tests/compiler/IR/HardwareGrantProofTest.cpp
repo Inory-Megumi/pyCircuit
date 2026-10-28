@@ -142,6 +142,11 @@ TEST_F(HardwareGrantProofTest, FourStateOracleChecksAllGrantPairs) {
   op(View::Eq, {a, b});
   op(View::Ne, {a, b});
   op(View::Eq, {inverse, b});
+  Node knownOne = op(View::IsTrue, {a});
+  Node knownZero = op(View::IsTrue, {inverse});
+  op(View::Not, {knownOne});
+  op(View::Not, {knownZero});
+  op(View::And, {op(View::Not, {knownOne}), op(View::Not, {knownZero})});
   // Independent scalar 0/1/X/Z evaluation, not the two-rail construction.
   constexpr int X = 2;
   auto and4 = [](int x, int y) { return x == 0 || y == 0 ? 0 : x == 1 && y == 1 ? 1 : X; };
@@ -155,6 +160,7 @@ TEST_F(HardwareGrantProofTest, FourStateOracleChecksAllGrantPairs) {
       if (n.fullyKnown) { values[i] = llvm::APSInt(n.fullyKnown->value.getCanonicalValue()).isZero() ? 0 : 1; continue; }
       int p = values[n.operands[0]], q = n.operands.size() > 1 ? values[n.operands[1]] : X;
       if (n.kind == View::Not) values[i] = p < 2 ? 1 - p : X;
+      else if (n.kind == View::IsTrue) values[i] = int(p == 1);
       else if (n.kind == View::And) values[i] = and4(p, q);
       else if (n.kind == View::Or) values[i] = or4(p, q);
       else if (n.kind == View::Eq || n.kind == View::Ne)
@@ -185,6 +191,41 @@ TEST_F(HardwareGrantProofTest, IndependentFieldsAndUnknownValuesCannotAcquireFac
   Node caseEquality = raw();
   auto opaque = p->disjoint(op(View::Not, {caseEquality}), progress);
   ASSERT_TRUE(mlir::succeeded(opaque)); EXPECT_FALSE(*opaque);
+}
+
+TEST_F(HardwareGrantProofTest, SharedOpaqueEnableCoveragePreservesFourStateMeaning) {
+  Node enabled = raw(), first = raw(), second = raw();
+  Node notFirst = op(View::Not, {first}), notSecond = op(View::Not, {second});
+  Node a = op(View::And, {enabled, first});
+  Node b = op(View::And, {op(View::And, {enabled, notFirst}), second});
+  Node c = op(View::And, {op(View::And, {enabled, notFirst}), notSecond});
+  Node partial = op(View::Or, {a, b});
+  Node covered = op(View::Or, {partial, c});
+  auto p = proof();
+  auto complete = p->disjoint(enabled, op(View::Not, {covered}));
+  auto omitted = p->disjoint(enabled, op(View::Not, {partial}));
+  ASSERT_TRUE(mlir::succeeded(complete)) << p->failureReason().str();
+  ASSERT_TRUE(mlir::succeeded(omitted)) << p->failureReason().str();
+  EXPECT_TRUE(*complete);
+  EXPECT_FALSE(*omitted);
+  // Independent 0/1/X/Z oracle. Unknown branches are not silently promoted
+  // to known ones; reached guard-known checks remain separately mandatory.
+  constexpr int X = 2;
+  auto and4 = [](int x, int y) { return x == 0 || y == 0 ? 0 : x == 1 && y == 1 ? 1 : X; };
+  auto or4 = [](int x, int y) { return x == 1 || y == 1 ? 1 : x == 0 && y == 0 ? 0 : X; };
+  auto not4 = [](int x) { return x < 2 ? 1 - x : X; };
+  bool missingWitness = false, unknownCoverage = false;
+  for (int e = 0; e < 4; ++e) for (int x = 0; x < 4; ++x) for (int y = 0; y < 4; ++y) {
+    int left = and4(e, x), right = and4(and4(e, not4(x)), y);
+    int last = and4(and4(e, not4(x)), not4(y));
+    int all = or4(or4(left, right), last);
+    EXPECT_FALSE(e == 1 && not4(all) == 1);
+    if (e == 1 && x < 2 && y < 2) EXPECT_EQ(all, 1);
+    missingWitness |= e == 1 && not4(or4(left, right)) == 1;
+    unknownCoverage |= e == 1 && all == X;
+  }
+  EXPECT_TRUE(missingWitness);
+  EXPECT_TRUE(unknownCoverage);
 }
 
 TEST_F(HardwareGrantProofTest,

@@ -237,6 +237,7 @@ private:
     };
     SmallVector<Registration, 0> registrations;
     bool distinctRegistrations = true;
+    bool allCheckGroupsSampled = true;
     bool hasSamplingMetadata = false, hasWiring = false;
   };
   FailureOr<uint64_t> checkComparisonAllowance(uint64_t count,
@@ -278,6 +279,7 @@ private:
           Budget::add(Budget::multiply(3, *occurrenceCost), *requiredCost));
       if (required) {
         if (!required.empty()) {
+          local.allCheckGroupsSampled &= op->hasAttr("ac.sampled_admission");
           // Prove the raw registration groups are distinct before using the
           // direct sampled-row allowance. Structural equality includes numeric
           // attributes with different widths; pointer inequality is not proof.
@@ -1162,7 +1164,7 @@ private:
             "ac.message", "ac.sampled_admission", "ac.transaction_wiring",
             "ac.queue_wiring", "ac.system_samples", "ac.registration_path",
             "ac.lexical_registration", "ac.registration_owner",
-            "ac.transaction_returns"}) {
+            "ac.transaction_returns", "ac.compose", "ac.state_composition"}) {
         Attribute attribute = op->getAttr(key);
         auto cost = structureCost(attribute, op);
         if (failed(cost))
@@ -1178,8 +1180,19 @@ private:
         }
         if (attribute &&
             (key == "ac.sampled_admission" || key == "ac.transaction_wiring" ||
-             key == "ac.queue_wiring"))
+             key == "ac.queue_wiring" || key == "ac.state_composition"))
           local.hasSamplingMetadata = true;
+        if (attribute && key == "ac.state_composition") {
+          auto stage = analysis.getPackage()->getAttrOfType<StringAttr>("ac.stage");
+          if (!directRule || !stage || (stage.getValue() != "routed" && stage.getValue() != "final")) {
+            op->emitOpError() << "ac.state_composition requires a direct Rule in a routed or final package";
+            return WalkResult::interrupt();
+          }
+        }
+        if (attribute && key == "ac.compose" && !isa<SourceMethodOp>(op)) {
+          op->emitOpError() << "ac.compose requires a source Method";
+          return WalkResult::interrupt();
+        }
         if (directRule && key == "ac.sampled_admission" && attribute) {
           auto schema = sampledSchemaCost(attribute, op);
           if (failed(schema))
@@ -1243,11 +1256,13 @@ private:
                           Budget::add(local.terminalKeyCost,
                                       Budget::multiply(local.terminalKeys,
                                                        local.keyMax)))));
-      if (local.rules == local.sampledRules && local.distinctRegistrations) {
+      if (local.allCheckGroupsSampled && local.distinctRegistrations) {
         // Distinct authenticated sampled registrations have no CheckID tree: each
         // RequiredCheck occupies its proved row ordinal. Terminal lookup pays
         // one complete semantic ID comparison, including width-equivalent
         // integer attributes, instead of repeated tree comparisons.
+        // Rules without checks create no registration group. In particular,
+        // an unrelated composer does not change this association algorithm.
         mapCost = Budget::add(
             Budget::multiply(3, local.checkKeys),
             Budget::add(Budget::multiply(3, local.terminalKeys),

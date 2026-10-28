@@ -56,6 +56,27 @@ public:
     }
     return core.disjoint(*lp, *rp);
   }
+  FailureOr<bool> disjointExecutionPaths(const ac::TransactionStatePlan &plan,
+                                          ac::StateWriteId a, ac::StateWriteId b) {
+    auto left = path(plan, {}, a, false), right = path(plan, {}, b, false);
+    if (failed(left) || failed(right)) return failure();
+    return core.disjoint(*left, *right);
+  }
+  // Operation bandwidth is global to the resource. Different fields or row
+  // addresses are not evidence that two invocations fit one operation port.
+  FailureOr<bool> disjointInvocations(const ac::TransactionStatePlan &first,
+                                      ac::StateWriteId a,
+                                      const ac::TransactionStatePlan &second,
+                                      ac::StateWriteId b) {
+    auto left = path(first, {}, a, false), right = path(second, {}, b, false);
+    if (failed(left) || failed(right)) return failure();
+    auto branches = core.disjoint(*left, *right);
+    if (failed(branches) || *branches) return branches;
+    left = path(first, {}, a);
+    right = path(second, {}, b);
+    if (failed(left) || failed(right)) return failure();
+    return core.disjoint(*left, *right);
+  }
   StringRef failureReason() const { return core.failureReason(); }
 private:
   uint64_t lookupCost() const {

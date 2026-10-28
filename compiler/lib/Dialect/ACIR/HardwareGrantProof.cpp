@@ -68,7 +68,8 @@ struct HardwareGrantProof::Impl {
     if (!inspect) return failure();
     auto view = inspect(node);
     if (failed(view)) return failure();
-    unsigned count = view->kind == NodeView::Raw ? 0 : view->kind == NodeView::Not ? 1 :
+    unsigned count = view->kind == NodeView::Raw ? 0 :
+                     (view->kind == NodeView::Not || view->kind == NodeView::IsTrue) ? 1 :
                      view->kind == NodeView::Select ? 3 : 2;
     if (view->operands.size() != count) {
       fail("owner-enable proof adapter has invalid node arity");
@@ -290,6 +291,9 @@ struct HardwareGrantProof::Impl {
                .isZero();
       if (truth != polarity)
         result.kind = Result::Impossible;
+    } else if (view.kind == NodeView::IsTrue) {
+      // A false known-one test includes unknown input; it does not prove !x.
+      if (polarity) result = required(view.operands[0], true, depth + 1);
     } else if (view.kind == NodeView::Not) {
       result = required(view.operands[0], !polarity, depth + 1);
     } else if (view.kind == NodeView::And || view.kind == NodeView::Or) {

@@ -392,6 +392,14 @@ def ACIR_StateUpdateOp : ACIR_Op<"state.update", [
   let hasVerifier = 1;
 }
 
+def ACIR_SourceAdmitOp : ACIR_Op<"admit", [Pure]> {
+    let summary = "Admit from local readiness or a same-owner peer commit";
+    let arguments = (ins ACIR_BitsType:$local, ArrayAttr:$releases,
+        DictionaryAttr:$occurrence);
+    let results = (outs ACIR_BitsType:$ready);
+    let hasVerifier = 1;
+}
+
 def ACIR_SourceStateReadOp : ACIR_Op<"state.read", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "Read a selected transaction-local owner candidate";

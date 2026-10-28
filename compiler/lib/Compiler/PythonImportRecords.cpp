@@ -2,6 +2,7 @@
 #include "LiteralPayloadWires.h"
 #include "Dialect/ACIR/ACIRSourceContracts.h"
 #include "Dialect/ACIR/HardwareGrantProof.h"
+#include "Dialect/ACIR/SourceCompose.h"
 #include "SourceDeclarationContext.h"
 #include "SourceRuleWrites.h"
 
@@ -107,6 +108,12 @@ struct SourceCallableDecl {
   bool autonomous = false;
   SmallVector<Value> actualFacts;
   SmallVector<DictionaryAttr> specializationAncestry;
+  DictionaryAttr composition;
+  llvm::StringMap<std::string> composeNames;
+  SmallVector<AstNode> composeReadyStatements;
+  AstNode composeReady;
+  llvm::StringMap<std::string> composeReadyStates;
+  llvm::StringMap<std::string> composeReadyPeers;
 };
 struct CallableDecl {
   FlatSymbolRefAttr symbol;
@@ -426,6 +433,7 @@ struct LoopLoweringContext {
 };
 
 class Importer final : public SourceDeclarationContext::Implementation {
+  const llvm::StringMap<std::string> *activeComposeNames = nullptr;
 public:
   Importer(const CapturedSource &source, DictionaryAttr owner,
            const SourceHeaderRegistry &headers,
@@ -1597,9 +1605,9 @@ FailureOr<PreparedNominalJoin> Importer::prepareNominalJoin(
     Value yes, Value no, std::optional<BindingBoundary> binding,
     const AstNode &node, OpBuilder &thenAt, OpBuilder &elseAt,
     FlatSymbolRefAttr ownerSymbol) {
-  if (!isa<ac::EnumType, ac::StructType>(yes.getType()) ||
-      !isa<ac::EnumType, ac::StructType>(no.getType()))
-    return error() << "changed branch local requires matching Bits or nominal payloads";
+  if (!isa<ac::EnumType, ac::StructType, ac::TableType>(yes.getType()) ||
+      !isa<ac::EnumType, ac::StructType, ac::TableType>(no.getType()))
+    return error() << "changed branch local requires matching hardware payloads";
   if (yes.getType() != no.getType())
     return error() << "branch values require identical nominal types";
   auto lexicalOwner = [](OpBuilder &at) {
@@ -3247,6 +3255,24 @@ FailureOr<Value> Importer::expression(
     llvm::StringMap<Value> &values, llvm::StringMap<Instance *> &instances,
     std::optional<Type> expected,
     llvm::StringMap<SmallVector<Value>> *captures) {
+  if (activeComposeNames) {
+    SmallVector<StringRef> parts;
+    AstNode root = node;
+    while (root.kind() == "Attribute") {
+      parts.push_back(root.string("attr"));
+      root = root.child("value");
+    }
+    if (root.kind() == "Name") {
+      std::string name = root.string("id").str();
+      for (StringRef part : llvm::reverse(parts)) name += "." + part.str();
+      auto found = activeComposeNames->find(name);
+      if (found != activeComposeNames->end()) {
+        auto value = values.lookup(found->second);
+        if (!value) return error() << "compose input is unavailable";
+        return value;
+      }
+    }
+  }
   if (!captures && activeRule && activeRule->outputs)
     captures = activeRule->outputs;
   if (node.kind() == "Name" &&

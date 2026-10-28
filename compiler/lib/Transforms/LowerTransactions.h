@@ -137,6 +137,11 @@ struct TransactionPreparedControl {
 };
 
 struct TransactionPreparation {
+  struct PeerAdmission {
+    ac::SourceAdmitOp operation;
+    ac::InvocationFrameId frame;
+    uint64_t capture;
+  };
   const ac::TransactionStatePlan *plan = nullptr;
   llvm::SmallVector<ac::BoundValueId> liveIns;
   llvm::SmallVector<TransactionCandidatePreparation> outputs;
@@ -144,6 +149,7 @@ struct TransactionPreparation {
   llvm::SmallVector<TransactionPreparedControl, 0> controls;
   llvm::SmallVector<TransactionQueueResource, 0> resources;
   llvm::SmallVector<TransactionQueueExternalPop, 0> externalPops;
+  llvm::SmallVector<PeerAdmission, 0> peerAdmissions;
   llvm::SmallVector<TransactionQueueProposal, 0> queueProposals;
   llvm::SmallVector<TransactionMemoryProposal, 0> memoryProposals;
   llvm::SmallVector<TransactionWriteDomain, 0> writeDomains;
@@ -246,6 +252,37 @@ struct MaterializedMemoryPin {
   llvm::SmallVector<MaterializedBranchResult, 0> selections;
 };
 
+struct ComposeContribution {
+    uint64_t transaction = 0, operation = 0;
+    llvm::SmallVector<uint64_t> outputs;
+    uint64_t frame = 0, write = 0, guard = 0;
+    llvm::SmallVector<std::pair<uint64_t, bool>> path;
+};
+struct ComposeGroup {
+    ac::ModuleOp module;
+    llvm::SmallVector<ac::InstanceOp> path;
+    ac::SourceMethodOp composer;
+    llvm::SmallVector<ac::SourceStateOp> states;
+    llvm::SmallVector<ComposeContribution> contributions;
+    bool expanded = false;
+    struct WriteView {
+        mlir::DictionaryAttr descriptor;
+        mlir::Type type;
+        llvm::SmallVector<std::pair<uint64_t, uint64_t>> domains;
+    };
+    llvm::SmallVector<WriteView> writes;
+};
+struct MaterializedCompose {
+    ComposeGroup source;
+    ac::RuleOp rule;
+    llvm::SmallVector<mlir::Value> inputs, results;
+    llvm::SmallVector<mlir::Value> arguments;
+    mlir::Value enable;
+    llvm::SmallVector<mlir::Operation *> generated;
+    llvm::SmallVector<MaterializedBranchResult, 0> branchSelections;
+    llvm::SmallVector<MaterializedBranchResult, 0> callSelections;
+};
+
 struct MaterializedTransactionLowering {
   mlir::OwningOpRef<mlir::ModuleOp> module;
   mlir::IRMapping packageMap;
@@ -255,6 +292,7 @@ struct MaterializedTransactionLowering {
   llvm::SmallVector<MaterializedQueueMerge, 0> queueMerges;
   llvm::SmallVector<mlir::Value, 0> queueDisabled;
   llvm::SmallVector<MaterializedMemoryPin, 0> memoryPins;
+  llvm::SmallVector<MaterializedCompose, 0> compositions;
 };
 
 mlir::FailureOr<PreparedTransactionLowering>

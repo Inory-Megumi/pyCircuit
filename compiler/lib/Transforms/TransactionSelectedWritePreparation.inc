@@ -1,7 +1,9 @@
   LogicalResult writeDomains(TransactionPreparation &prepared) {
     const auto &plan = *prepared.plan;
-    if (llvm::none_of(plan.writes, [](const auto &write) {
-          return !write.selectors.empty();
+    if (llvm::none_of(plan.writes, [&](const auto &write) {
+          auto composer = ac::detail::stateComposer(plan.owners[write.owner].declaration);
+          auto contract = composer ? composer->template getAttrOfType<DictionaryAttr>("ac.compose") : DictionaryAttr();
+          return !write.selectors.empty() || (contract && contract.get("writes"));
         })) return success();
     auto predicateType = hardware.resolveType(plan.values[plan.clockValue].value.getType(),
                                                plan.instances[0].bindings,
@@ -11,6 +13,9 @@
     for (auto [id, write] : llvm::enumerate(plan.writes)) {
       if (!charge(budget, write.operation, 4)) return failure();
       if (write.forwardedProposal) continue;
+      // Candidate closure is not an authored write. In particular it must
+      // never turn an untouched field into an active compose write mask.
+      if (write.operation->hasAttr("ac.compose_hold")) continue;
       detail::TransactionWriteDomain domain;
       domain.write = id;
       domain.selectors = write.selectors;

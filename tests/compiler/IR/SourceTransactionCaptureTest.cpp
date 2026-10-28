@@ -5782,5 +5782,10 @@ def Root(data: ac.bits[W], *, W: int = 8) -> ac.bits[W]:
     EXPECT_EQ(preserved.afterTransactions, "after-transactions");
   }
 }
+#include "ComposeCaptureTests.inc"
+#include "ComposeCallsTests.inc"
+#include "PeerAdmissionTests.inc"
+#include "ComposeConvergedTests.inc"
+#include "ComposeAdmissionReviewTests.inc"
 
 } // namespace

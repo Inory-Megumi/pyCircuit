@@ -25,7 +25,8 @@ public:
     uint64_t width;
   };
   struct NodeView {
-    enum Kind { Raw, Not, And, Or, Select, Eq, Ne } kind = Raw;
+    // IsTrue is the one-bit known-one predicate (x === 1), including X/Z -> 0.
+    enum Kind { Raw, Not, And, Or, Select, Eq, Ne, IsTrue } kind = Raw;
     llvm::SmallVector<Node, 3> operands;
     std::optional<uint64_t> width;
     std::optional<Constant> fullyKnown;

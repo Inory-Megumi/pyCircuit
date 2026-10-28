@@ -1,8 +1,10 @@
 #include "EntryBoundary.h"
+#include "HardwareSourceCheckPreflight.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include <array>
 
 using namespace mlir;
 namespace acir::ac::detail {
@@ -124,9 +126,22 @@ LogicalResult verifyEntryBoundary(const HardwareAnalysis &analysis, bool normali
   // generated routes may mention this compiler identity. An otherwise ignored
   // attribute must not become a second alias or an unauthenticated use.
   bool badReference = false;
+  // Cache only complete absence checks of immutable attribute subtrees.
+  // Position-specific provenance exceptions below never enter this cache.
+  // Collisions evict a proof and require the full traversal on the next miss.
+  std::array<Attribute, 512> referenceFree{};
+  if (failed(debit(SourceCheckBudget::bytes(sizeof(referenceFree)), package)))
+      return failure();
   std::function<void(Attribute, Operation *)> references = [&](Attribute attr, Operation *op) {
     if (badReference) return;
     if (failed(debit(1, op))) { badReference = true; return; }
+    bool retain = isa<DictionaryAttr, ArrayAttr, StaticExprAttr>(attr);
+    size_t slot = 0;
+    if (retain) {
+        if (failed(debit(2, op))) { badReference = true; return; }
+        slot = llvm::DenseMapInfo<Attribute>::getHashValue(attr) % referenceFree.size();
+        if (referenceFree[slot] == attr) return;
+    }
     if (auto symbol = dyn_cast<SymbolRefAttr>(attr)) {
       badReference = symbol.getRootReference().getValue() == entryBoundarySymbol;
     } else if (auto dictionary = dyn_cast<DictionaryAttr>(attr)) {
@@ -136,6 +151,9 @@ LogicalResult verifyEntryBoundary(const HardwareAnalysis &analysis, bool normali
     } else if (auto expression = dyn_cast<StaticExprAttr>(attr)) {
       references(expression.getTree(), op);
     }
+    if (badReference || !retain) return;
+    if (failed(debit(1, op))) { badReference = true; return; }
+    referenceFree[slot] = attr;
   };
   auto referencesWalk = package.walk([&](Operation *op) {
     for (NamedAttribute attr : op->getAttrs()) {

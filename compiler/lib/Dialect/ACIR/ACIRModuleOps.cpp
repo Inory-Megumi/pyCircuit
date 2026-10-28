@@ -23,7 +23,7 @@ bool equivalentTypes(TypeRange lhs, TypeRange rhs) {
 } // namespace
 namespace detail {
 bool isCombinationalHardwareOperation(Operation *operation) {
-  return isa<BitsConstantOp, BitsConstant4Op, BitsUnaryOp, BitsBinaryOp,
+  return isa<SourceAdmitOp, BitsConstantOp, BitsConstant4Op, BitsUnaryOp, BitsBinaryOp,
              BitsCompareOp, BitsSelectOp, BitsConcatOp, BitsExtractOp,
              BitsResizeOp, StructCreateOp, StructGetOp, EnumCreateOp,
              EnumToBitsOp, EnumFromBitsOp, TableCreateOp, TableSplatOp,

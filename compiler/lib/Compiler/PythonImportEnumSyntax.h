@@ -17,6 +17,7 @@ enum class MarkerKind {
   System,
   Rule,
   Method,
+  Compose,
   Struct,
   Bits,
   Table,

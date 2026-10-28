@@ -669,6 +669,9 @@
                                      size_t stateIndex,
                                      const StateCandidate &candidate) {
     auto &state = states[stateIndex];
+    if (state.composed && candidate.rule == state.writer)
+      return success(succeeded(domainSame(data, candidate.data, state.storage, "composed data")) &&
+                     succeeded(domainSame(enable, candidate.enable, state.storage, "composed enable")));
     auto sampled = writerAdmission(occurrences[candidate.occurrence], candidate.rule);
     if (failed(sampled)) return failure();
     bool domains = false;

@@ -2,6 +2,7 @@
 #include "Dialect/ACIR/HardwareGrantProof.h"
 #include "../Dialect/ACIR/SourceFormalCandidateSelection.h"
 #include "LowerTransactions.h"
+#include "Dialect/ACIR/SourceCompose.h"
 #include "TransactionValueAvailability.h"
 #include "Dialect/ACIR/HardwareValueAvailability.h"
 #include "Dialect/ACIR/HardwareQueueResources.h"
@@ -785,6 +786,13 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
             item.controls.size() + plan.bodyChecks.size())
       return site.emitOpError()
              << "transaction prepared body-effect inventory is inconsistent";
+    for (auto [ordinal, request] : llvm::enumerate(item.peerAdmissions)) {
+      if (!charge(budget, site) || !request.operation || request.frame >= plan.frames.size() ||
+          !plan.frames[request.frame].method ||
+          request.operation->getParentOp() != plan.frames[request.frame].method.operator->() ||
+          request.capture != item.liveIns.size() + item.externalPops.size() + ordinal)
+        return site.emitOpError() << "transaction peer admission bounds are inconsistent";
+    }
     uint64_t fire = SourceCheckBudget::add(
         plan.transaction->getNumResults(),
         SourceCheckBudget::multiply(2, item.outputs.size()));
@@ -1081,6 +1089,7 @@ SmallVector<ac::InstanceOp> anchorPath(const ac::TransactionStatePlan &plan,
   return result;
 }
 
+
 DictionaryAttr routedOccurrence(const ac::TransactionStatePlan &plan) {
   if (plan.registrationPath.empty()) return plan.transaction->getAttrOfType<DictionaryAttr>("occurrence");
   Builder b(plan.transaction->getContext());
@@ -1246,6 +1255,10 @@ SmallVector<unsigned, 4> memoryOperands(const ac::TransactionMemoryAccess &acces
 }
 
 #include "TransactionSourceGrantProof.inc"
+#include "TransactionComposePreparation.inc"
+Value bitsLiteral(Type payload, DictionaryAttr occurrence, Location location,
+                  bool one, OpBuilder &builder);
+#include "TransactionPeerAdmission.inc"
 
 /// Admission and growth accounting finish on the intact input before cloning.
 /// Routing only summarizes the existing analysis identities; it does not
@@ -1339,6 +1352,11 @@ public:
           failed(admissionMetadata(prepared)))
         return failure();
     budget.setPhase("prep: prospective queue routes");
+    for (auto &transaction : transactions) {
+      auto peers = collectPeerAdmissions(transaction, budget);
+      if (failed(peers)) return failure();
+      transaction.peerAdmissions = std::move(*peers);
+    }
     if (failed(queueProspectiveRoutes())) return failure();
     // Every definition participates, including definitions not selected by the
     // System. Summaries are relative to definitions, never root occurrences.
@@ -2071,6 +2089,13 @@ private:
       for (const auto &prior : summary) {
         if (!charge(budget, module)) return failure();
         if (ownerKey != key(prior.ownerPath, prior.state)) continue;
+        if (auto state = writer.state.getDefiningOp<ac::SourceStateOp>();
+            state && ac::detail::stateComposer(state)) {
+          if (prior.plan->routingModule != writer.plan->routingModule ||
+              prior.transactionPath != writer.transactionPath)
+            return module.emitOpError() << "compose writers must share one routing scope";
+          continue;
+        }
         {
           if (!prior.plan || !writer.plan) return failure();
           if (!grant) {
@@ -2548,6 +2573,10 @@ public:
       captures.push_back(*placeholder);
     }
     Type predicateType = captures[prepared.clockCapture].getType();
+    for (const auto &request : prepared.peerAdmissions) {
+      if (request.capture != captures.size()) return failure();
+      captures.push_back(captures[prepared.clockCapture]);
+    }
     for (auto output : prepared.outputs) {
       types.push_back(plan.owners[output.binding.owner].payloadType);
       types.push_back(predicateType);
@@ -3269,6 +3298,19 @@ private:
           savedObservations[found->second].values.push_back(*mapped);
         }
         ++nextEffectEvent;
+      } else if (auto admit = dyn_cast<ac::SourceAdmitOp>(op)) {
+        auto request = llvm::find_if(prepared.peerAdmissions, [&](const auto &entry) {
+          return entry.operation == admit && entry.frame == frame;
+        });
+        if (request == prepared.peerAdmissions.end() || !charge(budget, admit, 32)) return failure();
+        Value credit = builder.getBlock()->getArgument(request->capture);
+        OperationState state(admit.getLoc(), ac::BitsBinaryOp::getOperationName());
+        state.addOperands({frames[frame].lookup(admit.getLocal()), credit});
+        state.addTypes(admit.getReady().getType());
+        state.addAttribute("opcode", builder.getStringAttr("or"));
+        auto result = builder.create(state);
+        frames[frame].map(admit.getReady(), result->getResult(0));
+        frames[frame].map(admit.operator->(), result);
       } else {
         if (failed(verifyClosedPurePayload(
                 &op, budget,
@@ -3391,6 +3433,7 @@ Value bitsLiteral(Type payload, DictionaryAttr occurrence, Location location,
 }
 
 #include "TransactionDomainCommitMaterialization.inc"
+#include "TransactionComposeMaterialization.inc"
 #include "TransactionQueuePins.inc"
 #include "TransactionMemoryPins.inc"
 
@@ -3518,6 +3561,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
                           mlir::ModuleOp staged, IRMapping &mapping,
                           SmallVectorImpl<MaterializedTransaction> &records,
                           SmallVectorImpl<detail::MaterializedIncomingCommit> &incomingCommits,
+                          SmallVectorImpl<detail::MaterializedCompose> &compositions,
                           SourceCheckBudget &budget) {
   ac::HardwareAnalysis hardware(prepared.original);
   Builder attributes(staged.getContext());
@@ -3785,6 +3829,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     }
     for (auto [ordinal, binding] : llvm::enumerate(transaction.outputs)) {
       const auto &owner = transaction.plan->owners[binding.binding.owner];
+      if (ac::detail::stateComposer(owner.declaration)) continue;
       auto path = anchorPath(*transaction.plan, owner.anchor);
       auto declaration = owner.declaration;
       auto &candidates = nextValues[transaction.plan->routingModule];
@@ -3854,6 +3899,71 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         return original.emitOpError() << "independent writer group bypassed disjoint domain composition";
       candidates.try_emplace(key, std::make_pair(data, enable));
     }
+  }
+  auto composeGroups = collectComposeGroups(prepared, budget);
+  if (failed(composeGroups)) return failure();
+  for (auto &group : *composeGroups) {
+    detail::MaterializedCompose record;
+    record.source = group;
+    auto module = cast<ac::ModuleOp>(mapping.lookup(group.module.operator->()));
+    OpBuilder composeBuilder(module.getBody().front().getTerminator());
+    for (auto state : group.states) {
+      auto old = routes.value(group.module, group.path, state.getQ());
+      if (failed(old)) return failure();
+      record.inputs.push_back(*old);
+    }
+    unsigned count = group.states.size();
+    auto operationNames = group.composer->getAttrOfType<DictionaryAttr>("ac.compose").getAs<ArrayAttr>("operations");
+    if (group.expanded) {
+      for (const auto &call : group.contributions) {
+        const auto &transaction = prepared.transactions[call.transaction];
+        auto writer = records[call.transaction].rule;
+        for (auto output : call.outputs) {
+          record.inputs.push_back(writer->getResult(transaction.outputs[output].enableResult));
+          record.inputs.push_back(writer->getResult(transaction.outputs[output].dataResult));
+        }
+        for (auto [control, polarity] : call.path) {
+          (void)polarity;
+          record.inputs.push_back(writer->getResult(transaction.checkBase + 2 * control));
+        }
+      }
+    } else {
+    for (unsigned op = 0; op < operationNames.size(); ++op) {
+      auto contribution = llvm::find_if(group.contributions, [&](const auto &entry) { return entry.operation == op; });
+      if (contribution == group.contributions.end()) {
+        auto zero = bitsLiteral(group.states.front().getClk().getType(), group.composer.getOccurrence(),
+                                group.composer.getLoc(), false, composeBuilder);
+        record.inputs.push_back(zero);
+        record.generated.push_back(zero.getDefiningOp());
+        for (unsigned i = 0; i < count; ++i) record.inputs.push_back(record.inputs[i]);
+      } else {
+        const auto &transaction = prepared.transactions[contribution->transaction];
+        auto rule = records[contribution->transaction].rule;
+        record.inputs.push_back(rule->getResult(transaction.outputs[contribution->outputs.front()].enableResult));
+        for (auto output : contribution->outputs)
+          record.inputs.push_back(rule->getResult(transaction.outputs[output].dataResult));
+      }
+    }
+    for (unsigned op = 0; op < operationNames.size(); ++op) {
+      auto found = llvm::find_if(group.contributions, [&](const auto &entry) { return entry.operation == op; });
+      if (found == group.contributions.end()) continue;
+      const auto &contribution = *found;
+      const auto &transaction = prepared.transactions[contribution.transaction];
+      auto rule = records[contribution.transaction].rule;
+      for (auto output : llvm::drop_begin(contribution.outputs))
+        record.inputs.push_back(rule->getResult(transaction.outputs[output].enableResult));
+    }
+    }
+    for (const auto &view : group.writes) for (auto [callID, domainID] : view.domains) {
+      if (!prepayAppend(budget, group.composer, record.inputs)) return failure();
+      const auto &call = group.contributions[callID];
+      const auto &domain = prepared.transactions[call.transaction].writeDomains[domainID];
+      record.inputs.push_back(records[call.transaction].rule->getResult(domain.result));
+    }
+    if (failed(materializeComposeBody(record, prepared, compositions.size(), composeBuilder, budget))) return failure();
+    for (auto [i, state] : llvm::enumerate(group.states))
+      nextValues[group.module][routingKey(group.path, state.getQ())] = {record.results[i], record.enable};
+    compositions.push_back(std::move(record));
   }
   // All Rules exist before ordinary transaction results disappear. Captures
   // from another Rule retain actual graph dependencies and saved SSA values.
@@ -4458,6 +4568,8 @@ public:
         return failure();
     }
     budget.setPhase("transaction source routing proof");
+    if (failed(compositionProof())) return failure();
+    if (failed(peerAdmissionProof())) return failure();
     if (failed(routingProof())) return failure();
     budget.setPhase("transaction queue wiring proof");
     if (failed(queueWiringProof())) return failure();
@@ -4707,6 +4819,8 @@ private:
   }
 
 #include "TransactionSelectedWriteProof.inc"
+#include "TransactionComposeSourceProof.inc"
+#include "TransactionPeerAdmissionProof.inc"
 
   LogicalResult localBranchProof(Operation *branch, Type resolvedRoot,
                                  const ac::HardwareBindings &bindings,
@@ -5074,6 +5188,15 @@ private:
       return success();
     }
     using WriterSlot = std::pair<uint64_t, uint64_t>;
+    for (const auto &composition : candidate.compositions) {
+      if (composition.source.module != originalModule || composition.source.path != path) continue;
+      for (auto [ordinal, target] : llvm::enumerate(composition.source.states)) {
+        if (target->getResult(0) != state) continue;
+        if (!enable || data != composition.results[ordinal] || *enable != composition.enable)
+          return reject("compose final D/E differs from authenticated joint update");
+        return success();
+      }
+    }
     SmallVector<WriterSlot, 0> matching;
     for (uint64_t index : prepared.transactionSchedule) {
       const auto &transaction = prepared.transactions[index];
@@ -5130,6 +5253,12 @@ private:
       for (size_t j = 0; j < i; ++j) {
         const auto &first = scoped[i], &second = scoped[j];
         const auto &a = *first.transaction->plan, &b = *second.transaction->plan;
+        if (auto declaration = state.getDefiningOp<ac::SourceStateOp>();
+            declaration && ac::detail::stateComposer(declaration)) {
+          if (a.routingModule != b.routingModule || first.scope != second.scope)
+            return reject("compose scoped contributors differ");
+          continue;
+        }
         if (!scopedGrant) {
           if (!charge(budget, originalModule, 1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof)))) return failure();
           scopedGrant = std::make_unique<SourceWriteGrantProof>(originalModule, hardware, budget);
@@ -5839,6 +5968,13 @@ private:
     auto expectedExternalPops = originalQueueExternalPops(preparation, expectedCaptures);
     if (failed(expectedExternalPops)) return failure();
     expectedCaptures += expectedExternalPops->size();
+    auto expectedPeers = collectPeerAdmissions(preparation, budget);
+    if (failed(expectedPeers) || expectedPeers->size() != preparation.peerAdmissions.size())
+      return reject("original peer admission inventory differs");
+    for (auto [expected, actual] : llvm::zip(*expectedPeers, preparation.peerAdmissions))
+      if (expected.operation != actual.operation || expected.frame != actual.frame ||
+          expected.capture != actual.capture) return reject("original peer admission capture differs");
+    expectedCaptures += expectedPeers->size();
     uint64_t expectedFire = SourceCheckBudget::add(
         transaction->getNumResults(),
         SourceCheckBudget::multiply(2, preparation.outputs.size()));
@@ -5871,12 +6007,14 @@ private:
     }
     SmallVector<Attribute> expectedDomains;
     uint64_t domainCursor = 0;
-    bool partialWrites = llvm::any_of(plan.writes, [](const auto &write) {
-      return !write.selectors.empty();
+    bool partialWrites = llvm::any_of(plan.writes, [&](const auto &write) {
+      auto composer = ac::detail::stateComposer(plan.owners[write.owner].declaration);
+      auto contract = composer ? composer->template getAttrOfType<DictionaryAttr>("ac.compose") : DictionaryAttr();
+      return !write.selectors.empty() || (contract && contract.get("writes"));
     });
     for (auto [id, write] : llvm::enumerate(plan.writes)) {
       if (!charge(budget, transaction)) return failure();
-      if (!partialWrites || write.forwardedProposal) continue;
+      if (!partialWrites || write.forwardedProposal || write.operation->hasAttr("ac.compose_hold")) continue;
       if (domainCursor == preparation.writeDomains.size())
         return reject("original write domain inventory is missing");
       const auto &domain = preparation.writeDomains[domainCursor++];
@@ -5998,6 +6136,7 @@ private:
     actual.erase("ac.required_checks");
     actual.erase("ac.sampled_admission");
     actual.erase("ac.value_availability_captures");
+    if (!preparation.peerAdmissions.empty()) actual.erase("ac.peer_admissions");
     if (expected.getDictionary(transaction.getContext()) !=
         actual.getDictionary(transaction.getContext()))
       return reject("original transaction registration/attributes differ");
@@ -7229,6 +7368,28 @@ private:
               return failure();
             sourceObservations[id].values.push_back(mapped);
           }
+        } else if (auto admit = dyn_cast<ac::SourceAdmitOp>(op)) {
+          auto request = llvm::find_if(preparation.peerAdmissions, [&](const auto &entry) {
+            return entry.operation == admit && entry.frame == frame;
+          });
+          if (request == preparation.peerAdmissions.end()) return reject("original peer admission is absent");
+          auto actual = record.frames[frame].lookupOrNull(&op);
+          Value local = authenticated[frame].lookupOrNull(admit.getLocal());
+          Value credit = rule.getBody().front().getArgument(request->capture);
+          Builder attributes(admit.getContext());
+          if (!local || (last && (!actual || !last->isBeforeInBlock(actual))) ||
+              failed(generatedProof(actual, ac::BitsBinaryOp::getOperationName(),
+                  {local, credit}, {admit.getReady().getType()},
+                  attributes.getDictionaryAttr({attributes.getNamedAttr("opcode", attributes.getStringAttr("or"))}),
+                  admit.getLoc(), &rule.getBody().front()))) return reject("original peer admission expression differs");
+          if (record.frames[frame].lookupOrNull(admit.getReady()) != actual->getResult(0))
+            return reject("original peer admission result differs");
+          auto localID = replay.find(admit.getLocal(), plan.frames[frame].anchor, frame);
+          auto resultID = replay.find(admit.getReady(), plan.frames[frame].anchor, frame);
+          if (failed(localID) || failed(resultID) || failed(replay.requireAvailable(*localID, point())) ||
+              failed(replay.assignValidity(*resultID, point()))) return failure();
+          authenticated[frame].map(admit.getReady(), actual->getResult(0));
+          last = actual;
         } else {
           auto actual = record.frames[frame].lookupOrNull(&op);
           if (!actual || !operations.contains(actual) ||
@@ -8362,10 +8523,11 @@ materializeTransactionLowering(PreparedTransactionLowering &prepared,
   result.module =
       cast<mlir::ModuleOp>(prepared.original->clone(result.packageMap));
   if (failed(materialize(prepared, *result.module, result.packageMap,
-                         result.transactions, result.incomingCommits, budget)))
+                         result.transactions, result.incomingCommits, result.compositions, budget)))
     return failure();
   if (failed(QueuePinMaterializer(prepared, result, budget).run())) return failure();
   if (failed(MemoryPinMaterializer(prepared, result, budget).run())) return failure();
+  if (failed(materializePeerAdmissions(prepared, result, budget))) return failure();
   if (failed(materializeTransactionValueAvailability(prepared, result, budget)))
     return failure();
   return std::move(result);

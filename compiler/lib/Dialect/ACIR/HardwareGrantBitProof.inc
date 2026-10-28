@@ -99,6 +99,15 @@
       result = {Decision(!one), Decision(one)};
     } else if (view.kind == NodeView::Raw) {
       result = rawBit();
+    } else if (view.kind == NodeView::IsTrue) {
+      auto input = canonical(view.operands[0], depth + 1);
+      if (failed(input)) { fail("known-one normalization failed"); return result; }
+      auto inputWidth = width(*input);
+      if (failed(inputWidth) || !*inputWidth || **inputWidth != 1 || *view.width != 1) {
+        fail("known-one proof requires single-bit input and result"); return result;
+      }
+      auto a = bit(*input, 0, depth + 1);
+      result = {invert(a.one), a.one};
     } else if (view.kind == NodeView::Not) {
       auto a = bit(view.operands[0], ordinal, depth + 1);
       result = {a.one, a.zero};

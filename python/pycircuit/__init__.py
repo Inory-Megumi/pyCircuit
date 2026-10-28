@@ -9,6 +9,7 @@ __all__ = [
     "instance_ref",
     "rule",
     "method",
+    "compose",
     "struct",
     "bits",
     "table",
@@ -54,6 +55,11 @@ def rule(declaration=None, *, guard=None):
 
 def method(declaration=None, *, guard=None):
     """Declare an instance operation within its caller's Rule transaction."""
+    raise RuntimeError("pyCircuit declarations require pycircuit compile")
+
+
+def compose(*, target, operations):
+    """Define readiness and resolve overlapping successful Method operations."""
     raise RuntimeError("pyCircuit declarations require pycircuit compile")
 
 

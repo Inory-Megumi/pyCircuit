@@ -36,6 +36,7 @@ MarkerKind classifyImportedMarker(StringRef module, StringRef remoteName) {
       .Case("system", MarkerKind::System)
       .Case("rule", MarkerKind::Rule)
       .Case("method", MarkerKind::Method)
+      .Case("compose", MarkerKind::Compose)
       .Case("struct", MarkerKind::Struct)
       .Case("bits", MarkerKind::Bits)
       .Case("table", MarkerKind::Table)

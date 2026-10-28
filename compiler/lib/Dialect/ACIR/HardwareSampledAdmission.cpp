@@ -2,6 +2,7 @@
 #include "HardwareQueueResources.h"
 #include "HardwareValueAvailability.h"
 #include "HardwareGrantProof.h"
+#include "SourceCompose.h"
 #include "ACIRSourceContracts.h"
 #include "HardwareSourceCheckPreflight.h"
 #include "HardwareSourceChecks.h"
@@ -1711,6 +1712,7 @@ uint64_t prefixIndexStorageBytes() {
 }
 struct IdentityMemoEntry {
   HardwareIdentityEndpoint input, output;
+  std::optional<size_t> occurrence;
 };
 class IdentityMemo {
 public:
@@ -1719,7 +1721,8 @@ public:
       : analysis(analysis), budget(budget), policy(policy) {}
   FailureOr<const HardwareIdentityEndpoint *>
   borrow(Value value, const HardwareIdentityScope &scope,
-            const HardwareBindings *preparedBindings = nullptr) {
+            const HardwareBindings *preparedBindings = nullptr,
+            std::optional<size_t> occurrence = {}) {
     if (!value)
       return failure();
     Operation *site = valueSite(value);
@@ -1744,8 +1747,17 @@ public:
     // SSA first, then retain the complete scope comparison within that range.
     for (; position != cache.end() && position->first == key; ++position) {
       const auto &entry = position->second;
-      if (failed(budget.debit(1, site)) ||
-          failed(payScope(scope, budget, site)) ||
+      if (failed(budget.debit(1, site)))
+        return failure();
+      // Only WiringProof supplies these IDs, after authenticating the complete
+      // actual scope. One immutable proof root fixes bindings and stop policy;
+      // distinct occurrence IDs must never share a same-callee SSA verdict.
+      if (occurrence && entry.occurrence) {
+          if (occurrence == entry.occurrence)
+              return &entry.output;
+          continue;
+      }
+      if (failed(payScope(scope, budget, site)) ||
           failed(payScope(entry.input.scope, budget, site)))
         return failure();
       // Immutable IR and this memo's fixed complete stop policy make the same
@@ -1777,7 +1789,7 @@ public:
         failed(payScope(input->scope, budget, valueSite(value))))
       return failure();
     auto saved = cache.emplace_hint(position, key,
-        IdentityMemoEntry{std::move(*input), std::move(*output)});
+        IdentityMemoEntry{std::move(*input), std::move(*output), occurrence});
     // std::map nodes remain stable across insertions; this memo never erases.
     // Borrowers cannot change the endpoint or outlive the validation owner.
     return &saved->second.output;
@@ -3122,6 +3134,7 @@ struct State {
   // The complete candidate set is immutable after writers(). This theorem is
   // state-wide; incoming-stage and physical D/E proofs remain per connection.
   bool writeDomainsProven = false;
+  bool composed = false;
 };
 struct PrivateRoute {
   HardwareIdentityEndpoint endpoint;
@@ -3146,6 +3159,15 @@ struct EffectOwnerProof {
   Operation *terminal;
   ArrayAttr invocation;
   ResolvedSourceEffectOwner owner;
+  // Only completed site/span authentication under this exact owner and binding.
+  llvm::DenseSet<std::pair<Attribute, Attribute>> checkSites;
+};
+struct EffectDomainProof {
+    size_t occurrence;
+    ModuleOp receiver;
+    SmallVector<InstanceOp, 0> path;
+    const HardwareIdentityEndpoint *clock;
+    const HardwareIdentityEndpoint *reset;
 };
 struct BoundWriterAdmission {
   ModuleOp definition;
@@ -3190,6 +3212,10 @@ public:
     budget.setPhase("sampled wiring writers");
     if (failed(writers()))
       return failure();
+    budget.setPhase("sampled wiring peer admission");
+    if (failed(peerAdmissions())) return failure();
+    budget.setPhase("sampled wiring composition");
+    if (failed(compositions())) return failure();
     budget.setPhase("sampled wiring external inputs");
     if (failed(externalInputs()))
       return failure();
@@ -3302,6 +3328,7 @@ private:
       witness |= isa<SourceStateOp>(operation);
       if (auto rule = dyn_cast<RuleOp>(operation)) {
         witness |= rule->hasAttr("ac.sampled_admission");
+        witness |= rule->hasAttr("ac.state_composition");
         if (auto required =
                 rule->getAttrOfType<ArrayAttr>("ac.required_checks"))
           for (auto raw : required) {
@@ -3494,7 +3521,7 @@ private:
     // expand() established this complete binding under the immutable root.
     // occurrenceFor() authenticates the actual path, including same-callee
     // siblings; no binding or verdict is shared with another proof root.
-    return identity->borrow(value, scope, &occurrences[*owner].bindings);
+    return identity->borrow(value, scope, &occurrences[*owner].bindings, *owner);
   }
   FailureOr<HardwareIdentityEndpoint>
   normal(Value value, const HardwareIdentityScope &scope) {
@@ -3530,6 +3557,41 @@ private:
                              const HardwareIdentityEndpoint &clock,
                              const HardwareIdentityEndpoint &reset,
                              Operation *terminal) {
+    // This WiringProof owns one immutable root, complete bindings and stop
+    // policy. Reuse receiver normalization only for this exact occurrence and
+    // full logical path; every effect still compares its actual physical pins.
+    size_t occurrence = &entry - occurrences.data();
+    auto compare = [&](const HardwareIdentityEndpoint &receiverClock,
+                       const HardwareIdentityEndpoint &receiverReset) -> LogicalResult {
+        if (failed(budget.debit(2, terminal)))
+            return failure();
+        // Borrowed endpoints from this one IdentityMemo have stable addresses.
+        // Exact object identity needs no repeated scope/binding comparison.
+        if (&receiverClock == &clock && &receiverReset == &reset)
+            return success();
+        if (failed(payScope(receiverClock.scope, budget, terminal)) ||
+            failed(payScope(receiverReset.scope, budget, terminal)) ||
+            failed(payScope(clock.scope, budget, terminal)) ||
+            failed(payScope(reset.scope, budget, terminal)))
+            return failure();
+        if (!sameEndpoint(receiverClock, clock) ||
+            !sameEndpoint(receiverReset, reset))
+            return terminal->emitOpError()
+                << "sampled effect receiver domain differs from actual writer "
+                   "physical clock/reset";
+        return success();
+    };
+    for (const auto &proof : effectDomains) {
+        if (failed(budget.debit(1, terminal)))
+            return failure();
+        if (proof.occurrence != occurrence || proof.receiver != logical.terminal)
+            continue;
+        if (failed(budget.debit(SourceCheckBudget::add(
+                1, std::min(proof.path.size(), logical.path.size())), terminal)))
+            return failure();
+        if (proof.path == logical.path)
+            return compare(*proof.clock, *proof.reset);
+    }
     auto receiver = copyScope(entry.scope, budget, terminal);
     if (failed(receiver) || failed(charge(budget, terminal, logical.path.size(),
                                           sizeof(InstanceOp))))
@@ -3553,11 +3615,14 @@ private:
         logical.terminal->getRegion(0).front().getArgument(*rst), *receiver);
     if (failed(receiverClock) || failed(receiverReset))
       return failure();
-    if (!sameEndpoint(**receiverClock, clock) ||
-        !sameEndpoint(**receiverReset, reset))
-      return terminal->emitOpError()
-             << "sampled effect receiver domain differs from actual writer "
-                "physical clock/reset";
+    if (failed(compare(**receiverClock, **receiverReset)) ||
+        failed(charge(budget, terminal, 1, sizeof(EffectDomainProof))) ||
+        failed(charge(budget, terminal, logical.path.size(), sizeof(InstanceOp))))
+        return failure();
+    // IdentityMemo's map nodes remain stable until this WiringProof is destroyed.
+    effectDomains.push_back({occurrence, logical.terminal,
+        SmallVector<InstanceOp, 0>(logical.path.begin(), logical.path.end()),
+        *receiverClock, *receiverReset});
     return success();
   }
   FailureOr<EffectTerminalIndex *> effectTerminals(const Occurrence &entry) {
@@ -3677,7 +3742,7 @@ private:
       return failure();
     effectProofCache.owners.push_back({entry.module, entry.bindings, rule,
                                        terminal, invocation,
-                                       std::move(*owner)});
+                                       std::move(*owner), {}});
     return &effectProofCache.owners.back().owner;
   }
   LogicalResult checkOwner(const Occurrence &entry, DictionaryAttr id,
@@ -3690,7 +3755,7 @@ private:
     // that complete receiver descent under these exact definition bindings.
     // Reuse it across sibling checks, while authenticating each new site's
     // origin/span and every physical occurrence's actual clock/reset below.
-    for (const auto &proof : effectProofCache.owners) {
+    for (auto &proof : effectProofCache.owners) {
       if (failed(budget.debit(1, terminal)))
         return failure();
       if (proof.definition != entry.module || proof.rule != rule ||
@@ -3705,22 +3770,30 @@ private:
         continue;
       if (proof.terminal != terminal) {
         auto site = id.getAs<DictionaryAttr>("check");
-        auto error = [&] { return terminal->emitOpError(); };
-        if (failed(payAttribute(site, budget, terminal)) ||
-            failed(payAttribute(location, budget, terminal)) ||
-            failed(verifyOccurrence(site, error)) ||
-            failed(verifySourceSpan(location, error)) ||
-            failed(budget.debit(2, terminal)) ||
-            failed(verifyOriginDefinition(
-                site, FlatSymbolRefAttr::get(proof.owner.terminal->getAttrOfType<StringAttr>("sym_name")),
-                "source effect site", error)))
-          return failure();
-        auto sourceOwner = proof.owner.terminal->getAttrOfType<DictionaryAttr>(
-            "source_owner");
-        if (location.getAs<StringAttr>("path") !=
-            sourceOwner.getAs<StringAttr>("path"))
-          return error()
-                 << "source effect span must match logical owner SourceOwner";
+        std::pair<Attribute, Attribute> key{site, location};
+        if (failed(budget.debit(1, terminal)))
+            return failure();
+        if (!proof.checkSites.contains(key)) {
+            auto error = [&] { return terminal->emitOpError(); };
+            if (failed(payAttribute(site, budget, terminal)) ||
+                failed(payAttribute(location, budget, terminal)) ||
+                failed(verifyOccurrence(site, error)) ||
+                failed(verifySourceSpan(location, error)) ||
+                failed(budget.debit(2, terminal)) ||
+                failed(verifyOriginDefinition(
+                    site, FlatSymbolRefAttr::get(proof.owner.terminal->getAttrOfType<StringAttr>("sym_name")),
+                    "source effect site", error)))
+                return failure();
+            auto sourceOwner = proof.owner.terminal->getAttrOfType<DictionaryAttr>(
+                "source_owner");
+            if (location.getAs<StringAttr>("path") !=
+                sourceOwner.getAs<StringAttr>("path"))
+                return error()
+                    << "source effect span must match logical owner SourceOwner";
+            if (failed(charge(budget, terminal, 1, sizeof(key) + 64)))
+                return failure();
+            proof.checkSites.insert(key);
+        }
       }
       return effectDomain(entry, proof.owner, clock, reset, terminal);
     }
@@ -3746,6 +3819,8 @@ private:
   }
 
 #include "HardwareWriteDomainProof.inc"
+#include "HardwareComposeProof.inc"
+#include "HardwarePeerAdmissionProof.inc"
 
   using IndexedWriteEndpoints =
       std::pair<HardwareIdentityEndpoint, HardwareIdentityEndpoint>;
@@ -3894,10 +3969,12 @@ private:
         if (failed(parsed))
           return failure();
         const auto *sampled = *parsed;
-        auto clock = normal(sampled->clock, entry.scope);
-        auto reset = normal(sampled->reset, entry.scope);
-        if (failed(clock) || failed(reset))
+        auto clockEndpoint = normalBorrowed(sampled->clock, entry.scope);
+        auto resetEndpoint = normalBorrowed(sampled->reset, entry.scope);
+        if (failed(clockEndpoint) || failed(resetEndpoint))
           return failure();
+        const auto *clock = *clockEndpoint;
+        const auto *reset = *resetEndpoint;
         // A lifted callback's public values still belong to its lexical
         // definition. Its physical host may be a stateless entry boundary
         // without a source-call signature. Authenticate the complete actual
@@ -4615,6 +4692,12 @@ private:
       Operation *consumer = use.getOwner();
       unsigned operand = use.getOperandNumber();
       bool sanctioned = false;
+      if (route.kind == PrivateRoute::EffectOperand && route.operand == 0) {
+        if (failed(budget.debit(orderedLookupCost(compositionControlUses.size()), consumer)))
+          return failure();
+        sanctioned = compositionControlUses.count(
+            {currentOccurrence, consumer, operand, route.terminal});
+      }
       if (route.kind != PrivateRoute::EffectOperand) {
         auto first = allowedUses.lower_bound(
             {currentOccurrence, consumer, operand, 0, PrivateRoute::Data});
@@ -4837,6 +4920,8 @@ private:
   SmallVector<State, 0> states;
   SmallVector<HardwareIdentityEndpoint> stops;
   SmallVector<PrivateRoute> privateRoutes;
+  using CompositionControlUse = std::tuple<size_t, Operation *, unsigned, Operation *>;
+  std::set<CompositionControlUse> compositionControlUses;
   llvm::DenseMap<uint64_t, SmallVector<size_t>> occurrenceIndex;
   llvm::DenseMap<std::pair<size_t, Operation *>, size_t> stateIndex;
   llvm::DenseMap<std::pair<size_t, Attribute>, size_t> stateTargetProofs;
@@ -4844,6 +4929,7 @@ private:
   EffectProofCache &effectProofCache;
   bool &provedAvailability;
   std::optional<IdentityMemo> identity;
+  SmallVector<EffectDomainProof, 0> effectDomains;
   std::map<PrefixIndexKey, const SampledAdmissionView *, PrefixIndexLess> writerAdmissions;
 };
 bool localWitness(ModuleOp module) {

@@ -1,5 +1,6 @@
 #include "Compiler/HardwareEmitCommon.h"
 #include "Dialect/ACIR/HardwareSampledAdmission.h"
+#include "Dialect/ACIR/EntryBoundary.h"
 #include "Dialect/ACIR/HardwareSourceCheckPreflight.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
@@ -1643,6 +1644,149 @@ TEST_F(HardwareSampledAdmissionWiringTest,
   constexpr unsigned guardCount = 8;
   makeSharedPrefixGuards(guardCount);
   expectDefaultPlanAndTinyBudget(guardCount, 1);
+}
+
+TEST_F(HardwareSampledAdmissionWiringTest,
+       UncheckedRulePreservesDirectSampledCheckAssociation) {
+    build(false);
+    constexpr unsigned guardCount = 32;
+    makeSharedPrefixGuards(guardCount);
+    auto &body = definition.getBody().front();
+    b.setInsertionPoint(body.getTerminator());
+    OperationState state(loc(), ac::RuleOp::getOperationName());
+    state.addOperands(one);
+    state.addTypes(bit());
+    state.addAttributes({f("name", b.getStringAttr("identity")),
+                         f("occurrence", occurrence(900))});
+    state.addRegion();
+    auto unchecked = cast<ac::RuleOp>(b.create(state));
+    auto *uncheckedBody = new Block;
+    unchecked.getBody().push_back(uncheckedBody);
+    auto value = uncheckedBody->addArgument(bit(), loc());
+    b.setInsertionPointToEnd(uncheckedBody);
+    op(ac::YieldOp::getOperationName(), value);
+    expectDefaultPlanAndTinyBudget(guardCount, 1);
+}
+
+TEST_F(HardwareSampledAdmissionWiringTest,
+       SharedCheckSitesReauthenticateChangedOriginsAndSpans) {
+    for (unsigned mutation = 0; mutation != 3; ++mutation) {
+        SCOPED_TRACE(mutation);
+        build(false);
+        makeSharedPrefixGuards(8);
+        auto sampled = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+        SmallVector<Attribute> controls(sampled.getAs<ArrayAttr>("controls").getValue());
+        NamedAttrList updated(sampled);
+        updated.set("controls", b.getArrayAttr(controls));
+        rule->setAttr("ac.sampled_admission", updated.getDictionary(&context));
+        auto before = printPackage();
+        ASSERT_TRUE(succeeded(capture([&] { return verifyWiring(); }))) << diagnostics;
+        EXPECT_EQ(printPackage(), before);
+        if (!mutation)
+            continue;
+
+        auto required = rule->getAttrOfType<ArrayAttr>("ac.required_checks");
+        SmallVector<Attribute> rows(required.getValue());
+        NamedAttrList last(cast<DictionaryAttr>(rows.back()));
+        ac::SourceExpectOp terminal;
+        for (auto candidate : definition.getBody().front().getOps<ac::SourceExpectOp>())
+            terminal = candidate;
+        ASSERT_TRUE(terminal);
+        if (mutation == 1) {
+            NamedAttrList location(cast<DictionaryAttr>(last.get("location")));
+            location.set("path", b.getStringAttr("foreign.py"));
+            auto altered = location.getDictionary(&context);
+            last.set("location", altered);
+            terminal->setAttr("location", altered);
+        } else {
+            NamedAttrList id(cast<DictionaryAttr>(last.get("id")));
+            id.set("check", occurrence(8, "Foreign"));
+            auto altered = id.getDictionary(&context);
+            last.set("id", altered);
+            terminal->setAttr("ac.check_id", altered);
+            NamedAttrList control(cast<DictionaryAttr>(controls.back()));
+            control.set("id", altered);
+            controls.back() = control.getDictionary(&context);
+            updated.set("controls", b.getArrayAttr(controls));
+            rule->setAttr("ac.sampled_admission", updated.getDictionary(&context));
+        }
+        rows.back() = last.getDictionary(&context);
+        rule->setAttr("ac.required_checks", b.getArrayAttr(rows));
+        before = printPackage();
+        EXPECT_TRUE(failed(capture([&] { return verifyWiring(); }))) << diagnostics;
+        EXPECT_FALSE(diagnostics.empty());
+        EXPECT_EQ(printPackage(), before);
+    }
+}
+
+TEST_F(HardwareSampledAdmissionWiringTest,
+       CachedReceiverDomainStillRejectsLaterWriterWithSwappedPins) {
+    build(false);
+    auto later = addIndependentSampledRule(1);
+    ASSERT_TRUE(succeeded(capture([&] { return verifyWiring(); }))) << diagnostics;
+    auto &body = definition.getBody().front();
+    later->setOperand(0, body.getArgument(2));
+    later->setOperand(1, body.getArgument(1));
+    ac::SourceExpectOp terminal;
+    for (auto candidate : body.getOps<ac::SourceExpectOp>())
+        terminal = candidate;
+    ASSERT_TRUE(terminal);
+    terminal->setOperand(2, body.getArgument(2));
+    terminal->setOperand(3, body.getArgument(1));
+    auto before = printPackage();
+    EXPECT_TRUE(failed(capture([&] { return verifyWiring(); }))) << diagnostics;
+    EXPECT_NE(diagnostics.find("domain"),
+              std::string::npos) << diagnostics;
+    EXPECT_EQ(printPackage(), before);
+}
+
+TEST_F(HardwareSampledAdmissionWiringTest,
+       SharedDefinitionRetainsDistinctActualReceiverDomains) {
+    build(false);
+    makeSharedPrefixGuards(8);
+    exportValueThroughParent(one, false);
+    auto &body = proofRoot.getBody().front();
+    auto left = *body.getOps<ac::InstanceOp>().begin();
+    auto *right = left->clone();
+    right->setAttr("instance_name", b.getStringAttr("right"));
+    right->setAttr("occurrence", occurrence(32, "Parent"));
+    right->setOperand(1, body.getArgument(2));
+    right->setOperand(2, body.getArgument(1));
+    body.getOperations().insert(body.getTerminator()->getIterator(), right);
+    auto before = printPackage();
+    EXPECT_TRUE(succeeded(capture([&] { return verifyWiring(); }))) << diagnostics;
+    EXPECT_EQ(printPackage(), before);
+    EXPECT_TRUE(failed(capture([&] { return verifyWiring(1); })));
+    EXPECT_NE(diagnostics.find("analysis work budget"), std::string::npos);
+    EXPECT_EQ(printPackage(), before);
+}
+
+TEST_F(HardwareSampledAdmissionWiringTest,
+       SharedEntryMetadataDAGRemainsBoundedAndRejectsReservedReference) {
+    build(false);
+    Attribute shared = FlatSymbolRefAttr::get(&context, "Owner");
+    for (unsigned i = 0; i != 16; ++i)
+        shared = b.getArrayAttr({shared, shared});
+    definition->setAttr("test.shared_metadata", shared);
+    auto verifyEntry = [&](uint64_t limit) {
+        ac::HardwareAnalysis analysis(*package);
+        detail::SourceCheckBudget budget({limit});
+        return detail::verifyEntryBoundary(analysis, false,
+            [&](uint64_t work, Operation *site) { return budget.debit(work, site); });
+    };
+    auto before = printPackage();
+    EXPECT_TRUE(succeeded(capture([&] { return verifyEntry(8192); }))) << diagnostics;
+    EXPECT_EQ(printPackage(), before);
+    EXPECT_TRUE(failed(capture([&] { return verifyEntry(1); })));
+    EXPECT_EQ(printPackage(), before);
+    Attribute forbidden = FlatSymbolRefAttr::get(&context, detail::entryBoundarySymbol);
+    for (unsigned i = 0; i != 16; ++i)
+        forbidden = b.getArrayAttr({shared, forbidden});
+    rule->setAttr("test.reserved_reference", forbidden);
+    before = printPackage();
+    EXPECT_TRUE(failed(capture([&] { return verifyEntry(8192); }))) << diagnostics;
+    EXPECT_NE(diagnostics.find("unauthorized reference"), std::string::npos);
+    EXPECT_EQ(printPackage(), before);
 }
 
 TEST_F(HardwareSampledAdmissionWiringTest,

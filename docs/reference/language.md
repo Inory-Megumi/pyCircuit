@@ -505,6 +505,11 @@ second index level remain unsupported. Overlapping writers
 may use mutually exclusive whole-owner grants or the explicit address-separation
 proof described below. Neither supplies implicit arbitration.
 
+The explicit [Method composition profile](method-compose.md) additionally permits
+listed owner Methods to update the same fixed Bits register group concurrently.
+Its pure `@ac.compose` expression defines the joint next state using the final
+successful operations. Unlisted writers still reject.
+
 When source expressions supply mutually exclusive complete owner enables, rules
 may write the same scalar, overlapping Struct paths or overlapping Table domains:
 
@@ -1699,3 +1704,11 @@ Dynamic hardware creation, host I/O inside designs, arbitrary Python execution,
 legacy CycleAwareSignal/JIT/builders, QueueGraph, `acc.py`, `acc` and `pycc` are
 not alternate compilation paths. Historical examples remain migration references
 until their original behavior runs through this route.
+
+## Method composition
+
+The current compose contract is described in
+[Method composition](../extensions/compose.md): Methods define updates, leading
+`ops.<operation>.ready` assignments define admission, and the composer return
+resolves two or more successful operations. No-call and singleton behavior is
+automatic. There is no legacy full-composer mode or public `ac.admit` API.
