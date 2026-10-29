@@ -829,6 +829,38 @@ def Top(value: ac.u7) -> ac.u7:
     assert final.read_bytes() == original
 
 
+def test_method_actual_bindings_still_check_each_operation(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    text = """import pycircuit as ac
+@ac.module
+def Owner(*, V: int = 1):
+    @ac.method
+    def unused(value: ac.u7) -> ac.u7:
+        saved = value | 1
+        return saved | V
+@ac.module
+def Top() -> None:
+    first = Owner(V=1)
+    second = Owner(V=64)
+"""
+    authored = _write(source, "owners.py", text)
+    unit = tmp_path / "valid"
+    _ok(_compile(source, "owners.py", unit))
+    final = tmp_path / "final.ac"
+    _ok(_link([unit], "checks.owners.Top", final))
+    original = final.read_bytes()
+
+    # The same definition and fixed payload type have a different actual V.
+    # Reusing source metadata must not excuse this later invalid operation.
+    authored.write_text(text.replace("Owner(V=64)", "Owner(V=128)"))
+    invalid = tmp_path / "invalid"
+    _ok(_compile(source, "owners.py", invalid))
+    result = _link([invalid], "checks.owners.Top", final, replace=True)
+    assert result.returncode != 0, "128 must not fit the second instance's u7"
+    assert final.read_bytes() == original
+
+
 def test_method_generic_system_preserves_state_and_four_state_payloads(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

@@ -6,6 +6,7 @@
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PointerUnion.h"
+#include <array>
 #include <functional>
 
 using namespace mlir;
@@ -37,6 +38,10 @@ public:
       : methods(methods), transactions(transactions) {}
   LogicalResult run(ArrayRef<Operation *> modules, SourceModuleLookup lookup,
                     mlir::ModuleOp package = {}) {
+    if (!modules.empty() &&
+        !charge(modules.front(), detail::SourceCheckBudget::bytes(
+                                    sizeof(boundProvenance))))
+      return failure();
     for (Operation *module : modules) {
       if (!charge(module))
         return failure();
@@ -251,17 +256,52 @@ private:
             2 * sizeof(void *))))));
   }
   LogicalResult boundCost(llvm::PointerUnion<Attribute, Type> node,
-                          Operation *site, unsigned depth = 0) {
+                          Operation *site, unsigned depth = 0,
+                          unsigned *height = nullptr) {
+    if (height) *height = 0;
     if (!node) return success();
     if (depth > maxDepth)
       return site->emitOpError() << "bound Method static expression depth exceeded";
     if (!charge(site)) return failure();
+    // Only immutable, closed provenance is shared. Static expressions, types
+    // and actual-bound operation checks retain their full preparation below.
+    DictionaryAttr provenance;
+    size_t slot = 0;
+    if (auto value = dyn_cast<Attribute>(node))
+      if (auto dictionary = dyn_cast<DictionaryAttr>(value)) {
+        if (!charge(site, 2)) return failure();
+        if ((dictionary.size() == 2 &&
+             detail::isVerifiedOccurrenceGrammar(dictionary)) ||
+            (dictionary.size() == 5 &&
+             detail::isVerifiedSourceSpanGrammar(dictionary))) {
+          provenance = dictionary;
+          slot = llvm::DenseMapInfo<DictionaryAttr>::getHashValue(dictionary) %
+                 boundProvenance.size();
+          const auto &cached = boundProvenance[slot];
+          if (cached.key == dictionary) {
+            if (cached.height > maxDepth - depth)
+              return site->emitOpError()
+                     << "bound Method static expression depth exceeded";
+            if (height) *height = cached.height;
+            return success();
+          }
+        }
+      }
     bool valid = true;
+    unsigned subtreeHeight = 0;
+    auto child = [&](llvm::PointerUnion<Attribute, Type> value) {
+      if (!valid || !value) return;
+      unsigned childHeight = 0;
+      if (failed(boundCost(value, site, depth + 1, &childHeight)))
+        valid = false;
+      else
+        subtreeHeight = std::max(subtreeHeight, childHeight + 1);
+    };
     auto attribute = [&](Attribute value) {
-      if (valid && failed(boundCost(value, site, depth + 1))) valid = false;
+      child(value);
     };
     auto type = [&](Type value) {
-      if (valid && failed(boundCost(value, site, depth + 1))) valid = false;
+      child(value);
     };
     if (auto value = dyn_cast<Attribute>(node)) {
       if (auto text = dyn_cast<StringAttr>(value))
@@ -272,7 +312,15 @@ private:
     } else {
       cast<Type>(node).walkImmediateSubElements(attribute, type);
     }
-    return success(valid);
+    if (!valid) return failure();
+    if (provenance) {
+      if (!charge(site)) return failure();
+      // A collision evicts a scan result. Failed or partial scans never enter
+      // this fixed-size cache, and relative height preserves the depth bound.
+      boundProvenance[slot] = {provenance, subtreeHeight};
+    }
+    if (height) *height = subtreeHeight;
+    return success();
   }
   static bool hardwareType(Type type) {
     return isa<BitsType, StructType, EnumType, TableType, TypeParamType>(type);
@@ -873,11 +921,16 @@ private:
   llvm::DenseMap<Attribute, SmallVector<Call, 0>> rowCalls;
   llvm::DenseMap<Operation *, unsigned> instanceMarks;
   llvm::DenseMap<Operation *, SmallVector<HardwareBindings, 0>> completedInstances;
+  struct BoundProvenance {
+    DictionaryAttr key;
+    unsigned height = 0;
+  };
   SmallVector<Operation *, 0> nativeEffectfulBranches;
   SmallVector<Attribute, 0> rowEffectfulBranches;
   SmallVector<Callable> declarations, registrations;
   uint64_t work = 0;
   bool exhausted = false;
+  std::array<BoundProvenance, 512> boundProvenance{};
 };
 } // namespace
 SourceMethodSummariesAnalysis::SourceMethodSummariesAnalysis(
