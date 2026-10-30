@@ -877,7 +877,7 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     llvm::raw_string_ostream out(group.text);
     for (Operation *declaration : unit.declarations)
       if (auto module = dyn_cast<ac::ModuleOp>(declaration)) {
-        if (!reachable.contains(module)) continue;
+        if (context.isPhysical() && !reachable.contains(module)) continue;
         group.path = context.names(module).verilog;
         group.definitions.push_back(
             FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));

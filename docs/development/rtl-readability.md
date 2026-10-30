@@ -486,7 +486,11 @@ and unknown payload branch; only TableGet has a membership result to declare.
 
 Managed ports, instance identifiers and observation paths retain the existing
 native-compatible naming ABI. Readable physical/synthesis names do not change
-that protocol. Provenance visits original source operations in source order;
+that protocol. Managed source groups also retain every final source definition,
+including logical Method entry definitions outside the selected closure.
+Their original root-default ports remain present, with constants supplied by
+the existing wrapper rather than substituted into managed module bodies.
+Provenance visits original source operations in source order;
 pointer-keyed IRMapping iteration must not determine nested Location order.
 Independent compilations retain byte-identical final artifacts, including
 display metadata, for generated System comparisons across backends.

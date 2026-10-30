@@ -218,8 +218,28 @@ def test_narrow_addition_still_wraps_before_widening(ownership_views):
 
 @pytest.mark.parametrize("mode", ["managed", "physical", "synthesis"])
 def test_shared_method_result_is_computed_once(ownership_views, mode):
-    text, _ = ownership_views["Sharing", mode]
-    assert len(re.findall(r"\s\+\s", text)) == 1
+    text, mapping = ownership_views["Sharing", mode]
+    units = modules(text)
+    definitions = {item["rtl_module"]: item for item in mapping["modules"]}
+    root = next(
+        item
+        for item in mapping["modules"]
+        if item["source_symbol"].endswith(".Sharing")
+    )
+    # Managed export retains other source definitions too. Count each actual
+    # instance in this selected closure, including repeated uses of a callee.
+    pending = [(root, ())]
+    additions = 0
+    while pending:
+        definition, ancestors = pending.pop()
+        name = definition["rtl_module"]
+        assert name not in ancestors
+        additions += len(re.findall(r"\s\+\s", units[name]))
+        for allocation in definition["allocations"]:
+            if not allocation["primitive"]:
+                callee = definitions[allocation["rtl_callee"]]
+                pending.append((callee, (*ancestors, name)))
+    assert additions == 1
 
 
 def test_partitioned_navigation_keeps_all_operand_ids_bound(ownership_views):

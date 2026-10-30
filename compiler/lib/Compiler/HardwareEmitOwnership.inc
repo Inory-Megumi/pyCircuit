@@ -45,7 +45,7 @@ bool HardwareEmitContext::rtlChildPartition(const RtlOwnershipPartition *child, 
 }
 
 bool HardwareEmitContext::rtlBaseNeeded(ac::ModuleOp definition) const {
-    return rtlBaseDefinitions.contains(definition);
+    return !isPhysical() || rtlBaseDefinitions.contains(definition);
 }
 
 #include "HardwareEmitOwnershipPlan.inc"
@@ -64,6 +64,9 @@ LogicalResult prepareRtlOwnership(HardwareEmitContext &context) {
         if (auto root = dyn_cast_or_null<ac::ModuleOp>(context.analysis.lookupDefinition(
                 system.getEntry().getAs<FlatSymbolRefAttr>("callee").getValue()))) {
             pendingModules.push_back(root);
+            // Managed definitions keep their complete native-compatible
+            // interface; the existing wrapper supplies root defaults.
+            if (!context.isPhysical()) continue;
             auto layout = ac::getModulePortLayout(root);
             auto bindings = context.rootBindings();
             if (failed(layout) || failed(bindings)) return failure();
