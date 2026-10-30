@@ -11,7 +11,7 @@
       if (!charge(budget, site, 32 + 4 * operands.size() + 2 * types.size() +
                                   2 * attributes.size()) ||
           !prepayAppend(budget, site, result.generated)) return failure();
-      OperationState state(loc, name);
+      OperationState state(ac::sourceIdentityLocation(loc), name);
       state.addOperands(operands); state.addTypes(types); state.addAttributes(attributes);
       for (unsigned i = 0; i < regions; ++i) state.addRegion();
       Operation *created = at.create(state);

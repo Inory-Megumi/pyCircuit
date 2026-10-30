@@ -40,7 +40,7 @@ public:
   Builder(const HardwareAnalysis &analysis, HardwareSourceCheckLimits limits,
           PackageVerificationProfile profile)
       : analysis(analysis), profile(profile), budget(limits), validation(analysis, budget) {}
-  FailureOr<HardwareSourceCheckPlan> build() {
+  FailureOr<HardwareSourceCheckPlan> build(bool includeUnobserved = false) {
     auto package = analysis.getPackage();
     budget.setPhase("raw preflight");
     if (!package)
@@ -119,7 +119,8 @@ public:
     // source assertions: generated reset/prepare/commit must reach every leaf.
     // Reusable modules without checks still avoid hypothetical expansion.
     auto role = root->owner->getAttrOfType<StringAttr>("ac.root_kind");
-    if (!nodes[*rootIndex]->hasChecks && (!role || role.getValue() != "system"))
+    if (!includeUnobserved && !nodes[*rootIndex]->hasChecks &&
+        (!role || role.getValue() != "system"))
       return std::move(plan);
     budget.setPhase("occurrence summary");
     auto expansion = summarize(*rootIndex);
@@ -1824,7 +1825,7 @@ private:
 FailureOr<HardwareSourceCheckPlan>
 buildSourceCheckPlan(const HardwareAnalysis &analysis,
                      HardwareSourceCheckLimits limits,
-                     PackageVerificationProfile profile) {
-  return Builder(analysis, limits, profile).build();
+                     PackageVerificationProfile profile, bool includeUnobserved) {
+  return Builder(analysis, limits, profile).build(includeUnobserved);
 }
 } // namespace acir::ac::detail

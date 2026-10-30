@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from collections.abc import Mapping
@@ -24,6 +26,7 @@ from ._publication import (
     _validate_control,
 )
 from ._publication_fs import _PublicationFileSystem
+from ._rtl_runtime_profile import synthesis_runtime_source
 from ._source_capture import _read_stable_file_bytes
 from ._source_map import _validate_emitted_bundle
 
@@ -139,6 +142,7 @@ def _target_files(payload: dict, target: str):
     groups: dict[tuple[str, str], dict] = {}
     sources: list[str] = []
     rtl_sources: list[str] = []
+    standard_sources = payload.get("rtl_standard_sources", [])
 
     def add(path, text, role):
         _relative_file_path(path)
@@ -166,6 +170,43 @@ def _target_files(payload: dict, target: str):
             elif row["implementation"] is not None:
                 raise _DriverError("header-only source contains implementation text")
     else:
+        if payload.get("rtl_mode") == "synthesis" and standard_sources:
+            installed = Path(
+                os.environ.get("PYC_TOOLCHAIN_ROOT")
+                or native_helper("emit").resolve().parent.parent
+            ).resolve()
+            runtime_sources = []
+            for relative in standard_sources:
+                if relative not in (
+                    "include/verilog/fifo.v",
+                    "include/verilog/sync_mem.v",
+                ):
+                    raise _DriverError(
+                        "synthesis Runtime source lacks a verified profile"
+                    )
+                raw = _read_stable_file_bytes(installed / relative)
+                try:
+                    text = synthesis_runtime_source(raw.decode("utf-8"))
+                except (ValueError, UnicodeDecodeError) as error:
+                    raise _DriverError(str(error)) from error
+                path = "runtime/synthesis/" + Path(relative).name
+                add(path, text, "rtl")
+                rtl_sources.append(path)
+                runtime_sources.append(
+                    {
+                        "source": relative,
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                        "path": path,
+                        "profile": "SYNTHESIS=1,PYCIRCUIT_PLAIN_RTL=1",
+                        "rendered_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    }
+                )
+            add(
+                "runtime_sources.json",
+                json.dumps(runtime_sources, indent=2) + "\n",
+                "runtime-glue",
+            )
+            standard_sources = []
         add("design_top.sv", payload["rtl_core"], "rtl")
         # The package with shared packed types must precede source groups.
         rtl_sources.append("design_top.sv")
@@ -177,6 +218,12 @@ def _target_files(payload: dict, target: str):
         add(
             "ports.json",
             json.dumps(payload["port_availability"], separators=(",", ":")) + "\n",
+            "runtime-glue",
+        )
+    if "rtl_value_names" in payload:
+        add(
+            "rtl-names.json",
+            json.dumps(payload["rtl_value_names"], separators=(",", ":")) + "\n",
             "runtime-glue",
         )
     simulation = bool(
@@ -218,7 +265,7 @@ def _target_files(payload: dict, target: str):
             sources,
             rtl_sources,
             target=target,
-            standard_sources=payload.get("rtl_standard_sources", []),
+            standard_sources=standard_sources,
             root_rtl_name=payload.get("root_rtl_name", ""),
             simulation=simulation,
             needs_four_state=needs_four_state,
@@ -254,10 +301,10 @@ def emit_command(
 ):
     if target not in {"cpp", "verilog"}:
         raise _DriverError("emit target must be cpp or verilog")
-    if rtl_mode not in {"managed", "physical"}:
-        raise _DriverError("RTL mode must be managed or physical")
+    if rtl_mode not in {"managed", "physical", "synthesis"}:
+        raise _DriverError("RTL mode must be managed, physical or synthesis")
     if target != "verilog" and rtl_mode != "managed":
-        raise _DriverError("physical RTL mode requires the verilog target")
+        raise _DriverError("physical/synthesis RTL mode requires the verilog target")
     fs = _PublicationFileSystem()
     source, destination = fs.absolute(final), fs.absolute(output)
     fs.assert_no_symlink_chain(source)

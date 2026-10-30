@@ -15,13 +15,15 @@ struct FinalVerilogSourceParts {
   llvm::SmallVector<std::string> standardSources;
   std::string core, runtimeGlue, rootRtlName;
   std::string simulationTop, portMap;
+  std::string valueNames;
   uint64_t sourceCheckCount = 0;
 };
 mlir::FailureOr<FinalVerilogSourceParts>
 emitVerilogSourceParts(mlir::ModuleOp package, ac::HardwareAnalysis &analysis,
-                       bool physical = false);
+                       bool physical = false, bool synthesis = false);
 mlir::LogicalResult emitVerilog(mlir::ModuleOp package,
                                 ac::HardwareAnalysis &analysis,
-                                llvm::raw_ostream &out, bool physical = false);
+                                llvm::raw_ostream &out, bool physical = false,
+                                bool synthesis = false);
 } // namespace acir::compiler
 #endif

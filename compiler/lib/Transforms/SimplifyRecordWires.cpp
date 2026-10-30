@@ -1,6 +1,7 @@
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "pycircuit/Transforms/Passes.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
@@ -79,7 +80,7 @@ public:
                  rewriter.getNamedAttr("origin", origin),
                  rewriter.getNamedAttr("location", location)}));
         rewriter.setInsertionPoint(get);
-        OperationState state(get.getLoc(),
+        OperationState state(ac::sourceIdentityLocation(get.getLoc()),
                              ac::BitsExtractOp::getOperationName());
         state.addOperands(selected);
         state.addTypes(resultType);
@@ -87,6 +88,7 @@ public:
         replacement = rewriter.create(state)->getResult(0);
       }
     }
+    ac::retainSourceValueNames(get.getResult(), replacement);
     rewriter.replaceOp(get, replacement);
     return success();
   }

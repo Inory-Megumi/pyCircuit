@@ -10,7 +10,7 @@
                   4 + operands.size() + types.size() + attributes.size()) ||
           !prepayAppend(budget, plan.transaction, result.generated))
         return failure();
-      OperationState state(location, name);
+      OperationState state(ac::sourceIdentityLocation(location), name);
       state.addOperands(operands);
       state.addTypes(types);
       state.addAttributes(attributes);

@@ -3,6 +3,8 @@
 #include "mlir/IR/Diagnostics.h"
 #include "pycircuit/Dialect/ACIR/ACIRAttributes.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
+#include "mlir/IR/OperationSupport.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
 #include "gtest/gtest.h"
@@ -13,6 +15,195 @@
 namespace acir::ac {
 namespace {
 using namespace detail;
+
+class SourceValueNamesTest : public ::testing::Test {
+protected:
+    SourceValueNamesTest() : builder(&context) {
+        context.allowUnregisteredDialects();
+    }
+    mlir::OwningOpRef<mlir::Operation *> producer() {
+        mlir::OperationState state(site, "test.named_values");
+        state.addTypes({builder.getI8Type(), builder.getI8Type()});
+        return mlir::OwningOpRef<mlir::Operation *>(mlir::Operation::create(state));
+    }
+    mlir::MLIRContext context;
+    mlir::Builder builder;
+    mlir::Location site = mlir::FileLineColLoc::get(&context, "names.py", 7, 3);
+};
+
+TEST_F(SourceValueNamesTest, NamesArePerResultAndRetainSharedAliases) {
+    auto operation = producer();
+    auto first = operation->getResult(0), second = operation->getResult(1);
+    retainSourceValueName(first, "total", "Module.rule", site);
+    retainSourceValueName(second, "index", "Module.rule", site);
+    retainSourceValueName(first, "shared", "Module.rule", site);
+    retainSourceValueName(first, "shared", "Module.rule", site);
+    auto firstNames = sourceValueNames(first), secondNames = sourceValueNames(second);
+    ASSERT_EQ(firstNames.size(), 2u);
+    ASSERT_EQ(secondNames.size(), 1u);
+    EXPECT_EQ(firstNames.front().name.getValue(), "total");
+    EXPECT_EQ(firstNames.back().name.getValue(), "shared");
+    EXPECT_EQ(secondNames.front().name.getValue(), "index");
+}
+
+TEST_F(SourceValueNamesTest, NamesDoNotChangeCseEquivalenceHashOrLiveness) {
+    auto first = producer(), second = producer();
+    auto attributes = first->getAttrDictionary();
+    retainSourceValueName(first->getResult(0), "total", "Module.rule", site);
+    retainSourceValueName(second->getResult(0), "other", "Other.rule", site);
+    EXPECT_EQ(first->getAttrDictionary(), attributes);
+    EXPECT_TRUE(first->getResult(0).use_empty());
+    EXPECT_TRUE(mlir::OperationEquivalence::isEquivalentTo(first.get(), second.get(),
+        mlir::OperationEquivalence::IgnoreLocations));
+    auto hash = [](mlir::Operation *operation) {
+        return mlir::OperationEquivalence::computeHash(operation,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::IgnoreLocations);
+    };
+    EXPECT_EQ(hash(first.get()), hash(second.get()));
+}
+
+TEST_F(SourceValueNamesTest, ReplacementRetainsAliasesAcrossResultNumbers) {
+    auto original = producer(), replacement = producer();
+    retainSourceValueName(original->getResult(1), "saved", "Source.rule", site);
+    retainSourceValueName(replacement->getResult(0), "shared", "Other.rule", site);
+    retainSourceValueNames(original->getResult(1), replacement->getResult(0));
+    auto names = sourceValueNames(replacement->getResult(0));
+    ASSERT_EQ(names.size(), 2u);
+    EXPECT_EQ(names.back().name.getValue(), "saved");
+    EXPECT_TRUE(sourceValueNames(replacement->getResult(1)).empty());
+}
+
+TEST_F(SourceValueNamesTest, ArgumentAliasesTransferToOperationResults) {
+    mlir::Block block;
+    auto argument = block.addArgument(builder.getI8Type(), site);
+    retainSourceValueName(argument, "incoming", "Module.rule", site);
+    auto replacement = producer();
+    retainSourceValueNames(argument, replacement->getResult(1));
+    auto names = sourceValueNames(replacement->getResult(1));
+    ASSERT_EQ(names.size(), 1u);
+    EXPECT_EQ(names.front().name.getValue(), "incoming");
+    EXPECT_TRUE(argument.use_empty());
+}
+
+TEST_F(SourceValueNamesTest, AuthenticationRetainsTheOriginalSourceLocation) {
+    auto operation = producer();
+    retainSourceValueName(operation->getResult(0), "total", "Module.rule", site);
+    EXPECT_EQ(sourceIdentityLocation(operation->getLoc()), site);
+    auto different = mlir::FileLineColLoc::get(&context, "other.py", 8, 1);
+    operation->setLoc(different);
+    retainSourceValueName(operation->getResult(0), "total", "Module.rule", site);
+    EXPECT_EQ(sourceIdentityLocation(operation->getLoc()), different);
+    EXPECT_NE(sourceIdentityLocation(operation->getLoc()), site);
+}
+
+TEST_F(SourceValueNamesTest, DerivedPositionDoesNotAuthorizeAnotherValueName) {
+    auto original = producer();
+    retainSourceValueName(original->getResult(0), "accepted", "Module.rule", site);
+    // Even matching operation names and types do not make a fresh result the
+    // original binding. Only a clone or an explicit value mapping may do that.
+    mlir::OperationState state(sourceIdentityLocation(original->getLoc()), "test.named_values");
+    state.addTypes(original->getResultTypes());
+    mlir::OwningOpRef<mlir::Operation *> derived(mlir::Operation::create(state));
+    EXPECT_TRUE(sourceValueNames(derived->getResult(0)).empty());
+    mlir::OwningOpRef<mlir::Operation *> copy(original->clone());
+    ASSERT_EQ(sourceValueNames(copy->getResult(0)).size(), 1u);
+    retainSourceValueNames(original->getResult(0), derived->getResult(1));
+    ASSERT_EQ(sourceValueNames(derived->getResult(1)).size(), 1u);
+    EXPECT_TRUE(sourceValueNames(derived->getResult(0)).empty());
+}
+
+TEST_F(SourceValueNamesTest, NestedDiagnosticPositionsDoNotLeakBindings) {
+    auto original = producer();
+    retainSourceValueName(original->getResult(0), "accepted", "Module.rule", site);
+    auto named = mlir::NameLoc::get(builder.getStringAttr("diagnostic"), original->getLoc());
+    auto metadata = builder.getStringAttr("unrelated-context");
+    auto nested = mlir::FusedLoc::get(&context, {named, site}, metadata);
+    auto position = sourceIdentityLocation(nested);
+    auto fused = mlir::dyn_cast<mlir::FusedLoc>(position);
+    ASSERT_TRUE(fused);
+    EXPECT_EQ(fused.getMetadata(), metadata);
+    auto other = producer();
+    other->setLoc(position);
+    EXPECT_TRUE(sourceValueNames(other->getResult(0)).empty());
+}
+
+TEST_F(SourceValueNamesTest, RtlOwnershipHasNoSemanticAttributesUsesOrIdentity) {
+    auto first = producer(), second = producer();
+    auto owner = builder.getDictionaryAttr({builder.getNamedAttr("definition", builder.getStringAttr("Counter"))});
+    retainSourceRtlOwner(first.get(), owner);
+    EXPECT_EQ(sourceIdentityLocation(first->getLoc()), site);
+    EXPECT_TRUE(first->getResult(0).use_empty());
+    EXPECT_EQ(first->getAttrDictionary(), second->getAttrDictionary());
+    EXPECT_TRUE(mlir::OperationEquivalence::isEquivalentTo(first.get(), second.get(),
+        mlir::OperationEquivalence::IgnoreLocations));
+    auto hash = [](mlir::Operation *operation) {
+        return mlir::OperationEquivalence::computeHash(operation,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::IgnoreLocations);
+    };
+    EXPECT_EQ(hash(first.get()), hash(second.get()));
+}
+
+TEST_F(SourceValueNamesTest, SharedReplacementRetainsAllRtlOwnersAndBindings) {
+    auto first = producer(), second = producer();
+    auto owner = [&](llvm::StringRef name) {
+        return builder.getDictionaryAttr({builder.getNamedAttr("definition", builder.getStringAttr(name))});
+    };
+    retainSourceRtlOwner(first.get(), owner("Counter"));
+    retainSourceRtlOwner(second.get(), owner("Caller"));
+    retainSourceValueName(first->getResult(0), "saved", "Counter", site);
+    retainSourceValueNames(first->getResult(0), second->getResult(1));
+    EXPECT_EQ(sourceRtlOwners(second->getLoc()).size(), 2u);
+    EXPECT_EQ(sourceValueNames(second->getResult(1)).size(), 1u);
+    EXPECT_TRUE(sourceValueNames(second->getResult(0)).empty());
+    EXPECT_EQ(sourceIdentityLocation(second->getLoc()), site);
+}
+
+TEST_F(SourceValueNamesTest, DisplayRolesArePerResultAndDoNotBecomeBindings) {
+    auto operation = producer();
+    auto role = builder.getDictionaryAttr({builder.getNamedAttr("scope", builder.getStringAttr("finish")),
+        builder.getNamedAttr("role", builder.getStringAttr("condition"))});
+    retainSourceRtlRole(operation->getResult(1), role);
+    retainSourceRtlRole(operation->getResult(1), role);
+    EXPECT_TRUE(sourceRtlRoles(operation->getResult(0)).empty());
+    ASSERT_EQ(sourceRtlRoles(operation->getResult(1)).size(), 1u);
+    EXPECT_TRUE(sourceValueNames(operation->getResult(1)).empty());
+    EXPECT_EQ(sourceIdentityLocation(operation->getLoc()), site);
+}
+
+TEST_F(SourceValueNamesTest, DisplayRolesKeepCseHashEquivalenceAndDeadValueLiveness) {
+    auto first = producer(), second = producer();
+    retainSourceRtlRole(first->getResult(0), builder.getDictionaryAttr({
+        builder.getNamedAttr("scope", builder.getStringAttr("first"))}));
+    retainSourceRtlRole(second->getResult(0), builder.getDictionaryAttr({
+        builder.getNamedAttr("scope", builder.getStringAttr("second"))}));
+    EXPECT_EQ(first->getAttrDictionary(), second->getAttrDictionary());
+    EXPECT_TRUE(first->getResult(0).use_empty());
+    EXPECT_TRUE(mlir::OperationEquivalence::isEquivalentTo(first.get(), second.get(),
+        mlir::OperationEquivalence::IgnoreLocations));
+    auto hash = [](mlir::Operation *operation) {
+        return mlir::OperationEquivalence::computeHash(operation,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::ignoreHashValue,
+            mlir::OperationEquivalence::IgnoreLocations);
+    };
+    EXPECT_EQ(hash(first.get()), hash(second.get()));
+}
+
+TEST_F(SourceValueNamesTest, SharedReplacementRetainsEveryDisplayRoleAtItsNewResult) {
+    auto first = producer(), second = producer();
+    for (auto [operation, name] : {std::pair(first.get(), "receive"), std::pair(second.get(), "release")})
+        retainSourceRtlRole(operation->getResult(1), builder.getDictionaryAttr({
+            builder.getNamedAttr("scope", builder.getStringAttr(name))}));
+    retainSourceValueNames(first->getResult(1), second->getResult(1));
+    ASSERT_EQ(sourceRtlRoles(second->getResult(1)).size(), 2u);
+    EXPECT_TRUE(sourceRtlRoles(second->getResult(0)).empty());
+    EXPECT_TRUE(sourceValueNames(second->getResult(1)).empty());
+    EXPECT_EQ(sourceIdentityLocation(second->getLoc()), site);
+}
 
 class SourceValueSemanticsTest : public ::testing::Test {
 protected:

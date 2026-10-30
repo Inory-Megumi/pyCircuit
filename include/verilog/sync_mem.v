@@ -4,8 +4,10 @@
 module sync_mem #(
     parameter type T = logic [63:0],
     parameter int unsigned ADDR_WIDTH = 64,
-    parameter int unsigned DEPTH = 1024,
-    parameter bit pyc_managed = 0
+    parameter int unsigned DEPTH = 1024
+`ifndef PYCIRCUIT_PLAIN_RTL
+    , parameter bit pyc_managed = 0
+`endif
 ) (
     // DEPTH counts T entries; strobes select low packed-byte lanes first.
     input wire clk,
@@ -17,9 +19,11 @@ module sync_mem #(
     input wire [ADDR_WIDTH-1:0] waddr,
     input wire T wdata,
     input wire [($bits(T)/8 + (($bits(T)%8) != 0))-1:0] wstrb,
+`ifndef PYCIRCUIT_PLAIN_RTL
     input wire [2:0] pyc_phase,
     input tri1 pyc_root_commit_ok,
     output wire pyc_local_error,
+`endif
     output wire rlive
 );
     localparam int unsigned PAYLOAD_BITS = $bits(T);
@@ -262,7 +266,9 @@ module sync_mem #(
         end
     end else begin : autonomous
         bit [3:0] control_error;
+`ifndef PYCIRCUIT_PLAIN_RTL
         assign pyc_local_error = 1'b0;
+`endif
         always @(posedge clk) begin
             control_error = edge_control_error(1'b1, rst, ren, raddr,
                                                 wvalid, waddr, wdata, wstrb);
@@ -275,15 +281,21 @@ module sync_mem #(
             if (control_error[3])
                 $fatal(1, "sync_mem: enabled write address, data and strobes must be known");
             prepare_transition(1'b1, rst, ren, raddr, wvalid, waddr, wdata, wstrb);
+`ifndef PYCIRCUIT_PLAIN_RTL
             if (pyc_root_commit_ok === 1'b1)
+`endif
                 commit_transition();
         end
     end endgenerate
 `else
+`ifndef PYCIRCUIT_PLAIN_RTL
     assign pyc_local_error = 1'b0;
+`endif
     always @(posedge clk) begin
         prepare_transition(1'b1, rst, ren, raddr, wvalid, waddr, wdata, wstrb);
+`ifndef PYCIRCUIT_PLAIN_RTL
         if (pyc_root_commit_ok === 1'b1)
+`endif
             commit_transition();
     end
 `endif

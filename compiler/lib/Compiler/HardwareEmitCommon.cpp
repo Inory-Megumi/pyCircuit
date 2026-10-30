@@ -1,12 +1,17 @@
 #include "HardwareEmitCommon.h"
 #include "../Dialect/ACIR/ACIRSourceContracts.h"
 #include "../Dialect/ACIR/HardwareSourceChecks.h"
+#include "../Dialect/ACIR/HardwareSampledAdmission.h"
+#include "../Dialect/ACIR/HardwareSourceCheckPreflight.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "FinalCppNames.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
@@ -18,6 +23,9 @@
 #include <tuple>
 using namespace mlir;
 namespace acir::compiler {
+// Included here so both the construction plan and renderer consume the same
+// already prepared hardware types and original occurrence identities.
+#include "HardwareEmitOwnership.inc"
 namespace {
 FailureOr<std::string> identifier(StringRef raw, Operation *site) {
   auto value = legalizeIdentifier(raw, [&] { return site->emitOpError(); });
@@ -164,7 +172,7 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
           return staticTree(context, expression.getTree(), site, rtl, bindings);
       }
     }
-    return rtl ? context.rtlFormalName(name.getValue(), site)
+    return rtl ? context.rtlParameterName(ref.getAs<FlatSymbolRefAttr>("owner"), name.getValue(), site)
                : context.cppFormalName(name.getValue(), site);
   }
   if (tag == "type_width") {
@@ -553,8 +561,8 @@ buildObservationPlan(HardwareEmitContext &context) {
 } // namespace
 HardwareEmitContext::HardwareEmitContext(ModuleOp package,
                                          ac::HardwareAnalysis &analysis,
-                                         bool physical)
-    : package(package), analysis(analysis), physical_(physical) {}
+                                         bool physical, bool synthesis)
+    : package(package), analysis(analysis), physical_(physical), synthesis_(synthesis) {}
 LogicalResult HardwareEmitContext::prepare() { return prepareImpl(false); }
 LogicalResult HardwareEmitContext::prepareNativeChecks() {
   return prepareImpl(true);
@@ -582,8 +590,41 @@ std::string HardwareEmitContext::rtlReset(StringRef expression) const {
 LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   sourceChecks_.reset();
   names_.clear();
+  enumMemberNames_.clear();
+  nominalNames_.clear();
   if (!package)
     return failure();
+  llvm::StringMap<unsigned> nominalLeaves;
+  llvm::StringSet<> nominalFallbacks;
+  SmallVector<Operation *> nominals;
+  for (Operation &op : package.getBody()->getOperations()) {
+    if (!isa<ac::StructOp, ac::EnumOp>(op)) continue;
+    nominals.push_back(&op);
+    auto symbol = op.getAttrOfType<StringAttr>("sym_name").getValue();
+    auto leaf = symbol.rsplit('.').second;
+    if (leaf.empty()) leaf = symbol;
+    auto id = rtlIdentifier(leaf, [&] { return op.emitOpError(); });
+    auto fallback = rtlQualifiedIdentifier(symbol, "_t", [&] { return op.emitOpError(); });
+    if (failed(id) || failed(fallback)) return failure();
+    ++nominalLeaves[rtlIdentifierStem(*id)];
+    nominalFallbacks.insert(rtlIdentifierStem(*fallback));
+  }
+  llvm::StringSet<> nominalAllocated;
+  for (Operation *op : nominals) {
+    auto symbol = op->getAttrOfType<StringAttr>("sym_name");
+    auto leaf = symbol.getValue().rsplit('.').second;
+    if (leaf.empty()) leaf = symbol.getValue();
+    auto id = rtlIdentifier(leaf, [&] { return op->emitOpError(); });
+    auto fallback = rtlQualifiedIdentifier(symbol.getValue(), "_t", [&] { return op->emitOpError(); });
+    if (failed(id) || failed(fallback)) return failure();
+    auto name = rtlIdentifierStem(*id) + "_t";
+    if (nominalLeaves[rtlIdentifierStem(*id)] != 1 || nominalFallbacks.contains(name))
+      name = rtlIdentifierStem(*fallback);
+    auto stem = name;
+    unsigned suffix = 0;
+    while (!nominalAllocated.insert(name).second) name = stem + "_" + std::to_string(++suffix);
+    nominalNames_[symbol] = "pycircuit_types::" + name;
+  }
   // Building the plan includes full package verification. Retain that result
   // instead of verifying and expanding the same occurrence closure twice.
   auto checks = analysis.getSourceCheckPlan();
@@ -919,6 +960,27 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
   // Every non-generic definition emits a concrete scalar wrapper, even when the
   // selected root does not instantiate it. Validate that emitted closure too;
   // unbound generic definitions must not acquire facts from their defaults.
+  llvm::StringMap<unsigned> physicalLeafCounts;
+  llvm::StringSet<> physicalReservedModules;
+  if (isPhysical())
+    for (Operation &op : package.getBodyRegion().front()) {
+      auto primitive = analysis.getPrimitiveKind(&op);
+      if (!primitive.empty()) physicalReservedModules.insert(primitive);
+    }
+  if (isPhysical())
+    for (auto definition : analysis.getDefinitions()) {
+      auto symbol = definition.getSymName();
+      auto leaf = symbol.rsplit('.').second;
+      if (leaf.empty()) leaf = symbol;
+      auto spelling = rtlIdentifier(leaf, [&] { return definition.emitOpError(); });
+      if (failed(spelling)) return failure();
+      ++physicalLeafCounts[rtlIdentifierStem(*spelling)];
+      auto fallback = rtlQualifiedIdentifier(symbol, "", [&] { return definition.emitOpError(); });
+      if (failed(fallback)) return failure();
+      physicalReservedModules.insert(rtlIdentifierStem(*fallback));
+      auto primitive = analysis.getPrimitiveKind(definition);
+      if (!primitive.empty()) physicalReservedModules.insert(primitive);
+    }
   for (auto definition : analysis.getDefinitions()) {
     if (!definition.getParameters().empty() ||
         !definition.getTypeParameters().empty() ||
@@ -964,6 +1026,24 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     if (!rtlTypes.insert(*rtlName).second)
       return op.emitOpError() << "emitted hardware name collision";
   }
+  llvm::StringSet<> enumSymbols;
+  for (const auto &name : rtlTypes) enumSymbols.insert(name.getKey());
+  for (auto enumeration : package.getOps<ac::EnumOp>()) {
+    auto type = ac::EnumType::get(enumeration.getContext(), enumeration.getSymNameAttr());
+    auto definition = analysis.resolveEnum(type, enumeration);
+    auto spelling = rtlType(type, enumeration);
+    if (failed(definition) || failed(spelling)) return failure();
+    for (const auto &member : definition->members) {
+      auto id = rtlIdentifier(member.name.getValue(), [&] { return enumeration.emitOpError(); });
+      if (failed(id)) return failure();
+      auto preferred = "pycircuit_types::" + rtlIdentifierStem(StringRef(*spelling).rsplit("::").second) +
+          "__" + rtlIdentifierStem(*id);
+      auto name = preferred;
+      unsigned suffix = 0;
+      while (!enumSymbols.insert(name).second) name = preferred + "_" + std::to_string(++suffix);
+      enumMemberNames_.try_emplace({type, member.name}, name);
+    }
+  }
   for (auto definition : analysis.getDefinitions()) {
     Operation *site = definition;
     auto symbol = definition.getSymName();
@@ -985,7 +1065,15 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     names.cppFamilyQualified =
         "::" + (names.cppNamespace.empty() ? "" : names.cppNamespace + "::") +
         names.cppFamilyClass;
-    names.rtl = "ac_" + *r;
+    auto leaf = symbol.rsplit('.').second;
+    if (leaf.empty()) leaf = symbol;
+    auto rtlLeaf = rtlIdentifier(leaf, [&] { return site->emitOpError(); });
+    if (failed(rtlLeaf)) return failure();
+    auto rtlFallback = rtlQualifiedIdentifier(symbol, "", [&] { return site->emitOpError(); });
+    if (failed(rtlFallback)) return failure();
+    names.rtl = isPhysical() ?
+        (physicalLeafCounts.lookup(rtlIdentifierStem(*rtlLeaf)) == 1 &&
+         !physicalReservedModules.contains(rtlIdentifierStem(*rtlLeaf)) ? *rtlLeaf : *rtlFallback) : "ac_" + *r;
     auto owner = sourceOwnerComponents(definition.getSourceOwner(),
                                        [&] { return site->emitOpError(); });
     if (failed(owner))
@@ -1004,14 +1092,20 @@ LogicalResult HardwareEmitContext::prepareImpl(bool allowSourceChecks) {
     if (failed(reserveCppName(names.cppQualified, site)) ||
         failed(reserveCppName(names.cppFamilyQualified, site)))
       return failure();
-    if (!rtl.insert(names.rtl).second)
-      return site->emitOpError() << "emitted hardware name collision";
+    auto rtlStem = rtlIdentifierStem(names.rtl);
+    unsigned rtlSuffix = 0;
+    while (!rtl.insert(rtlIdentifierStem(names.rtl)).second) {
+      if (!isPhysical()) return site->emitOpError() << "emitted hardware name collision";
+      auto id = rtlIdentifier(rtlStem + "_" + std::to_string(++rtlSuffix), [&] { return site->emitOpError(); });
+      if (failed(id)) return failure();
+      names.rtl = *id;
+    }
     // Owners may intentionally share a basename; grouping checks unequal
     // owners.
     names_.try_emplace(site, std::move(names));
   }
   if (physical_) {
-    auto projection = analysis.getPhysicalProjection(*checks);
+    auto projection = analysis.getPhysicalProjection(*checks, {}, synthesis_);
     if (failed(projection))
       return failure();
     physicalProjection_ = *projection;
@@ -1031,10 +1125,19 @@ HardwareEmitContext::cppFormalName(StringRef name, Operation *site) const {
 }
 FailureOr<std::string>
 HardwareEmitContext::rtlFormalName(StringRef name, Operation *site) const {
+  if (isPhysical()) return rtlIdentifier(name, [&] { return site->emitOpError(); });
   auto legalized = identifier(name, site);
   if (failed(legalized))
     return failure();
   return "pyc_parameter_" + *legalized;
+}
+FailureOr<std::string> HardwareEmitContext::rtlParameterName(
+    FlatSymbolRefAttr owner, StringRef name, Operation *site) const {
+    if (rtlScope && owner)
+        for (const auto &parameter : rtlScope->parameters)
+            if (SymbolTable::getSymbolName(parameter.owner).getValue() == owner.getValue() && parameter.name.getValue() == name)
+                return parameter.alias;
+    return rtlFormalName(name, site);
 }
 FailureOr<std::string> HardwareEmitContext::staticValue(ac::StaticExprAttr expr,
                                                         Operation *site) const {
@@ -1135,37 +1238,88 @@ FailureOr<std::string> HardwareEmitContext::cppType(Type type,
   }
   return site->emitOpError() << "unsupported C++ hardware type";
 }
+FailureOr<std::string> HardwareEmitContext::rtlTableDimensions(
+    Type type, Operation *site) const {
+    if (!isPhysical()) return std::string();
+    std::string dimensions;
+    while (auto table = dyn_cast<ac::TableType>(type)) {
+        auto count = shapeSize(table.getShape(), site, true);
+        if (failed(count)) return failure();
+        uint64_t number = 0;
+        if (StringRef(*count).getAsInteger(10, number) || !number)
+            return std::string();
+        // Ascending packed dimensions retain element zero at the MSB.
+        dimensions += "[0:" + std::to_string(number - 1) + "]";
+        type = table.getElementType();
+    }
+    return dimensions;
+}
 FailureOr<std::string> HardwareEmitContext::rtlType(Type type,
                                                     Operation *site) const {
   if (auto bits = dyn_cast<ac::BitsType>(type)) {
     auto width = staticTree(*this, bits.getWidth().getTree(), site, true);
     if (failed(width))
       return failure();
+    if (isPhysical() && isClosedStatic(bits.getWidth())) {
+      auto closed = staticRtlValue(bits.getWidth(), site);
+      unsigned count = 0;
+      if (succeeded(closed) && !StringRef(*closed).getAsInteger(10, count) && count > 0)
+        return "logic [" + std::to_string(count - 1) + ":0]";
+    }
     return "logic [(" + *width + ")-1:0]";
   }
   if (auto table = dyn_cast<ac::TableType>(type)) {
+    auto dimensions = rtlTableDimensions(table, site);
+    if (failed(dimensions)) return failure();
+    if (!dimensions->empty()) {
+        Type element = table.getElementType();
+        while (auto nested = dyn_cast<ac::TableType>(element))
+            element = nested.getElementType();
+        auto rendered = rtlType(element, site);
+        if (failed(rendered)) return failure();
+        // Bits contribute the innermost packed dimension. Nominal payloads
+        // already carry their own layout through the declared packed type.
+        if (isa<ac::BitsType>(element))
+            return "logic " + *dimensions + " " + StringRef(*rendered).drop_front(6).str();
+        return *rendered + " " + *dimensions;
+    }
     auto width = payloadWidth(table, site, true);
     if (failed(width))
       return failure();
+    uint64_t closed = 0;
+    if (isPhysical() && !StringRef(*width).getAsInteger(10, closed) && closed)
+      return "logic [" + std::to_string(closed - 1) + ":0]";
     return "logic [(" + *width + ")-1:0]";
   }
   if (auto param = dyn_cast<ac::TypeParamType>(type))
-    return rtlFormalName(param.getName().getValue(), site);
+    return rtlParameterName(param.getOwner(), param.getName().getValue(), site);
   if (auto enumeration = dyn_cast<ac::EnumType>(type)) {
     if (failed(analysis.resolveEnum(enumeration, site)))
       return failure();
+    if (auto found = nominalNames_.find(enumeration.getName()); found != nominalNames_.end())
+      return found->second;
     auto q = qualified(enumeration.getName().getValue(), site, "_");
     if (failed(q))
       return failure();
     return "pycircuit_types::ac_" + *q + "_t";
   }
   if (auto record = dyn_cast<ac::StructType>(type)) {
+    if (auto found = nominalNames_.find(record.getName()); found != nominalNames_.end())
+      return found->second;
     auto q = qualified(record.getName().getValue(), site, "_");
     if (failed(q))
       return failure();
     return "pycircuit_types::ac_" + *q + "_t";
   }
   return site->emitOpError() << "unsupported RTL hardware type";
+}
+FailureOr<std::string> HardwareEmitContext::rtlEnumMember(
+    Type type, StringAttr member, Operation *site) const {
+  auto enumeration = dyn_cast<ac::EnumType>(type);
+  if (!enumeration) return site->emitOpError() << "RTL enum member requires Enum type";
+  auto found = enumMemberNames_.find({type, member});
+  if (found == enumMemberNames_.end()) return site->emitOpError() << "unresolved RTL enum member";
+  return found->second;
 }
 FailureOr<std::string>
 HardwareEmitContext::cppInstanceType(ac::InstanceOp instance) const {
@@ -1296,6 +1450,246 @@ namespace acir::compiler {
 FailureOr<ac::HardwareBindings> HardwareEmitContext::rootBindings() const {
   return ac::detail::resolveHardwareRootBindings(analysis);
 }
+std::string HardwareEmitContext::rtlProtocolName(StringRef name) const {
+    if (!isPhysical()) return name.str();
+    if (name == "pyc_root_commit_ok") return "__checks_allow";
+    if (name == "pyc_reset_active") return "__checks_reset";
+    if (name == "pyc_local_error") return "__checks_error";
+    return name.str();
+}
+#include "HardwareEmitVerilogInterfaces.inc"
+std::optional<unsigned> HardwareEmitContext::rtlForwardedInput(
+    Operation *definition, unsigned output) const {
+    if (!isPhysical()) return std::nullopt;
+    auto module = dyn_cast<ac::ModuleOp>(definition);
+    if (!module) return std::nullopt;
+    auto layout = ac::getModulePortLayout(module);
+    if (failed(layout) || output < layout->sourceOutputCount ||
+        llvm::is_contained(layout->outputValidity, static_cast<int64_t>(output)))
+        return std::nullopt;
+    // Collection lanes may broadcast inputs. Retain that existing packed ABI.
+    bool collectionUse = false;
+    auto scope = package;
+    scope.walk([&](ac::CollectionOp occurrence) {
+        if (analysis.resolveCallee(occurrence) == definition) collectionUse = true;
+    });
+    if (collectionUse) return std::nullopt;
+    Value value = cast<ac::YieldOp>(module.getBody().front().back()).getValues()[output];
+    llvm::DenseSet<Value> visited;
+    while (visited.insert(value).second) {
+        if (auto argument = dyn_cast<BlockArgument>(value)) {
+            auto *owner = argument.getOwner()->getParentOp();
+            if (owner == definition) return argument.getArgNumber();
+            if (auto rule = dyn_cast<ac::RuleOp>(owner)) {
+                value = rule.getCaptures()[argument.getArgNumber()];
+                continue;
+            }
+        }
+        if (auto rule = value.getDefiningOp<ac::RuleOp>()) {
+            value = cast<ac::YieldOp>(rule.getBody().front().back()).getValues()[cast<OpResult>(value).getResultNumber()];
+            continue;
+        }
+        if (auto result = dyn_cast<OpResult>(value))
+            if (auto instance = dyn_cast<ac::InstanceOp>(result.getOwner()))
+                if (auto input = rtlForwardedInput(analysis.resolveCallee(instance), result.getResultNumber())) {
+                    value = instance.getOperand(*input);
+                    continue;
+                }
+        break;
+    }
+    return std::nullopt;
+}
+bool HardwareEmitContext::rtlOmittedInput(Operation *definition, unsigned input) const {
+    auto module = dyn_cast<ac::ModuleOp>(definition);
+    if (!module) return false;
+    if (rtlRootConstants.count(module.getBody().front().getArgument(input))) return true;
+    if (!isPhysical()) return false;
+    auto layout = ac::getModulePortLayout(module);
+    if (failed(layout) || input < layout->sourceInputCount) return false;
+    // Elide only compiler-private captures with no effective consumer. Source
+    // inputs and all business logic retain their declared hardware boundary.
+    llvm::DenseSet<Value> seen;
+    SmallVector<Value> pending{module.getBody().front().getArgument(input)};
+    unsigned budget = 256;
+    while (!pending.empty()) {
+        if (!budget--) return false;
+        Value value = pending.pop_back_val();
+        if (!seen.insert(value).second) continue;
+        for (OpOperand &use : value.getUses()) {
+            auto *owner = use.getOwner();
+            if (auto rule = dyn_cast<ac::RuleOp>(owner)) {
+                pending.push_back(rule.getBody().front().getArgument(use.getOperandNumber()));
+            } else if (isa<ac::YieldOp>(owner)) {
+                if (auto rule = dyn_cast<ac::RuleOp>(owner->getParentOp()))
+                    pending.push_back(rule.getResult(use.getOperandNumber()));
+                else if (owner->getParentOp() != module ||
+                         !rtlForwardedInput(module, use.getOperandNumber())) return false;
+            } else return false;
+        }
+    }
+    return true;
+}
+
+FailureOr<std::string> HardwareEmitContext::rtlPortName(Operation *definition,
+                                                       StringRef name) const {
+    if (!isPhysical())
+        return legalizeIdentifier(name, [&] { return definition->emitOpError(); });
+    auto legal = rtlIdentifier(name, [&] { return definition->emitOpError(); });
+    if (failed(legal))
+        return legal;
+    auto module = dyn_cast<ac::ModuleOp>(definition);
+    if (!module) return legal;
+    auto layout = ac::getModulePortLayout(module);
+    if (failed(layout)) return failure();
+    auto source = [&](Value value) {
+        llvm::DenseSet<Value> visited;
+        while (visited.insert(value).second) {
+            if (auto argument = dyn_cast<BlockArgument>(value)) {
+                if (auto rule = dyn_cast<ac::RuleOp>(argument.getOwner()->getParentOp())) {
+                    value = rule.getCaptures()[argument.getArgNumber()];
+                    continue;
+                }
+            }
+            if (auto rule = value.getDefiningOp<ac::RuleOp>()) {
+                value = cast<ac::YieldOp>(rule.getBody().front().back()).getValues()[cast<OpResult>(value).getResultNumber()];
+                continue;
+            }
+            break;
+        }
+        return value;
+    };
+    auto depends = [&](Value value, Value target) {
+        llvm::DenseSet<Value> visited;
+        SmallVector<Value> pending{value};
+        unsigned budget = 256;
+        while (!pending.empty() && budget--) {
+            Value current = source(pending.pop_back_val());
+            if (current == target) return true;
+            if (!visited.insert(current).second) continue;
+            auto *op = current.getDefiningOp();
+            if (op && !isa<ac::InstanceOp, ac::CollectionOp>(op))
+                llvm::append_range(pending, op->getOperands());
+        }
+        return false;
+    };
+    SmallVector<std::pair<std::string, std::string>> ports;
+    llvm::StringSet<> reserved;
+    for (auto raw : module.getParameters()) {
+        auto id = rtlFormalName(cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue(), definition);
+        if (failed(id)) return failure();
+        reserved.insert(rtlIdentifierStem(*id));
+    }
+    for (auto raw : module.getTypeParameters()) {
+        auto id = rtlFormalName(cast<StringAttr>(raw).getValue(), definition);
+        if (failed(id)) return failure();
+        reserved.insert(rtlIdentifierStem(*id));
+    }
+    auto append = [&](StringAttr raw, std::string preferred) -> LogicalResult {
+        auto id = rtlIdentifier(raw.getValue(), [&] { return definition->emitOpError(); });
+        if (failed(id)) return failure();
+        reserved.insert(rtlIdentifierStem(*id));
+        ports.emplace_back(raw.getValue().str(), preferred.empty() ? *id : std::move(preferred));
+        return success();
+    };
+    auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
+    for (auto [index, raw] : llvm::enumerate(module.getInputNames())) {
+        auto original = cast<StringAttr>(raw);
+        std::string preferred;
+        if (domain)
+            for (auto [role, generated, alias] :
+                 {std::tuple<StringRef, StringRef, StringRef>{"clock", "pyc_clk", "clk"}, {"reset", "pyc_rst", "rst"}})
+                if (auto ordinal = domain.getAs<IntegerAttr>(role))
+                    if (ordinal.getInt() == static_cast<int64_t>(index) && original.getValue() == generated)
+                        preferred = alias.str();
+        if (index >= layout->sourceInputCount) {
+            llvm::StringSet<> owners;
+            Value argument = module.getBody().front().getArgument(index);
+            for (const auto &endpoint : sourceChecks().commits) {
+                auto instance = dyn_cast<ac::InstanceOp>(endpoint.allocation);
+                if (!instance || instance->getParentOp() != definition) continue;
+                auto kind = analysis.getPrimitiveKind(analysis.resolveCallee(instance));
+                if (kind != "dff" && kind != "dffe") continue;
+                auto state = rtlIdentifier(instance.getInstanceName(), [&] { return instance.emitOpError(); });
+                if (failed(state)) return failure();
+                if (kind == "dffe" && depends(instance.getOperand(2), argument))
+                    owners.insert(rtlIdentifierStem(*state) + "_enable");
+                else if (depends(instance.getOperand(kind == "dffe" ? 3 : 2), argument))
+                    owners.insert(rtlIdentifierStem(*state) + "_next");
+            }
+            auto resource = readableResourceInputStem(module, index);
+            auto state = readableStateInputStem(*this, module, index);
+            preferred = resource ? *resource : state ? *state : owners.size() == 1 ? owners.begin()->getKey().str() : "argument_" + std::to_string(index);
+        }
+        if (failed(append(original, preferred))) return failure();
+    }
+    auto yield = cast<ac::YieldOp>(module.getBody().front().back());
+    for (auto [index, raw] : llvm::enumerate(module.getOutputNames())) {
+        std::string preferred;
+        for (auto [sourceIndex, companion] : llvm::enumerate(layout->outputValidity))
+            if (companion == static_cast<int64_t>(index)) {
+                auto sourceName = cast<StringAttr>(module.getOutputNames()[sourceIndex]).getValue();
+                auto id = rtlIdentifier(sourceName, [&] { return definition->emitOpError(); });
+                if (failed(id)) return failure();
+                preferred = rtlIdentifierStem(*id) + "_valid";
+            }
+        if (preferred.empty() && index >= layout->sourceOutputCount) {
+            Value value = source(yield.getValues()[index]);
+            auto bindings = ac::sourceValueNames(value);
+            if (!bindings.empty()) preferred = bindings.front().name.getValue().str();
+            if (auto instance = value.getDefiningOp<ac::InstanceOp>()) {
+                auto kind = analysis.getPrimitiveKind(analysis.resolveCallee(instance));
+                if (kind == "dff" || kind == "dffe") {
+                    auto state = rtlIdentifier(instance.getInstanceName(), [&] { return instance.emitOpError(); });
+                    if (failed(state)) return failure();
+                    preferred = rtlIdentifierStem(*state) + "_current";
+                } else if (preferred.empty()) {
+                    auto *callee = analysis.resolveCallee(instance);
+                    auto outputs = callee ? callee->getAttrOfType<ArrayAttr>("output_names") : ArrayAttr();
+                    unsigned slot = cast<OpResult>(value).getResultNumber();
+                    if (outputs && slot < outputs.size()) {
+                        auto port = rtlPortName(callee, cast<StringAttr>(outputs[slot]).getValue());
+                        if (failed(port)) return failure();
+                        preferred = instance.getInstanceName().str() + "_" + rtlIdentifierStem(*port);
+                    }
+                }
+            }
+            if (auto argument = dyn_cast<BlockArgument>(value))
+                if (argument.getOwner()->getParentOp() == definition)
+                    preferred = rtlIdentifierStem(ports[argument.getArgNumber()].second) + "_capture";
+            if (preferred.empty()) preferred = "capture_" + std::to_string(index);
+        }
+        if (failed(append(cast<StringAttr>(raw), preferred))) return failure();
+    }
+    llvm::StringSet<> allocated;
+    for (auto raw : module.getParameters()) {
+        auto id = rtlFormalName(cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue(), definition);
+        if (failed(id)) return failure();
+        allocated.insert(rtlIdentifierStem(*id));
+    }
+    for (auto raw : module.getTypeParameters()) {
+        auto id = rtlFormalName(cast<StringAttr>(raw).getValue(), definition);
+        if (failed(id)) return failure();
+        allocated.insert(rtlIdentifierStem(*id));
+    }
+    for (auto &[raw, preferred] : ports) {
+        auto original = rtlIdentifier(raw, [&] { return definition->emitOpError(); });
+        if (failed(original)) return failure();
+        if (preferred != *original) {
+            std::string stem = rtlIdentifierStem(preferred);
+            preferred = stem;
+            unsigned suffix = 0;
+            while (!reserved.insert(preferred).second) preferred = stem + "_" + std::to_string(++suffix);
+        }
+        auto stem = rtlIdentifierStem(preferred);
+        auto selected = stem;
+        unsigned suffix = 0;
+        while (!allocated.insert(selected).second) selected = stem + "_" + std::to_string(++suffix);
+        if (selected != stem) preferred = selected;
+        if (raw == name) return preferred == *original ? original :
+            rtlIdentifier(preferred, [&] { return definition->emitOpError(); });
+    }
+    return legal;
+}
 FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
   auto system = *package.getOps<ac::SystemOp>().begin();
   auto root = cast<ac::ModuleOp>(analysis.lookupDefinition(
@@ -1308,7 +1702,8 @@ FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
   llvm::json::Array inputs, outputs, controls;
   auto describe = [&](Type type, StringRef name,
                       unsigned ordinal) -> FailureOr<llvm::json::Object> {
-    auto wire = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto wire = rtl ? rtlPortName(root, name)
+                    : legalizeIdentifier(name, [&] { return root.emitOpError(); });
     auto width = analysis.getPackedWidth(type, *bindings, root);
     auto leaves = analysis.getLeaves(type, *bindings, root);
     if (failed(wire) || failed(width) || failed(leaves))
@@ -1345,9 +1740,8 @@ FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
     (*row)["availability"] = nullptr;
     int64_t companion = layout->outputValidity[i];
     if (companion >= 0) {
-      auto wire = legalizeIdentifier(
-          cast<StringAttr>(root.getOutputNames()[companion]).getValue(),
-          [&] { return root.emitOpError(); });
+      auto rawName = cast<StringAttr>(root.getOutputNames()[companion]).getValue();
+      auto wire = rtl ? rtlPortName(root, rawName) : legalizeIdentifier(rawName, [&] { return root.emitOpError(); });
       if (failed(wire))
         return failure();
       (*row)["availability"] = *wire;
@@ -1449,6 +1843,19 @@ namespace acir::compiler {
 FailureOr<std::string>
 HardwareEmitContext::shapeSize(ArrayAttr shape, Operation *site, bool rtl,
                                const ac::HardwareBindings &bindings) const {
+  if (rtl && llvm::all_of(shape, [&](Attribute raw) {
+        return isClosedStatic(cast<ac::StaticExprAttr>(raw), bindings);
+      })) {
+    auto extents = analysis.resolveShape(shape, bindings, site);
+    if (failed(extents)) return failure();
+    uint64_t product = 1;
+    for (uint64_t extent : *extents) {
+      if (!extent || product > std::numeric_limits<uint64_t>::max() / extent)
+        return site->emitOpError() << "RTL shape cardinality overflows";
+      product *= extent;
+    }
+    return std::to_string(product);
+  }
   std::string result = "1";
   for (Attribute raw : shape) {
     auto text = staticTree(*this, cast<ac::StaticExprAttr>(raw).getTree(), site,
@@ -1471,6 +1878,13 @@ HardwareEmitContext::payloadWidth(Type type, Operation *site, bool rtl,
     auto element = payloadWidth(table.getElementType(), site, rtl, bindings);
     if (failed(count) || failed(element))
       return failure();
+    uint64_t cardinality = 0, elementBits = 0;
+    if (rtl && !StringRef(*count).getAsInteger(10, cardinality) &&
+        !StringRef(*element).getAsInteger(10, elementBits) && elementBits) {
+      if (cardinality > std::numeric_limits<uint64_t>::max() / elementBits)
+        return site->emitOpError() << "RTL packed width overflows";
+      return std::to_string(cardinality * elementBits);
+    }
     return "(" + *count + " * (" + *element + "))";
   }
   if (auto bits = dyn_cast<ac::BitsType>(type))

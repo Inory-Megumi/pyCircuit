@@ -2339,6 +2339,7 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
             values[name] = *value;
           }
         }
+        retainBinding(values.lookup(name), name, decl.symbol, statement);
         if (failed(emitFormalWrite(name, values.lookup(name), statement, inside, environment))) return failure();
       }
       return success();

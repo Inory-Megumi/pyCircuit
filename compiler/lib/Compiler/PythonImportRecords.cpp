@@ -1,4 +1,5 @@
 #include "PythonImportRecords.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 #include "LiteralPayloadWires.h"
 #include "Dialect/ACIR/ACIRSourceContracts.h"
 #include "Dialect/ACIR/HardwareGrantProof.h"
@@ -453,6 +454,11 @@ public:
   }
 
 private:
+  void retainBinding(Value value, StringRef name, FlatSymbolRefAttr symbol,
+                     const AstNode &node) {
+    ac::retainSourceValueName(value, name, symbol.getValue(),
+                             node.location(b.getContext(), source.path));
+  }
   DictionaryAttr sourceOccurrence(OpBuilder &at, FlatSymbolRefAttr symbol,
                                   const AstNode &node) {
     return occurrence(at, symbol, node, activeSourceExpansion);
@@ -1882,6 +1888,7 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
         if (failed(value))
           return failure();
         joined.values[name] = *value;
+        retainBinding(*value, name, ownerSymbol, node);
         if (binding == joined.boundaries.end())
           joined.boundaries[name] = inferredBoundary(name, *value, node);
       }
@@ -1914,6 +1921,7 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
       joined.boundaries[name] = inferredBoundary(name, *value, node);
     }
     joined.values[name] = *value;
+    retainBinding(*value, name, ownerSymbol, node);
     return success();
   };
   if (sourceBranch) {
@@ -1988,6 +1996,7 @@ FailureOr<BranchEnvironment> Importer::joinBranches(
       if (failed(value))
         return failure();
       joined.values[name] = *value;
+      retainBinding(*value, name, ownerSymbol, node);
       if (!joined.boundaries.contains(name))
         joined.boundaries[name] = inferredBoundary(name, *value, node);
     }

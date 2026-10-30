@@ -32,7 +32,7 @@ FailureOr<MaterializedBranchResult> materializeDomainCommit(
                   unsigned regions = 0) -> FailureOr<Operation *> {
     if (!charge(budget, source, 32 + 4 * operands.size() + 2 * types.size() + 2 * attributes.size()) ||
         !prepayAppend(budget, source, result.generated)) return failure();
-    OperationState state(source->getLoc(), name);
+    OperationState state(ac::sourceIdentityLocation(source->getLoc()), name);
     state.addOperands(operands); state.addTypes(types); state.addAttributes(attributes);
     for (unsigned i = 0; i < regions; ++i) state.addRegion();
     Operation *operation = at.create(state); result.generated.push_back(operation); return operation;

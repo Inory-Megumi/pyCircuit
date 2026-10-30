@@ -188,10 +188,17 @@ struct HardwareSourceCheckPlan {
   llvm::SmallVector<HardwareCheckSamplingOccurrence> samplingOccurrences;
   bool hasChecks() const { return !checks.empty(); }
 };
-/// Read-only physical-edge admission over the authenticated check inventory.
+  struct HardwarePhysicalControlBinding {
+    ModuleOp definition;
+    mlir::Value raw, reached;
+  };
+  /// Read-only physical-edge admission over the authenticated check inventory.
 struct HardwarePhysicalProjection {
   ModuleOp root;
   unsigned clockInput = 0, resetInput = 0;
+  bool hasDomain = true;
+    llvm::SmallVector<HardwarePhysicalControlBinding> controls;
+    bool explicitDomains = false;
 };
 using FieldPath = llvm::SmallVector<mlir::StringAttr>;
 struct PackedLeaf {
@@ -350,7 +357,8 @@ public:
                         HardwareSourceCheckLimits limits = {}) const;
   mlir::FailureOr<HardwarePhysicalProjection>
   getPhysicalProjection(const HardwareSourceCheckPlan &plan,
-                        HardwareSourceCheckLimits limits = {}) const;
+                        HardwareSourceCheckLimits limits = {},
+                        bool synthesis = false) const;
   mlir::LogicalResult verifyDefinitionSourceChecks(ModuleOp definition) const;
   mlir::LogicalResult verify() const;
 

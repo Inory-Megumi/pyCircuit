@@ -93,6 +93,7 @@ FailureOr<bool> Importer::bindFixedResults(
   // No local is visible until every destination contract has succeeded.
   for (auto [index, name] : llvm::enumerate(**targets)) {
     values[name] = converted[index];
+    retainBinding(converted[index], name, symbol, assignment);
     noteNestedRuleDataBinding(name);
     if (boundaries)
       (*boundaries)[name] = contracts[index];
@@ -257,6 +258,7 @@ LogicalResult Importer::updateAssignment(const AstNode &target,
                          (behavioralRules.contains(name) && !nestedRuleBinding(name))))
       return error() << "assignment shadows a source declaration";
     values[name] = replacement;
+    retainBinding(replacement, name, symbol, node);
     noteNestedRuleDataBinding(name);
     return success();
   }
@@ -296,6 +298,7 @@ LogicalResult Importer::updateAssignment(const AstNode &target,
     if (failed(updated))
       return failure();
     values[name] = *updated;
+    retainBinding(*updated, name, symbol, node);
     return success();
   }
   if (target.kind() == "Attribute") {
@@ -329,6 +332,7 @@ LogicalResult Importer::updateAssignment(const AstNode &target,
     if (failed(updated))
       return failure();
     values[name] = *updated;
+    retainBinding(*updated, name, symbol, node);
     return success();
   }
   return error() << "assignment requires a local name, nested field or named "

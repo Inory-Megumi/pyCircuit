@@ -4,7 +4,9 @@
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/SHA256.h"
 #include "llvm/Support/raw_ostream.h"
 using namespace mlir;
 namespace acir::compiler {
@@ -19,6 +21,13 @@ LogicalResult emitEnum(HardwareEmitContext &context, ac::EnumOp declaration,
     return failure();
   out << "typedef logic [" << definition->width << "-1:0] "
       << StringRef(*name).rsplit("::").second << ";\n";
+  for (const auto &member : definition->members) {
+    auto symbol = context.rtlEnumMember(type, member.name, declaration);
+    if (failed(symbol)) return failure();
+    out << "localparam " << StringRef(*name).rsplit("::").second << " "
+        << StringRef(*symbol).rsplit("::").second << " = "
+        << definition->width << "'d" << member.code.getCanonicalValue() << ";\n";
+  }
   return success();
 }
 LogicalResult emitRecord(HardwareEmitContext &context, ac::StructOp record,
@@ -48,7 +57,7 @@ LogicalResult emitRecord(HardwareEmitContext &context, ac::StructOp record,
     auto field = cast<DictionaryAttr>(raw);
     auto fieldType = field.getAs<TypeAttr>("type").getValue();
     auto type = context.rtlType(fieldType, record);
-    auto member = legalizeIdentifier(field.getAs<StringAttr>("name").getValue(),
+    auto member = rtlIdentifier(field.getAs<StringAttr>("name").getValue(),
                                      [&] { return record.emitOpError(); });
     if (failed(type) || failed(member))
       return failure();
@@ -93,9 +102,8 @@ FailureOr<std::string> managedReset(HardwareEmitContext &context,
       reset.getValue().getZExtValue() >= names.size())
     return root.emitOpError()
            << "managed module requires verified reset context";
-  auto name = legalizeIdentifier(
-      cast<StringAttr>(names[reset.getValue().getZExtValue()]).getValue(),
-      [&] { return root.emitOpError(); });
+  auto name = context.rtlPortName(
+      root, cast<StringAttr>(names[reset.getValue().getZExtValue()]).getValue());
   if (failed(name))
     return failure();
   return context.rtlReset(*name);
@@ -183,8 +191,8 @@ observationHierarchy(const ObservationEmissionPlan &plan,
     if (failed(name))
       return failure();
     if (isa<ac::CollectionOp>(operation))
-      result += ".pyc_instances_" + *name + "[" + std::to_string(lane) + "]";
-    result += ".pyc_instance_" + *name;
+      result += ".pyc_instances_" + rtlIdentifierStem(*name) + "[" + std::to_string(lane) + "]";
+    result += ".pyc_instance_" + rtlIdentifierStem(*name);
   }
   auto owner = occurrence.site.op->getParentOfType<ac::ModuleOp>();
   auto sites = plan.definitions.find(owner);
@@ -602,7 +610,7 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     if (failed(resolved))
       return failure();
     auto rendered = context.rtlType(*resolved, root);
-    auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto id = context.rtlPortName(root, name);
     if (failed(rendered) || failed(id))
       return failure();
     out << (first ? "\n" : ",\n") << "  " << direction << " wire " << *rendered
@@ -641,16 +649,12 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
                         : FailureOr<std::string>(std::string());
   if (failed(parameters))
     return failure();
-  if (context.isPhysical()) {
+  if (context.hasPhysicalChecks()) {
     const auto &projection = context.physicalProjection();
-    auto clock = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.clockInput])
-            .getValue(),
-        [&] { return root.emitOpError(); });
-    auto reset = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.resetInput])
-            .getValue(),
-        [&] { return root.emitOpError(); });
+    auto clock = context.rtlPortName(
+        root, cast<StringAttr>(root.getInputNames()[projection.clockInput]).getValue());
+    auto reset = context.rtlPortName(
+        root, cast<StringAttr>(root.getInputNames()[projection.resetInput]).getValue());
     if (failed(clock) || failed(reset))
       return failure();
     out << "  wire pyc_local_error;\n"
@@ -682,7 +686,7 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
   out << "  " << callee << *parameters << " dut (";
   first = true;
   auto connection = [&](StringRef name, StringRef expression) -> LogicalResult {
-    auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto id = context.rtlPortName(root, name);
     if (failed(id))
       return failure();
     out << (first ? "\n" : ",\n") << "    ." << *id << "(" << expression << ")";
@@ -690,10 +694,11 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     return success();
   };
   for (auto [index, raw] : llvm::enumerate(root.getInputNames())) {
+    if (context.rtlOmittedInput(root, index)) continue;
     StringRef name = cast<StringAttr>(raw).getValue();
     std::string expression;
     if (index < layout->sourceInputCount) {
-      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      auto id = context.rtlPortName(root, name);
       if (failed(id))
         return failure();
       expression = std::move(*id);
@@ -711,12 +716,13 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
       return failure();
   }
   for (auto [index, raw] : llvm::enumerate(root.getOutputNames())) {
+    if (context.rtlForwardedInput(root, index)) continue;
     StringRef name = cast<StringAttr>(raw).getValue();
     std::string expression;
     if (index < layout->sourceOutputCount ||
         llvm::is_contained(layout->outputValidity,
                            static_cast<int64_t>(index))) {
-      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      auto id = context.rtlPortName(root, name);
       if (failed(id))
         return failure();
       expression = std::move(*id);
@@ -738,16 +744,16 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
         << "    .pyc_local_error(pyc_local_error)";
     first = false;
   }
-  if (context.isPhysical()) {
+  if (context.hasPhysicalChecks()) {
     auto reset = managedReset(context, root);
     if (failed(reset))
       return failure();
     out << (first ? "\n" : ",\n")
-        << "    .pyc_root_commit_ok(pyc_root_commit_ok),\n"
-           "    .pyc_reset_active("
+        << "    .__checks_allow(pyc_root_commit_ok),\n"
+           "    .__checks_reset("
         << *reset
         << "),\n"
-           "    .pyc_local_error(pyc_local_error)";
+           "    .__checks_error(pyc_local_error)";
     first = false;
   }
   out << (first ? ");\n" : "\n  );\n") << "endmodule\n";
@@ -756,13 +762,23 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
 } // namespace
 FailureOr<FinalVerilogSourceParts>
 emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
-                       bool physical) {
-  HardwareEmitContext context(package, analysis, physical);
+                       bool physical, bool synthesis) {
+  HardwareEmitContext context(package, analysis, physical || synthesis, synthesis);
   const bool system = context.isSystem();
+  if (synthesis && system)
+    return package.emitOpError() << "synthesis RTL requires a Module root; System is a simulation harness";
   if (failed(context.prepareNativeChecks()))
     return failure();
   if (failed(analysis.verifySourceCheckPlan(context.sourceChecks())))
     return failure();
+  auto originalIr = [&] {
+    std::string text;
+    llvm::raw_string_ostream stream(text);
+    package.print(stream);
+    return text;
+  };
+  const std::string verifiedIr = originalIr();
+  if (failed(prepareRtlOwnership(context))) return failure();
   auto root = rootModule(context);
   if (failed(root))
     return failure();
@@ -798,8 +814,15 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
   if (failed(portMap))
     return failure();
   parts.portMap = std::move(*portMap);
-  parts.sourceCheckCount = context.sourceChecks().checks.size();
+  parts.sourceCheckCount = synthesis ? 0 : context.sourceChecks().checks.size();
   parts.rootRtlName = "pyc_root";
+  if (synthesis) {
+    llvm::StringSet<> names;
+    for (auto module : package.getOps<ac::ModuleOp>()) names.insert(context.names(module).rtl);
+    parts.rootRtlName = "design_top";
+    unsigned suffix = 0;
+    while (names.contains(parts.rootRtlName)) parts.rootRtlName = "design_top_" + std::to_string(++suffix);
+  }
   llvm::StringSet<> standard;
   package.walk([&](ac::InstanceOp instance) {
     if (!ac::isQueueInstance(instance))
@@ -815,6 +838,7 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
              << "unresolved module import in RTL emitter";
     if (kind == "fifo_local" || kind == "fifo_downstream_pop")
       continue;
+    if (synthesis && (kind == "dff" || kind == "dffe")) continue;
     std::string path = "include/verilog/" + kind.str() + ".v";
     if (standard.insert(path).second)
       parts.standardSources.push_back(path);
@@ -853,11 +877,15 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     llvm::raw_string_ostream out(group.text);
     for (Operation *declaration : unit.declarations)
       if (auto module = dyn_cast<ac::ModuleOp>(declaration)) {
+        if (!reachable.contains(module)) continue;
         group.path = context.names(module).verilog;
         group.definitions.push_back(
             FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));
-        if (failed(emitHardwareVerilogDefinition(context, module, out)))
+        if (context.rtlBaseNeeded(module) && failed(emitHardwareVerilogDefinition(context, module, out)))
           return failure();
+        for (const auto &partition : context.rtlPartitions)
+          if (partition->active && partition->definition == module && failed(emitHardwareVerilogDefinition(context, module, out, partition.get())))
+            return failure();
       }
     out.flush();
     // Shared nominal typedefs remain in the core. An owner without a module
@@ -882,11 +910,29 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
       return failure();
     parts.simulationTop = std::move(*simulation);
   }
+  llvm::json::Array bindings;
+  for (const auto &entry : context.rtlSourceNames)
+    bindings.emplace_back(llvm::json::Object{
+        {"module", entry.module}, {"source_name", entry.binding},
+        {"scope", entry.scope}, {"location", entry.site},
+        {"optimized_value", entry.valueOrdinal}, {"type", entry.type},
+        {"rtl_expression", entry.expression}});
+  llvm::raw_string_ostream namesOut(parts.valueNames);
+  if (originalIr() != verifiedIr)
+    return package.emitOpError() << "RTL presentation changed verified common IR";
+  llvm::SHA256 hash;
+  hash.update(verifiedIr);
+  namesOut << llvm::json::Value(llvm::json::Object{
+      {"schema", "pycircuit-rtl-value-names/v1"}, {"bindings", std::move(bindings)},
+      {"verified_ir_sha256", llvm::toHex(hash.final(), true)},
+      {"presentation_preserves_common_ir", true},
+      {"modules", std::move(context.rtlModules)}, {"ownership_notes", std::move(context.rtlOwnershipNotes)}});
+  namesOut.flush();
   return parts;
 }
 LogicalResult emitVerilog(ModuleOp package, ac::HardwareAnalysis &analysis,
-                          raw_ostream &out, bool physical) {
-  auto parts = emitVerilogSourceParts(package, analysis, physical);
+                          raw_ostream &out, bool physical, bool synthesis) {
+  auto parts = emitVerilogSourceParts(package, analysis, physical, synthesis);
   if (failed(parts))
     return failure();
   out << parts->core;

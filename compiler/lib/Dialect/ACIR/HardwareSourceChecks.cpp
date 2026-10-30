@@ -1395,39 +1395,107 @@ LogicalResult HardwareAnalysis::verifySourceCheckPlan(
 
 FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
     const HardwareSourceCheckPlan &plan,
-    HardwareSourceCheckLimits limits) const {
+    HardwareSourceCheckLimits limits, bool synthesis) const {
   if (failed(verifySourceCheckPlan(plan, limits)))
     return failure();
-  if (plan.owners.empty())
-    return package.emitOpError() << "physical RTL requires a root owner";
-  auto root = plan.owners.front().definition;
+  std::optional<HardwareSourceCheckPlan> expanded;
+  if (synthesis && plan.owners.empty()) {
+    auto fresh = detail::buildSourceCheckPlan(*this, limits,
+        detail::PackageVerificationProfile::Hardware, true);
+    if (failed(fresh)) return failure();
+    expanded = std::move(*fresh);
+  }
+  const auto &inventory = expanded ? *expanded : plan;
+  if (inventory.owners.empty()) {
+    // A genuinely combinational closure needs neither a fake clock nor the
+    // managed check lifecycle. Authenticate this case from the selected root,
+    // rather than treating every empty owner inventory as combinational.
+    auto systems = package.getOps<SystemOp>();
+    if (!llvm::hasSingleElement(systems))
+      return package.emitOpError() << "physical RTL requires one root";
+    auto entry = (*systems.begin()).getEntry().getAs<FlatSymbolRefAttr>("callee");
+    auto root = entry ? dyn_cast_or_null<ModuleOp>(lookupDefinition(entry.getValue())) : ModuleOp();
+    if (!root) return package.emitOpError() << "physical root is unresolved";
+    auto kind = root->getAttrOfType<StringAttr>("ac.root_kind");
+    if (kind && kind.getValue() == "system")
+      return root.emitOpError() << "physical RTL requires an ordinary Module, not a closed System";
+    llvm::DenseSet<Operation *> visited;
+    SmallVector<ModuleOp> pending{root};
+    while (!pending.empty()) {
+      auto module = pending.pop_back_val();
+      if (!visited.insert(module).second) continue;
+      auto checked = module.walk([&](Operation *op) {
+        if (isa<RuleOp, SourceExpectOp, SourceObserveOp>(op)) {
+          op->emitOpError() << "empty physical owner inventory cannot omit sampled effects";
+          return WalkResult::interrupt();
+        }
+        Operation *callee = nullptr;
+        if (auto instance = dyn_cast<InstanceOp>(op)) callee = resolveCallee(instance);
+        else if (auto collection = dyn_cast<CollectionOp>(op)) callee = resolveCallee(collection);
+        else return WalkResult::advance();
+        if (!callee || !getPrimitiveKind(callee).empty()) {
+          op->emitOpError() << "empty physical owner inventory cannot omit primitive endpoints";
+          return WalkResult::interrupt();
+        }
+        if (auto child = dyn_cast<ModuleOp>(callee)) pending.push_back(child);
+        return WalkResult::advance();
+      });
+      if (checked.wasInterrupted()) return failure();
+    }
+    return HardwarePhysicalProjection{root, 0, 0, false};
+  }
+  auto root = inventory.owners.front().definition;
   auto kind = root->getAttrOfType<StringAttr>("ac.root_kind");
   if (kind && kind.getValue() == "system")
     return root.emitOpError()
            << "physical RTL requires an ordinary Module, not a closed System";
   auto domain = root->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
+  if (expanded && inventory.commits.empty() && inventory.samplingOccurrences.empty()) {
+    bool sampled = false;
+    llvm::DenseSet<Operation *> checked;
+    for (const auto &owner : inventory.owners) {
+      if (!checked.insert(owner.definition).second) continue;
+      owner.definition->walk([&](Operation *op) {
+        sampled |= isa<RuleOp, SourceExpectOp, SourceObserveOp>(op);
+      });
+    }
+    if (!sampled) return HardwarePhysicalProjection{root, 0, 0, false};
+  }
+  bool explicitDomains = synthesis && (!domain || domain.empty());
   auto clock = domain ? domain.getAs<IntegerAttr>("clock") : IntegerAttr();
   auto reset = domain ? domain.getAs<IntegerAttr>("reset") : IntegerAttr();
   auto layout = getModulePortLayout(root);
   if (failed(layout))
     return failure();
-  if (!clock || !reset || clock.getValue().getActiveBits() > 32 ||
+  if (!explicitDomains && (!clock || !reset || clock.getValue().getActiveBits() > 32 ||
       reset.getValue().getActiveBits() > 32 || clock == reset ||
       clock.getValue().getZExtValue() >= layout->sourceInputCount ||
-      reset.getValue().getZExtValue() >= layout->sourceInputCount)
+      reset.getValue().getZExtValue() >= layout->sourceInputCount))
     return root.emitOpError()
            << "physical RTL requires one actual root clock/reset pair";
-  unsigned clk = clock.getValue().getZExtValue(),
-           rst = reset.getValue().getZExtValue();
+  unsigned clk = explicitDomains ? 0 : clock.getValue().getZExtValue(),
+           rst = explicitDomains ? 0 : reset.getValue().getZExtValue();
   detail::SourceCheckBudget budget(limits);
   budget.setPhase("physical RTL projection");
+    // Index verified occurrences so domain identity can follow an ordinary
+    // child's transparent outputs, including compiler-owned Method captures.
+    llvm::DenseMap<std::pair<uint64_t, Operation *>, SmallVector<uint64_t>> children;
+    for (auto [ordinal, occurrence] : llvm::enumerate(inventory.owners)) {
+        if (!occurrence.parent)
+            continue;
+        if (failed(budget.debit(1, occurrence.definition)))
+            return failure();
+        children[{*occurrence.parent, occurrence.path.back().allocation}].push_back(ordinal);
+    }
   // Identity-only transport is sufficient for domain proof. Uniform Tables
   // preserve identity through Collection slicing and layout permutations.
   // Derived expressions deliberately have no domain identity.
+#include "HardwareExplicitDomains.inc"
   std::function<FailureOr<unsigned>(Value, uint64_t, unsigned)> identity;
   identity = [&](Value value, uint64_t owner,
                  unsigned depth) -> FailureOr<unsigned> {
-    auto &occurrence = plan.owners[owner];
+    if (explicitDomains) return explicitPin(value, owner, depth, {});
+    auto &occurrence = inventory.owners[owner];
     Operation *site = value.getDefiningOp();
     if (!site)
       site = value.getParentBlock()->getParentOp();
@@ -1455,6 +1523,23 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
         return identity(cast<YieldOp>(rule.getBody().front().back())
                             .getValues()[result.getResultNumber()],
                         owner, depth + 1);
+        if (isa<InstanceOp, CollectionOp>(result.getOwner())) {
+            unsigned uniform = 0;
+            auto found = children.find({owner, result.getOwner()});
+            if (found == children.end())
+                return 0u;
+            for (auto child : found->second) {
+                auto definition = inventory.owners[child].definition;
+                auto yield = cast<YieldOp>(definition.getBody().front().back());
+                auto part = identity(yield.getValues()[result.getResultNumber()], child, depth + 1);
+                if (failed(part))
+                    return failure();
+                if (!*part || (uniform && uniform != *part))
+                    return 0u;
+                uniform = *part;
+            }
+            return uniform;
+        }
     }
     if (auto extract = value.getDefiningOp<BitsExtractOp>()) {
       auto low = evaluateStatic(extract.getLow(), occurrence.bindings, extract);
@@ -1490,28 +1575,31 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
     auto c = identity(clockValue, owner, 0), r = identity(resetValue, owner, 0);
     if (failed(c) || failed(r))
       return failure();
-    if (*c != 1 || *r != 2)
+    if (explicitDomains ? (!*c || !*r || *c == *r) : (*c != 1 || *r != 2))
       return site->emitOpError()
              << "physical RTL requires all sampling and storage to use the "
                 "actual root clock/reset pair";
+    clockPins.insert(*c);
     return success();
   };
   llvm::DenseSet<Operation *> reachable;
-  for (const auto &owner : plan.owners)
+  SmallVector<HardwarePhysicalControlBinding> physicalControls;
+  llvm::DenseSet<std::pair<Value, Value>> seenControls;
+  for (const auto &owner : inventory.owners)
     reachable.insert(owner.definition);
-  for (const auto &check : plan.bindings)
+  for (const auto &check : inventory.bindings)
     if (reachable.contains(check.definition) &&
         check.kind.getValue() != "guard_known")
       return check.expect->emitOpError()
              << "physical RTL requires managed execution for residual "
              << check.kind.getValue() << " checks";
-  for (const auto &sampling : plan.samplingOccurrences) {
-    const auto &binding = plan.samplingBindings[sampling.bindingIndex];
+  for (const auto &sampling : inventory.samplingOccurrences) {
+    const auto &binding = inventory.samplingBindings[sampling.bindingIndex];
     if (failed(pair(binding.clock, binding.reset, sampling.ownerOccurrence,
                     binding.definition)))
       return failure();
   }
-  for (auto [owner, occurrence] : llvm::enumerate(plan.owners)) {
+  for (auto [owner, occurrence] : llvm::enumerate(inventory.owners)) {
     auto definition = occurrence.definition;
     auto observations = definition.getBody().front().getOps<SourceObserveOp>();
     if (!observations.empty())
@@ -1526,11 +1614,11 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
                                                 occurrence.bindings, budget);
       if (failed(view) || failed(pair(view->clock, view->reset, owner, rule)))
         return failure();
-      for (const auto &control : view->controls)
-        if (control.kind != detail::SampledControlKind::CallableGuard &&
-            control.kind != detail::SampledControlKind::BranchSelect)
-          return rule.emitOpError() << "physical RTL requires managed "
-                                       "execution for non-guard controls";
+      for (const auto &control : view->controls) {
+        if (failed(budget.debit(1, rule))) return failure();
+        if (seenControls.insert({control.raw, control.reached}).second)
+          physicalControls.push_back({definition, control.raw, control.reached});
+      }
     }
     for (Operation &op : definition.getBody().front()) {
       if (!isa<InstanceOp, CollectionOp>(op))
@@ -1539,46 +1627,74 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
                          ? resolveCallee(cast<InstanceOp>(op))
                          : resolveCallee(cast<CollectionOp>(op));
       auto primitive = getPrimitiveKind(callee);
-      if (primitive.empty())
+      bool queue = isa<InstanceOp>(op) && isQueueInstance(cast<InstanceOp>(op));
+      if (primitive.empty() && !queue)
         continue;
-      if (primitive != "dff" && primitive != "dffe")
+      bool storage = primitive == "dff" || primitive == "dffe";
+      bool synthesisPrimitive = synthesis &&
+          (primitive == "sync_mem" || queue);
+      if (!storage && !synthesisPrimitive)
         return op.emitOpError()
                << "physical RTL supports only DFF/DFFE storage primitives";
       if (op.getNumOperands() < 2 ||
           failed(pair(op.getOperand(0), op.getOperand(1), owner, &op)))
         return failure();
+      if (!storage) continue;
       unsigned initialIndex = primitive == "dff" ? 3 : 4;
       if (op.getNumOperands() <= initialIndex ||
           failed(detail::verifyClosedStateInitializer(
               *this, op.getOperand(initialIndex), occurrence.bindings, &op)))
         return failure();
     }
+  }
+  // Collect every explicit clock before checking any consumer in the closure.
+  for (auto [owner, occurrence] : llvm::enumerate(inventory.owners)) {
+    auto definition = occurrence.definition;
     auto uses = definition.walk([&](Operation *op) {
       for (auto [index, operand] : llvm::enumerate(op->getOperands())) {
         auto id = identity(operand, owner, 0);
         if (failed(id))
           return WalkResult::interrupt();
-        if (*id != 1)
+        bool clock = clockPins.contains(*id);
+        if (explicitDomains && !clock) {
+          auto paths = getFieldPaths(operand.getType(), occurrence.bindings, op,
+              [&](uint64_t units, Operation *site) { return budget.debit(units, site); });
+          if (failed(paths)) return WalkResult::interrupt();
+          for (const auto &path : *paths) {
+            auto pin = explicitPin(operand, owner, 0, path);
+            if (failed(pin)) return WalkResult::interrupt();
+            clock |= clockPins.contains(*pin);
+          }
+        }
+        if (!clock)
           continue;
-        bool transport = isa<TableSplatOp>(op);
+        bool transport = isa<TableSplatOp>(op) ||
+            (explicitDomains && isa<StructGetOp, StructCreateOp>(op));
+        if (isa<YieldOp>(op)) {
+            // A forwarding edge is not a data consumer. Its actual uses are
+            // still checked, and a root output can never export the clock.
+            auto *parent = op->getParentOp();
+            transport = isa<RuleOp>(parent) ||
+                        (parent == definition && occurrence.parent.has_value());
+        }
         if (auto create = dyn_cast<TableCreateOp>(op)) {
           auto result = identity(create.getResult(), owner, 0);
           if (failed(result))
             return WalkResult::interrupt();
-          transport = *result == 1;
+          transport = clockPins.contains(*result);
         }
         if (auto extract = dyn_cast<BitsExtractOp>(op)) {
           auto result = identity(extract.getResult(), owner, 0);
           if (failed(result))
             return WalkResult::interrupt();
-          transport = *result == 1;
+          transport = clockPins.contains(*result);
         }
         if (auto rule = dyn_cast<RuleOp>(op)) {
-          auto metadata =
-              rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
-          auto capture = metadata ? metadata.getAs<IntegerAttr>("clock_capture")
-                                  : IntegerAttr();
-          transport = capture && index == capture.getValue().getZExtValue();
+            // Captures forward identity to the body's arguments. Check every
+            // actual body consumer instead of rejecting a duplicate domain
+            // capture returned by a callable child. pair() still authenticates
+            // the Rule's designated sampling clock independently.
+            transport = index < rule.getBody().front().getNumArguments();
         }
         if (isa<InstanceOp, CollectionOp>(op)) {
           auto *callee = isa<InstanceOp>(op)
@@ -1587,8 +1703,10 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
           auto primitive = getPrimitiveKind(callee);
           // Ordinary child arguments are checked in their actual occurrence.
           transport =
-              primitive.empty() ||
-              ((primitive == "dff" || primitive == "dffe") && index == 0);
+              (primitive.empty() && !(isa<InstanceOp>(op) && isQueueInstance(cast<InstanceOp>(op)))) ||
+              (index == 0 && (primitive == "dff" || primitive == "dffe" ||
+               (synthesis && (primitive == "sync_mem" ||
+                (isa<InstanceOp>(op) && isQueueInstance(cast<InstanceOp>(op)))))));
         }
         if (auto expect = dyn_cast<SourceExpectOp>(op))
           transport = expect.getKind() == "guard_known" && index == 2;
@@ -1603,6 +1721,7 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
     if (uses.wasInterrupted())
       return failure();
   }
-  return HardwarePhysicalProjection{root, clk, rst};
+  return HardwarePhysicalProjection{root, clk, rst, !explicitDomains,
+      std::move(physicalControls), explicitDomains};
 }
 } // namespace acir::ac

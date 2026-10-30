@@ -71,6 +71,7 @@ LogicalResult materializeComposeBody(detail::MaterializedCompose &record,
     auto builder = OpBuilder::atBlockEnd(block);
     auto create = [&](OperationState &state) -> Operation * {
         if (!charge(budget, method, 32 + 4 * state.operands.size())) return nullptr;
+        state.location = ac::sourceIdentityLocation(state.location);
         auto *op = builder.create(state);
         record.generated.push_back(op);
         return op;

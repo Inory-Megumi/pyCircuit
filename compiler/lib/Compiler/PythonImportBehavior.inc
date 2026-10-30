@@ -3048,6 +3048,7 @@ LogicalResult Importer::emitBehavioral(ModuleDecl &decl) {
       if (failed(value))
         return failure();
       values[name] = *value;
+      retainBinding(*value, name, decl.symbol, stmt);
       ordinaryBoundaries[name] = inferredBoundary(name, *value, stmt);
       noteNestedRuleDataBinding(name);
       continue;

@@ -218,7 +218,7 @@
           output.getType() != (operands.empty() ? bit : operands.front().getType()) ||
           operation->getName().getStringRef() != name ||
           operation->getBlock() != &module.getBody().front() ||
-          operation->getLoc() != queue.getLoc() ||
+          ac::sourceIdentityLocation(operation->getLoc()) != ac::sourceIdentityLocation(queue.getLoc()) ||
           !llvm::equal(operation->getOperands(), operands) ||
           operation->getAttrs() != attributes.getValue())
         return reject("original queue pop union operation differs");

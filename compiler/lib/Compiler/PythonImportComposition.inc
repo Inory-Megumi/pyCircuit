@@ -464,6 +464,7 @@ LogicalResult Importer::bindCallableResults(
   }
   for (auto [index, name] : llvm::enumerate(*targets)) {
     values[name] = converted[index];
+    retainBinding(converted[index], name, symbol, assignment);
     noteNestedRuleDataBinding(name);
   }
   return success();
@@ -544,6 +545,7 @@ FailureOr<bool> Importer::bindModuleResults(
   // Publish the names only after all targets and conversions have succeeded.
   for (auto [index, name] : llvm::enumerate(*targets)) {
     values[name] = converted[index];
+    retainBinding(converted[index], name, symbol, assignment);
     noteNestedRuleDataBinding(name);
   }
   return true;

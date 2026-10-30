@@ -29,6 +29,9 @@ nightly_python_tests=(
   tests/system/test_scalar_generic_modules.py
   tests/system/test_stateful_static_parameters.py
   tests/system/test_physical_rtl_export.py
+  tests/system/test_physical_rtl_readability.py
+  tests/system/test_synthesis_rtl_export.py
+  tests/system/test_physical_domain_forwarding.py
   tests/system/test_physical_projection_rejections.py
   tests/system/test_source_system_execution.py
   tests/system/test_boolean_record_fields.py

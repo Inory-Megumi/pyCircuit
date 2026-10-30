@@ -102,6 +102,7 @@ mlir::FailureOr<HardwareSourceCheckPlan>
 buildSourceCheckPlan(const HardwareAnalysis &analysis,
                      HardwareSourceCheckLimits limits,
                      PackageVerificationProfile profile =
-                         PackageVerificationProfile::Hardware);
+                         PackageVerificationProfile::Hardware,
+                     bool includeUnobserved = false);
 } // namespace acir::ac::detail
 #endif

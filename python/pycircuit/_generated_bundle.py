@@ -170,7 +170,7 @@ def _generated_receipt(
     if "rtl_mode" in value and (
         value["target"] != "verilog"
         or type(value["rtl_mode"]) is not str
-        or value["rtl_mode"] not in {"managed", "physical"}
+        or value["rtl_mode"] not in {"managed", "physical", "synthesis"}
     ):
         raise _PublicationError("generated.json RTL mode is invalid")
 

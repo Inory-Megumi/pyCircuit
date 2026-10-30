@@ -10,6 +10,8 @@
 #include <limits>
 #include <optional>
 
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
+
 using namespace mlir;
 namespace acir::detail {
 namespace {
@@ -847,7 +849,7 @@ class ValueAvailabilityMaterializer {
       return nullptr;
     OpBuilder builder(site);
     if (block) builder.setInsertionPointToEnd(block);
-    OperationState state(site->getLoc(), name);
+    OperationState state(ac::sourceIdentityLocation(site->getLoc()), name);
     state.addOperands(operands);
     state.addTypes(types);
     state.addAttributes(attrs);
@@ -1352,7 +1354,7 @@ class ValueAvailabilityMaterializer {
     SmallVector<Type> types(old.getResultTypes());
     for (int64_t output : child.output) if (output >= 0) types.push_back(bit);
     types.append(child.routed.size(), bit);
-    OperationState state(old.getLoc(), ac::InstanceOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(old.getLoc()), ac::InstanceOp::getOperationName());
     state.addOperands(old.getOperands());
     state.addTypes(types);
     state.addAttributes(old->getAttrs());
@@ -1383,8 +1385,10 @@ class ValueAvailabilityMaterializer {
       for (auto &selection : pin.selections)
         remapPinValue(selection.value);
     }
-    for (auto [ordinal, value] : llvm::enumerate(old.getResults()))
+    for (auto [ordinal, value] : llvm::enumerate(old.getResults())) {
+      ac::retainSourceValueNames(value, replacement->getResult(ordinal));
       value.replaceAllUsesWith(replacement->getResult(ordinal));
+    }
     old.erase();
     return success();
   }

@@ -10,6 +10,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/FileSystem.h"
@@ -997,7 +998,10 @@ TEST_F(SourceModuleScalarResultsTest,
     collect(create);
   ASSERT_EQ(used.size(), 1u);
   EXPECT_EQ(used.front().getValue(), representativeValue);
-  EXPECT_EQ(used.front().getLoc(), representativeLocation);
+  // Display names/owners can wrap the retained diagnostic position. Pooling
+  // must still preserve the first original position and all other metadata.
+  EXPECT_EQ(ac::sourceIdentityLocation(used.front().getLoc()),
+            ac::sourceIdentityLocation(representativeLocation));
   EXPECT_EQ(text(unit->body->getOperation()), bodyBefore);
   EXPECT_EQ(text(unit->interface->getOperation()), interfaceBefore);
 

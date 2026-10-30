@@ -16,6 +16,30 @@ bool isAsciiAlpha(char value) {
 
 bool isAsciiDigit(char value) { return value >= '0' && value <= '9'; }
 
+std::string rtlIdentifierStem(StringRef spelling) {
+  return (spelling.starts_with("\\") && spelling.ends_with(" ")
+      ? spelling.drop_front().drop_back() : spelling).str();
+}
+
+FailureOr<std::string> rtlIdentifier(StringRef source,
+                                     ac::detail::EmitError emitError) {
+  auto common = legalizeIdentifier(source, emitError);
+  if (failed(common)) return failure();
+  bool ascii = !source.empty() && (isAsciiAlpha(source.front()) || source.front() == '_');
+  for (char byte : source)
+    ascii &= isAsciiAlpha(byte) || isAsciiDigit(byte) || byte == '_';
+  if (ascii && *common != source) return "\\" + source.str() + " ";
+  return common;
+}
+
+FailureOr<std::string> rtlQualifiedIdentifier(StringRef symbol, StringRef suffix,
+                                              ac::detail::EmitError emitError) {
+  std::string name = "ac_" + symbol.str();
+  for (char &byte : name) if (byte == '.') byte = '_';
+  name += suffix.str();
+  return rtlIdentifier(name, emitError);
+}
+
 bool isCppKeyword(StringRef value) {
   static const llvm::StringSet<> keywords = [] {
     llvm::StringSet<> result;

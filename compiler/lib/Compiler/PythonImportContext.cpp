@@ -1,4 +1,5 @@
 #include "PythonImportContext.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 
 #include "pycircuit/Dialect/ACIR/ACIRDialect.h"
 
@@ -61,7 +62,7 @@ Operation *createSourceOperation(OpBuilder &builder, Location location,
                                  TypeRange results,
                                  ArrayRef<NamedAttribute> attributes,
                                  unsigned regionCount) {
-  OperationState state(location, name);
+  OperationState state(ac::sourceIdentityLocation(location), name);
   state.addOperands(operands);
   state.addTypes(results);
   state.addAttributes(attributes);

@@ -70,13 +70,14 @@ int main(int argc, char **argv) {
   }
   if (!optionsValid || (target != "cpp" && target != "verilog") ||
       (format != "json" && format != "source") ||
-      (rtlMode != "managed" && rtlMode != "physical") ||
+      (rtlMode != "managed" && rtlMode != "physical" && rtlMode != "synthesis") ||
       (target != "verilog" && rtlMode != "managed")) {
     llvm::errs() << "usage: pycircuit-emit FINAL.ac --target cpp|verilog "
-                    "[--format json|source] [--rtl-mode managed|physical]\n";
+                    "[--format json|source] [--rtl-mode managed|physical|synthesis]\n";
     return 2;
   }
-  bool physical = rtlMode == "physical";
+  bool synthesis = rtlMode == "synthesis";
+  bool physical = rtlMode == "physical" || synthesis;
   auto package = parseSourceFile<ModuleOp>(argv[1], &context);
   if (!package || failed(mlir::verify(*package)))
     return 1;
@@ -89,7 +90,7 @@ int main(int argc, char **argv) {
     LogicalResult status =
         target == "cpp"
             ? acir::compiler::emitCpp(*package, analysis, stream)
-            : acir::compiler::emitVerilog(*package, analysis, stream, physical);
+            : acir::compiler::emitVerilog(*package, analysis, stream, physical, synthesis);
     if (failed(status))
       return 1;
     llvm::outs() << text;
@@ -243,7 +244,7 @@ int main(int argc, char **argv) {
     result["source_groups"] = std::move(groups);
   } else {
     auto parts =
-        acir::compiler::emitVerilogSourceParts(*package, analysis, physical);
+        acir::compiler::emitVerilogSourceParts(*package, analysis, physical, synthesis);
     if (failed(parts))
       return 1;
     llvm::json::Array groups, standard;
@@ -264,6 +265,13 @@ int main(int argc, char **argv) {
     result["rtl_source_groups"] = std::move(groups);
     result["rtl_standard_sources"] = std::move(standard);
     result["rtl_core"] = parts->core;
+    auto valueNames = llvm::json::parse(parts->valueNames);
+    if (!valueNames) {
+      llvm::consumeError(valueNames.takeError());
+      emitError() << "invalid RTL value name map";
+      return 1;
+    }
+    result["rtl_value_names"] = std::move(*valueNames);
     result["rtl_mode"] = rtlMode;
     result["simulation_top"] = parts->simulationTop;
     result["source_check_count"] = parts->sourceCheckCount;

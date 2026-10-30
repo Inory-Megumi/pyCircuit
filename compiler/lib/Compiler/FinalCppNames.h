@@ -11,6 +11,9 @@
 
 namespace acir::compiler {
 
+bool isAsciiAlpha(char value);
+bool isAsciiDigit(char value);
+
 struct CppOwnerComponents {
   std::string moduleName;
   llvm::SmallVector<std::string> namespaces;
@@ -22,6 +25,14 @@ sourceOwnerComponents(mlir::DictionaryAttr owner,
                       ac::detail::EmitError emitError);
 mlir::FailureOr<std::string>
 legalizeIdentifier(llvm::StringRef source, ac::detail::EmitError emitError);
+// RTL has its own namespace and standard escaped identifiers. C++ mangling
+// must not turn an authored ASCII hardware name into a hexadecimal alias.
+mlir::FailureOr<std::string>
+rtlIdentifier(llvm::StringRef source, ac::detail::EmitError emitError);
+std::string rtlIdentifierStem(llvm::StringRef spelling);
+mlir::FailureOr<std::string>
+rtlQualifiedIdentifier(llvm::StringRef symbol, llvm::StringRef suffix,
+                       ac::detail::EmitError emitError);
 mlir::FailureOr<std::string>
 sourceDefinitionName(mlir::FlatSymbolRefAttr definition,
                      llvm::StringRef moduleName,

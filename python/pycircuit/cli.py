@@ -25,9 +25,13 @@ def _cmd_elaborate(args: argparse.Namespace) -> int:
         if not args.replace and (output.exists() or manifest_path.exists()):
             raise ValueError("output already exists; use --replace to overwrite it")
         if manifest_path.resolve() == Path(args.source).resolve():
-            raise ValueError("component manifest must not overwrite the authored source")
+            raise ValueError(
+                "component manifest must not overwrite the authored source"
+            )
         manifest = elaborate(args.source, output)
-        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
     except (ElaborationError, OSError, SyntaxError, UnicodeError, ValueError) as error:
         print(f"pycircuit elaborate: {error}", file=sys.stderr)
         return 1
@@ -156,8 +160,12 @@ def main(argv: list[str] | None = None) -> int:
     elaborate = sub.add_parser(
         "elaborate", help="Expand architecture extensions into ordinary Python source."
     )
-    elaborate.add_argument("source", help="Authored source using architecture extensions")
-    elaborate.add_argument("-o", dest="output", required=True, help="Expanded Python source")
+    elaborate.add_argument(
+        "source", help="Authored source using architecture extensions"
+    )
+    elaborate.add_argument(
+        "-o", dest="output", required=True, help="Expanded Python source"
+    )
     elaborate.add_argument("--replace", action="store_true")
     elaborate.set_defaults(fn=_cmd_elaborate)
 
@@ -237,7 +245,9 @@ def main(argv: list[str] | None = None) -> int:
     emit = sub.add_parser("emit", help="Emit C++ or Verilog from a saved final design.")
     emit.add_argument("final")
     emit.add_argument("--target", choices=("cpp", "verilog"), required=True)
-    emit.add_argument("--rtl-mode", choices=("managed", "physical"), default="managed")
+    emit.add_argument(
+        "--rtl-mode", choices=("managed", "physical", "synthesis"), default="managed"
+    )
     emit.add_argument("-o", dest="output", required=True)
     emit.add_argument("--replace", action="store_true")
     emit.set_defaults(fn=_cmd_emit)

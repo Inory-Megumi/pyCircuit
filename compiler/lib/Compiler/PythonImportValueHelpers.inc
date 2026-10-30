@@ -507,6 +507,7 @@ LogicalResult Importer::lowerValueHelper(ValueHelperDecl &helper) {
     numericValues.erase(result);
     fixedValues.erase(result);
     arithmeticValues.erase(result);
+    ac::retainSourceValueNames(result, replacement);
     result.replaceAllUsesWith(replacement);
     extract.erase();
   }
@@ -526,6 +527,7 @@ LogicalResult Importer::lowerValueHelper(ValueHelperDecl &helper) {
     numericValues.erase(result);
     fixedValues.erase(result);
     arithmeticValues.erase(result);
+    ac::retainSourceValueNames(result, representative);
     result.replaceAllUsesWith(representative);
     constant.erase();
   }

@@ -1,5 +1,6 @@
 #include "pycircuit/Transforms/Passes.h"
 #include "pycircuit/Transforms/SourceControlFlow.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 
 #include "Dialect/ACIR/ACIRSourceContracts.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
@@ -208,7 +209,7 @@ struct Normalizer {
          builder.getNamedAttr("value", integer),
          builder.getNamedAttr("origin", origin),
          builder.getNamedAttr("location", location)});
-    OperationState state(site->getLoc(),
+    OperationState state(ac::sourceIdentityLocation(site->getLoc()),
                          ac::BitsConstantOp::getOperationName());
     state.addTypes(type);
     state.addAttribute("value",
@@ -290,6 +291,7 @@ struct Normalizer {
     for (Operation &nested :
          llvm::make_early_inc_range(block.without_terminator()))
       nested.moveBefore(operation);
+    ac::retainSourceValueNames(operation.getResults(), values);
     operation.replaceAllUsesWith(values);
     operation.erase();
     return values;
@@ -348,6 +350,7 @@ struct Normalizer {
     if (TypeRange(ValueRange(carried)) != operation.getResultTypes())
       return operation.emitOpError()
              << "source for carried result types disagree";
+    ac::retainSourceValueNames(operation.getResults(), carried);
     operation.replaceAllUsesWith(carried);
     operation.erase();
     return success();
@@ -383,6 +386,7 @@ struct Normalizer {
       auto values = cloneBlock(chosen.front(), {}, operation);
       if (failed(values))
         return failure();
+      ac::retainSourceValueNames(operation.getResults(), *values);
       operation.replaceAllUsesWith(*values);
       operation.erase();
       return success();
@@ -431,7 +435,7 @@ struct Normalizer {
       return operation.emitOpError()
              << "source SCF if needs a proven-known condition or source "
                 "predicate transport";
-    OperationState state(operation.getLoc(),
+    OperationState state(ac::sourceIdentityLocation(operation.getLoc()),
                          ac::SourceBranchOp::getOperationName());
     state.addOperands(condition);
     state.addTypes(operation.getResultTypes());
@@ -458,6 +462,7 @@ struct Normalizer {
       ac::YieldOp::create(inside, yield.getLoc(), yield.getOperands());
       yield.erase();
     }
+    ac::retainSourceValueNames(operation.getResults(), branch.getResults());
     operation.replaceAllUsesWith(branch.getResults());
     operation.erase();
     return success();
@@ -564,7 +569,7 @@ struct Normalizer {
                             Value condition, TypeRange types,
                             DictionaryAttr origin, DictionaryAttr span,
                             bool continuation) {
-    OperationState state(site->getLoc(),
+    OperationState state(ac::sourceIdentityLocation(site->getLoc()),
                          ac::SourceBranchOp::getOperationName());
     state.addOperands(condition);
     state.addTypes(types);
@@ -610,6 +615,7 @@ struct Normalizer {
                          index.getSourceLocation());
         if (failed(folded))
           return failure();
+        ac::retainSourceValueNames(index.getResult(), *folded);
         index.getResult().replaceAllUsesWith(*folded);
         index.erase();
       } else if (isa<scf::YieldOp, scf::ConditionOp>(operation)) {
@@ -788,6 +794,7 @@ LogicalResult Normalizer::normalizeWhile(scf::WhileOp operation) {
     if (failed(visible))
       return failure();
     if (ordinal == trips) {
+      ac::retainSourceValueNames(operation.getResults(), *visible);
       operation.replaceAllUsesWith(*visible);
       operation.erase();
       return success();
@@ -985,7 +992,7 @@ LogicalResult Normalizer::normalizeHardwareWhile(scf::WhileOp operation) {
     if (!predicate)
       return operation.emitOpError()
              << "runtime while continuation lost its four-state transport";
-    OperationState conjunction(operation.getLoc(),
+    OperationState conjunction(ac::sourceIdentityLocation(operation.getLoc()),
                                ac::BitsBinaryOp::getOperationName());
     conjunction.addOperands({active, predicate.getInput()});
     conjunction.addTypes(predicateType);
@@ -1008,6 +1015,7 @@ LogicalResult Normalizer::normalizeHardwareWhile(scf::WhileOp operation) {
       // reached condition still owes its X/Z check after the last body.
       ac::YieldOp::create(thenBuilder, operation.getLoc(), ValueRange{});
       ac::YieldOp::create(elseBuilder, operation.getLoc(), ValueRange{});
+      ac::retainSourceValueNames(operation.getResults(), visible);
       operation.replaceAllUsesWith(visible);
       operation.erase();
       return success();

@@ -4,8 +4,10 @@ module fifo #(
     parameter type T = logic [0:0],
     parameter longint signed DEPTH = 0,
     parameter int READY_POLICY = -1,
-    parameter [63:0] AVAILABILITY_LATENCY = 64'd0,
-    parameter bit pyc_managed = 0
+    parameter [63:0] AVAILABILITY_LATENCY = 64'd0
+`ifndef PYCIRCUIT_PLAIN_RTL
+    , parameter bit pyc_managed = 0
+`endif
 ) (
     input wire clk,
     input wire rst,
@@ -15,10 +17,12 @@ module fifo #(
     output wire in_ready,
     output wire out_valid,
     output wire T out_data,
-    output wire local_capacity,
-    input wire [2:0] pyc_phase,
+    output wire local_capacity
+`ifndef PYCIRCUIT_PLAIN_RTL
+    , input wire [2:0] pyc_phase,
     input tri1 pyc_root_commit_ok,
     output wire pyc_local_error
+`endif
 );
     localparam int unsigned PAYLOAD_BITS = $bits(T);
     localparam int unsigned PTR_BITS = DEPTH <= 1 ? 1 : $clog2(DEPTH);
@@ -212,7 +216,9 @@ module fifo #(
                 end
             end else begin : autonomous
                 bit [1:0] control_error;
+`ifndef PYCIRCUIT_PLAIN_RTL
                 assign pyc_local_error = 1'b0;
+`endif
                 always @(posedge clk) begin
                     control_error = edge_control_error(1'b1, rst, do_push, do_pop);
                     if (control_error[0])
@@ -220,16 +226,22 @@ module fifo #(
                     if (control_error[1])
                         $fatal(1, "fifo: effective transfers must be known");
                     prepare_transition(1'b1, rst, do_push, do_pop, in_data);
+`ifndef PYCIRCUIT_PLAIN_RTL
                     if (pyc_root_commit_ok === 1'b1)
+`endif
                         commit_transition();
                 end
             end
 `else
             // All physical-edge state, including reset and age, shares permit.
+`ifndef PYCIRCUIT_PLAIN_RTL
             assign pyc_local_error = 1'b0;
+`endif
             always @(posedge clk) begin
                 prepare_transition(1'b1, rst, do_push, do_pop, in_data);
+`ifndef PYCIRCUIT_PLAIN_RTL
                 if (pyc_root_commit_ok === 1'b1)
+`endif
                     commit_transition();
             end
 `endif
@@ -379,7 +391,9 @@ module fifo #(
                 end
             end else begin : autonomous
                 bit [1:0] control_error;
+`ifndef PYCIRCUIT_PLAIN_RTL
                 assign pyc_local_error = 1'b0;
+`endif
                 always @(posedge clk) begin
                     control_error = edge_control_error(1'b1, rst, do_push, do_pop);
                     if (control_error[0])
@@ -387,22 +401,30 @@ module fifo #(
                     if (control_error[1])
                         $fatal(1, "fifo: effective transfers must be known");
                     prepare_transition(1'b1, rst, do_push, do_pop, in_data);
+`ifndef PYCIRCUIT_PLAIN_RTL
                     if (pyc_root_commit_ok === 1'b1)
+`endif
                         commit_transition();
                 end
             end
 `else
             // All physical-edge state, including reset and age, shares permit.
+`ifndef PYCIRCUIT_PLAIN_RTL
             assign pyc_local_error = 1'b0;
+`endif
             always @(posedge clk) begin
                 prepare_transition(1'b1, rst, do_push, do_pop, in_data);
+`ifndef PYCIRCUIT_PLAIN_RTL
                 if (pyc_root_commit_ok === 1'b1)
+`endif
                     commit_transition();
             end
 `endif
         end else begin : invalid_latency
             assign out_valid = 1'bx;
+`ifndef PYCIRCUIT_PLAIN_RTL
             assign pyc_local_error = 1'b1;
+`endif
             always_comb data_read = 'x;
         end
     endgenerate

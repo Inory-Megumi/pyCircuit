@@ -24,6 +24,8 @@
 #include <limits>
 #include <map>
 
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
+
 using namespace mlir;
 
 namespace acir {
@@ -2394,7 +2396,7 @@ FailureOr<MaterializedBranchResult> materializeSelection(
       return failure();
     MaterializedBranchResult result;
     result.generated.reserve(1);
-    OperationState state(branch->getLoc(), ac::ValueMergeOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(branch->getLoc()), ac::ValueMergeOp::getOperationName());
     state.addOperands({whenFalse, condition, whenTrue});
     state.addTypes({type, condition.getType()});
     state.addAttributes({
@@ -2425,7 +2427,7 @@ FailureOr<MaterializedBranchResult> materializeSelection(
   auto create = [&](StringRef name, ArrayRef<Value> operands,
                     ArrayRef<Type> types,
                     ArrayRef<NamedAttribute> attributes = {}) {
-    OperationState state(branch->getLoc(), name);
+    OperationState state(ac::sourceIdentityLocation(branch->getLoc()), name);
     state.addOperands(operands);
     state.addTypes(types);
     state.addAttributes(attributes);
@@ -2610,7 +2612,7 @@ public:
     if (types.size() != prepared.totalResults)
       return transaction.emitOpError()
              << "transaction prepared result layout is inconsistent";
-    OperationState state(staged.getLoc(), ac::RuleOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(staged.getLoc()), ac::RuleOp::getOperationName());
     state.addOperands(captures);
     state.addTypes(types);
     NamedAttrList attributes(transaction->getAttrs());
@@ -2705,7 +2707,7 @@ public:
       if (!charge(budget, transaction,
                   3 + 2 * 2 + 2 + 1 + sizeof(ac::BitsBinaryOp::Properties)))
         return failure();
-      OperationState enable(transaction.getLoc(),
+      OperationState enable(ac::sourceIdentityLocation(transaction.getLoc()),
                             ac::BitsBinaryOp::getOperationName());
       enable.addOperands({prefix, versions[output.binding.version].rawIntent});
       enable.addTypes(predicateType);
@@ -2796,7 +2798,7 @@ public:
       rule->getResult(result).setType(check.first.getType());
       rule->getResult(result + 1).setType(prefix.getType());
     }
-    OperationState yield(staged.getLoc(), ac::YieldOp::getOperationName());
+    OperationState yield(ac::sourceIdentityLocation(staged.getLoc()), ac::YieldOp::getOperationName());
     yield.addOperands(results);
     builder.create(yield);
     MaterializedTransaction record;
@@ -2893,7 +2895,7 @@ private:
              << "transaction branch selection inputs are unmapped";
     if (!charge(budget, plan.transaction, 3 + 2 * 3 + 2))
       return failure();
-    OperationState state(location, ac::BitsSelectOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(location), ac::BitsSelectOp::getOperationName());
     state.addOperands({condition, whenTrue, whenFalse});
     state.addTypes(resultType);
     return cast<ac::BitsSelectOp>(builder.create(state));
@@ -2913,7 +2915,7 @@ private:
     if (!charge(budget, plan.transaction,
                 3 + 4 + 2 + 1 + sizeof(ac::BitsBinaryOp::Properties)))
       return failure();
-    OperationState state(location, ac::BitsBinaryOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(location), ac::BitsBinaryOp::getOperationName());
     state.addOperands({lhs, rhs});
     state.addTypes(lhs.getType());
     state.addAttribute("opcode", builder.getStringAttr(opcode));
@@ -2926,7 +2928,7 @@ private:
         !charge(budget, plan.transaction,
                 3 + 4 + 2 + 1 + sizeof(ac::BitsCompareOp::Properties)))
       return failure();
-    OperationState state(location, ac::BitsCompareOp::getOperationName());
+    OperationState state(ac::sourceIdentityLocation(location), ac::BitsCompareOp::getOperationName());
     state.addOperands({raw, *literal});
     state.addTypes(prefix.getType());
     state.addAttribute("predicate", builder.getStringAttr("case_eq"));
@@ -3050,7 +3052,7 @@ private:
         if (failed(condition)) return failure();
         Value selected = *condition;
         if (!ancestry.whenTrue) {
-          OperationState invert(site->getLoc(), ac::BitsUnaryOp::getOperationName());
+          OperationState invert(ac::sourceIdentityLocation(site->getLoc()), ac::BitsUnaryOp::getOperationName());
           invert.addOperands(selected);
           invert.addTypes(selected.getType());
           invert.addAttribute("opcode", builder.getStringAttr("not"));
@@ -3068,7 +3070,7 @@ private:
         if (failed(joined)) return failure();
         path = *joined;
       }
-      OperationState state(site->getLoc(), ac::ValueRequireOp::getOperationName());
+      OperationState state(ac::sourceIdentityLocation(site->getLoc()), ac::ValueRequireOp::getOperationName());
       // Availability is filled from actual producer SSA after every Rule and
       // physical Module route exists. No speculative zero/one wire is seeded.
       state.addOperands({*payload, path});
@@ -3152,6 +3154,7 @@ private:
           return failure();
         frames[frame].map(access.getValue(),
                           versions[found->second->version].data);
+        ac::retainSourceValueNames(access.getValue(), versions[found->second->version].data);
       } else if (auto intent = dyn_cast<ac::SourceStateWriteOp>(op)) {
         if (failed(emitRequirements(intent, frame, builder))) return failure();
         auto found = writes.find({frame, intent});
@@ -3171,6 +3174,7 @@ private:
           if (failed(selected) || !prepayValueMapping(budget, formal, frames[frame],
                                                      formal.getSnapshot())) return failure();
           frames[frame].map(formal.getSnapshot(), *selected);
+          ac::retainSourceValueNames(formal.getSnapshot(), *selected);
         }
       } else if (auto split = dyn_cast<ac::SourceBranchOp>(op)) {
         if (failed(emitRequirements(split, frame, builder))) return failure();
@@ -3224,6 +3228,7 @@ private:
           if (!prepayValueMapping(budget, split, frames[frame], original))
             return failure();
           frames[frame].map(original, joined->value);
+          ac::retainSourceValueNames(original, joined->value);
           branchResults[id] = std::move(*joined);
         }
       } else if (auto call = dyn_cast<ac::SourceMethodCallOp>(op)) {
@@ -3256,6 +3261,7 @@ private:
                                   plan.values[result.result].value))
             return failure();
           frames[frame].map(plan.values[result.result].value, *value);
+          ac::retainSourceValueNames(plan.values[result.result].value, *value);
         }
       } else if (auto check = dyn_cast<ac::SourceExpectOp>(op)) {
         auto found = bodyCheckPlans.find({frame, check});
@@ -3424,7 +3430,7 @@ ac::StaticExprAttr bitsLiteralAttribute(Type payload, DictionaryAttr occurrence,
 
 Value bitsLiteral(Type payload, DictionaryAttr occurrence, Location location,
                   bool one, OpBuilder &builder) {
-  OperationState constant(location, ac::BitsConstantOp::getOperationName());
+  OperationState constant(ac::sourceIdentityLocation(location), ac::BitsConstantOp::getOperationName());
   constant.addTypes(payload);
   constant.addAttribute(
       "value",
@@ -3678,7 +3684,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       OpBuilder builder(old);
       // Detached reconstruction binds complete candidate pairs after every
       // allocation exists. Avoid inventing an untyped zero for nominal data.
-      OperationState replacement(old.getLoc(),
+      OperationState replacement(ac::sourceIdentityLocation(old.getLoc()),
                                  ac::InstanceOp::getOperationName());
       replacement.addAttributes(old->getAttrs());
       replacement.addTypes(resultTypes);
@@ -3687,6 +3693,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
       for (auto [source, prior, result] :
            llvm::zip(original.getResults(), old.getResults(),
                      allocation.getResults().take_front(old.getNumResults()))) {
+        ac::retainSourceValueNames(prior, result);
         prior.replaceAllUsesWith(result);
         mapping.map(source, result);
       }
@@ -3711,7 +3718,10 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         nextValues[definition.module][routingKey(route.path, route.value)] = {data, enable};
         if (route.path.empty()) {
           auto old = mapping.lookupOrNull(route.value);
-          if (old) old.replaceAllUsesWith(data);
+          if (old) {
+            ac::retainSourceValueNames(old, data);
+            old.replaceAllUsesWith(data);
+          }
           mapping.map(route.value, data);
         }
         continue;
@@ -3762,7 +3772,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
          llvm::enumerate(transaction.controls)) {
       auto check =
           cast<DictionaryAttr>(transaction.expectedRequiredChecks[ordinal]);
-      OperationState expect(original.getLoc(),
+      OperationState expect(ac::sourceIdentityLocation(original.getLoc()),
                             ac::SourceExpectOp::getOperationName());
       expect.addOperands(
           {materializedRule->getResult(transaction.checkBase + 2 * ordinal),
@@ -3788,7 +3798,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         auto metadata = cast<DictionaryAttr>(bodyRows[id]);
         uint64_t result = transaction.checkBase +
                           2 * (transaction.controls.size() + id);
-        OperationState expect(source.operation->getLoc(),
+        OperationState expect(ac::sourceIdentityLocation(source.operation->getLoc()),
                               ac::SourceExpectOp::getOperationName());
         expect.addOperands({materializedRule->getResult(result),
                             materializedRule->getResult(result + 1)});
@@ -3808,7 +3818,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         for (uint64_t ordinal = 0; ordinal < source.values.size(); ++ordinal)
           operands.push_back(
               materializedRule->getResult(pathResult + 1 + ordinal));
-        OperationState observe(source.operation->getLoc(),
+        OperationState observe(ac::sourceIdentityLocation(source.operation->getLoc()),
                                ac::SourceObserveOp::getOperationName());
         observe.addOperands(operands);
         observe.addAttribute("kind", source.kind);
@@ -3877,7 +3887,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         if (prior != candidates.end()) {
           auto gate = [&](Value first, Value second, StringRef opcode) -> FailureOr<Value> {
             if (!charge(budget, original, 32) || !prepayAppend(budget, original, commit.enableGenerated)) return failure();
-            OperationState state(original->getLoc(), ac::BitsBinaryOp::getOperationName());
+            OperationState state(ac::sourceIdentityLocation(original->getLoc()), ac::BitsBinaryOp::getOperationName());
             state.addOperands({first, second}); state.addTypes(first.getType());
             state.addAttribute("opcode", commitBuilder.getStringAttr(opcode));
             Operation *operation = commitBuilder.create(state); commit.enableGenerated.push_back(operation);
@@ -3976,6 +3986,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
          llvm::zip(original.getResults(), transaction.getResults(),
                    replacement.rule.getResults().take_front(
                        original.getNumResults()))) {
+      ac::retainSourceValueNames(old, result);
       old.replaceAllUsesWith(result);
       mapping.map(source, result);
     }
@@ -4059,7 +4070,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         candidate(module, {}, original.getQ(), original.getQ().getType(),
                   original.getClk().getType(), original.getOccurrence(),
                   original.getLoc(), builder);
-    OperationState update(original.getLoc(), ac::StateUpdateOp::getOperationName());
+    OperationState update(ac::sourceIdentityLocation(original.getLoc()), ac::StateUpdateOp::getOperationName());
     update.addOperands({state.getQ(), data, intent});
     builder.create(update);
   }
@@ -4801,7 +4812,7 @@ private:
       return failure();
     if (!op || !operations.contains(op) ||
         op->getName().getStringRef() != name || op->getBlock() != parent ||
-        op->getLoc() != location || op->getNumRegions() != regions ||
+        ac::sourceIdentityLocation(op->getLoc()) != ac::sourceIdentityLocation(location) || op->getNumRegions() != regions ||
         !llvm::equal(op->getOperands(), operands) ||
         op->getResultTypes() != types ||
         op->getAttrs() != attributes.getValue())
@@ -5495,7 +5506,7 @@ private:
         source->getName() != target->getName() ||
         cast<DictionaryAttr>(*expectedAttrs).getValue() != target->getAttrs() ||
         *expectedProperties != target->getPropertiesAsAttribute() ||
-        source->getLoc() != target->getLoc() ||
+        ac::sourceIdentityLocation(source->getLoc()) != ac::sourceIdentityLocation(target->getLoc()) ||
         source->getNumOperands() != target->getNumOperands() ||
         TypeRange(expectedTypes) != target->getResultTypes() ||
         source->getNumRegions() != target->getNumRegions() ||
@@ -5782,7 +5793,7 @@ private:
         expected.erase("ac.source_memory"); expected.erase("ac.payload_constraint");
         if (!isa<ac::InstanceOp>(target) || target->getAttrs() != expected.getAttrs() ||
             target->getPropertiesAsAttribute() != memory->getPropertiesAsAttribute() ||
-            target->getLoc() != memory.getLoc() || target->getNumOperands() != memory->getNumOperands() ||
+            ac::sourceIdentityLocation(target->getLoc()) != ac::sourceIdentityLocation(memory.getLoc()) || target->getNumOperands() != memory->getNumOperands() ||
             target->getNumResults() != memory->getNumResults() ||
             target->getResultTypes() != memory->getResultTypes() || failed(cover(target)))
           return reject("original Memory allocation identity differs");
@@ -5802,7 +5813,7 @@ private:
         if (!isa<ac::InstanceOp>(target) ||
             target->getAttrs() != expected.getAttrs() ||
             target->getPropertiesAsAttribute() != queue->getPropertiesAsAttribute() ||
-            target->getLoc() != queue->getLoc() || target->getNumOperands() != queue->getNumOperands() ||
+            ac::sourceIdentityLocation(target->getLoc()) != ac::sourceIdentityLocation(queue->getLoc()) || target->getNumOperands() != queue->getNumOperands() ||
             target->getNumResults() != queue->getNumResults() || failed(cover(target)))
           return reject("original queue allocation identity differs");
         for (auto [ordinal, operand] : llvm::enumerate(queue->getOperands())) {
@@ -5834,7 +5845,7 @@ private:
             target->getAttrs() != expectedInstance.getAttrs() ||
             target->getPropertiesAsAttribute() !=
                 op.getPropertiesAsAttribute() ||
-            target->getLoc() != op.getLoc() ||
+            ac::sourceIdentityLocation(target->getLoc()) != ac::sourceIdentityLocation(op.getLoc()) ||
             target->getNumRegions() != op.getNumRegions() ||
             target->getNumOperands() != op.getNumOperands() + extraInputs ||
             target->getNumResults() != op.getNumResults() + extraOutputs ||
@@ -5859,7 +5870,7 @@ private:
         if (!isa<ac::YieldOp>(target) || target->getAttrs() != op.getAttrs() ||
             target->getPropertiesAsAttribute() !=
                 op.getPropertiesAsAttribute() ||
-            target->getLoc() != op.getLoc() || target->getNumRegions() ||
+            ac::sourceIdentityLocation(target->getLoc()) != ac::sourceIdentityLocation(op.getLoc()) || target->getNumRegions() ||
             target->getNumResults() ||
             target->getNumOperands() !=
                 definition.sourceOutputs + definition.upward.size() + definition.queuePopSummaries.size() + validityOutputs)
@@ -8572,7 +8583,7 @@ FailureOr<OwningOpRef<mlir::ModuleOp>> materializeHardwareState(
         return state.emitOpError()
                << "unconditional hardware state requires the verified DFF primitive";
       auto table = dyn_cast<ac::TableType>(state.getQ().getType());
-      OperationState leaf(state.getLoc(), table ? ac::CollectionOp::getOperationName()
+      OperationState leaf(ac::sourceIdentityLocation(state.getLoc()), table ? ac::CollectionOp::getOperationName()
                                                 : ac::InstanceOp::getOperationName());
       leaf.addTypes(state.getQ().getType());
       leaf.addAttribute("instance_name", state.getInstanceNameAttr());
@@ -8586,6 +8597,7 @@ FailureOr<OwningOpRef<mlir::ModuleOp>> materializeHardwareState(
       // Establish Q first so a hold candidate or forward dependency is rebound
       // through ordinary SSA use replacement, without dangling copied Values.
       auto *storage = builder.create(leaf);
+      ac::retainSourceValueNames(state.getQ(), storage->getResult(0));
       state.getQ().replaceAllUsesWith(storage->getResult(0));
       SmallVector<Value> inputs{state.getClk(), state.getRst()};
       if (!dff) inputs.push_back(update->getIntent());
@@ -8593,7 +8605,7 @@ FailureOr<OwningOpRef<mlir::ModuleOp>> materializeHardwareState(
       inputs.push_back(state.getInitial());
       if (table)
         for (unsigned i = 0; i < 3; ++i) {
-          OperationState splat(state.getLoc(), ac::TableSplatOp::getOperationName());
+          OperationState splat(ac::sourceIdentityLocation(state.getLoc()), ac::TableSplatOp::getOperationName());
           splat.addOperands(inputs[i]);
           splat.addTypes(ac::TableType::get(state.getContext(), table.getShape(),
                                             inputs[i].getType()));
@@ -8628,6 +8640,8 @@ void acceptTransactionCandidate(mlir::ModuleOp input, mlir::ModuleOp staged) {
   input->setAttrs(staged->getAttrs());
   input->getRegion(0).takeBody(staged->getRegion(0));
 }
+
+#include "TransactionRtlProvenance.inc"
 
 class RouteTransactionsPass
     : public PassWrapper<RouteTransactionsPass, OperationPass<mlir::ModuleOp>> {
@@ -8683,6 +8697,7 @@ public:
       signalPassFailure();
       return;
     }
+    retainTransactionRtlProvenance(*prepared, *candidate);
     acceptTransactionCandidate(input, *candidate->module);
   }
 };

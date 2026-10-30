@@ -1,6 +1,7 @@
 #include "SourceLink.h"
 #include "SourceEntryBoundary.h"
 #include "LiteralPayloadWires.h"
+#include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 #include "SourceHeaderHelpers.h"
 #include "Dialect/ACIR/HardwareSourceCheckPreflight.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -41,6 +42,7 @@ public:
            llvm::make_early_inc_range(block.getOps<ac::BitsExtractOp>())) {
         Value input = detail::literalPayloadReplacement(extract, block);
         if (!input) continue;
+        ac::retainSourceValueNames(extract.getResult(), input);
         extract.getResult().replaceAllUsesWith(input);
         extract.erase();
       }
@@ -54,6 +56,7 @@ public:
         return;
       }
       for (auto [constant, representative] : *plan) {
+        ac::retainSourceValueNames(constant.getResult(), representative);
         constant.getResult().replaceAllUsesWith(representative);
         constant.erase();
       }
