@@ -57,7 +57,6 @@ def test_release_retirement_gate_checks_the_single_public_driver_contract(
     choices = re.search(r"\{([^{}]+)\}", capsys.readouterr().out)
     assert choices is not None
     assert set(choices[1].split(",")) == {
-        "elaborate",
         "compile",
         "link",
         "emit",
