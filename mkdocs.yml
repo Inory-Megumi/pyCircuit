@@ -97,14 +97,24 @@ nav:
       - Selected Module Entries: architecture/entry-boundary.md
       - Saved Anchors: architecture/saved-anchor.md
       - Simulation: architecture/simulation.md
+      - RV32I Example Contract: development/rv32i-core-contract.md
       - System Execution: architecture/system-execution.md
       - System Host Integration Design: architecture/system-host-integration.md
       - Combinational and Progress Analysis: architecture/progress-analysis.md
+  - Design gallery: https://github.com/PTO-ISA/pyCircuit/blob/main/designs/README.md
   - Development:
       - Overview: development/index.md
       - Source Authoring: development/agent-frontend-guide.md
       - Source-unit Workflow: development/source-unit-workflow.md
+      - Shared Functional and Timing Execution: development/shared-functional-timing-model.md
+      - Model Tool Product Plan: development/model-tool-product-plan.md
+      - Clocked Complete-state Execution: development/clocked-model-execution.md
+      - Shared Model Validation: development/shared-model-validation.md
+      - Installed Model Projects: development/model-project-workflow.md
+      - Model Specifications and Traceability: development/model-spec-workflow.md
+      - Model Specification Validation: development/model-spec-validation.md
       - Physical RTL Export: development/physical-rtl-export.md
+      - Transactional Resource IR: development/transactional-resource-ir.md
       - Compiler Benchmark Delivery: development/compiler-benchmark-delivery.md
       - Implementation Guide: development/implementation-guide.md
       - Contributing: development/contributing-workflow.md
