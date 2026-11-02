@@ -43,7 +43,8 @@ def test_every_current_document_is_reachable_from_navigation() -> None:
     nav_pages = {
         link.split("#", 1)[0]
         for link in _nav_pages(config["nav"])
-        if link.endswith(".md") or ".md#" in link
+        if not link.startswith(("http://", "https://"))
+        and (link.endswith(".md") or ".md#" in link)
     }
 
     existing = _current_markdown_pages()

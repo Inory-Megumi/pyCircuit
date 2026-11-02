@@ -90,6 +90,8 @@ nav:
       - Enums: reference/spec-enums.md
       - Queues: reference/spec-queues.md
       - Architecture Extensions: extensions/architecture.md
+      - Method Composition Contract: extensions/compose.md
+      - Method Composition Reference: reference/method-compose.md
   - Architecture:
       - Overview: architecture/overview.md
       - Compiler Pipeline: architecture/compiler-pipeline.md
@@ -114,6 +116,8 @@ nav:
       - Model Specifications and Traceability: development/model-spec-workflow.md
       - Model Specification Validation: development/model-spec-validation.md
       - Physical RTL Export: development/physical-rtl-export.md
+      - Physical Domain Transport: development/physical-domain-transport.md
+      - RTL Readability: development/rtl-readability.md
       - Transactional Resource IR: development/transactional-resource-ir.md
       - Compiler Benchmark Delivery: development/compiler-benchmark-delivery.md
       - Implementation Guide: development/implementation-guide.md

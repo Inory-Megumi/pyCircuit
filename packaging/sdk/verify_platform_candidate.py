@@ -23,6 +23,7 @@ ACTIVE_EXPORTS = {
     "module",
     "rule",
     "method",
+    "compose",
     "struct",
     "bits",
     "table",

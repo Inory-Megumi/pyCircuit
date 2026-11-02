@@ -219,6 +219,7 @@ def scan_public_surface() -> list[str]:
             "module",
             "rule",
             "method",
+            "compose",
             "struct",
             "bits",
             "table",
@@ -285,6 +286,7 @@ def scan_public_surface() -> list[str]:
             ):
                 commands.update(values)
         expected_commands = {
+            "elaborate",
             "compile",
             "link",
             "emit",
