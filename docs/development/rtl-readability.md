@@ -1,5 +1,11 @@
 # Readable physical RTL
 
+Native hardware export now prepares a [typed presentation plan](rtl-presentation.md)
+before printing. That plan owns consumer context, source-root identity, typed
+slot names, sharing and expression boundaries, with mandatory publication
+coverage. The current authoring scope is native Rule/Method and `pycircuit.lib`;
+Compose and `arch_primitives` retain their historical identities.
+
 `--rtl-mode synthesis` is a separate reset-based export for an open Module root.
 It emits no startup `initial`, private check ports, check blocks, fault history
 or runtime diagnostic tasks. Declared values remain synchronous reset values.
@@ -468,7 +474,7 @@ original wire equivalence classes without trusting planned cut aliases. The
 emitter fingerprints verified common IR before and after presentation and rejects
 a mutation. These checks are structural evidence, not RTL formal proof.
 
-## Current compose and Method lowering
+## Historical Compose and Method lowering
 
 Presentation metadata is retained on the current compose readiness, candidate
 and Method parameter implementation. It does not replace those implementations

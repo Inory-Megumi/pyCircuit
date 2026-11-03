@@ -918,6 +918,13 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
         {"optimized_value", entry.valueOrdinal}, {"type", entry.type},
         {"rtl_expression", entry.expression}});
   llvm::raw_string_ostream namesOut(parts.valueNames);
+  if (context.isPhysical())
+    for (const auto &entry : context.rtlModules) {
+      auto module = entry.getAsObject();
+      auto plan = module ? module->getObject("presentation_plan") : nullptr;
+      if (!plan || plan->getBoolean("complete") != true)
+        return package.emitOpError() << "RTL presentation plan has uncovered emitted values";
+    }
   if (originalIr() != verifiedIr)
     return package.emitOpError() << "RTL presentation changed verified common IR";
   llvm::SHA256 hash;

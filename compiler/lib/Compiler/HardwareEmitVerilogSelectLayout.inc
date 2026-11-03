@@ -25,6 +25,11 @@ std::unique_ptr<ReadableSelectLayout> planReadableSelect(
     }
     auto select = source.getDefiningOp<ac::BitsSelectOp>();
     if (!select || readableWidth(source) != width) return node;
+    if (!root && !presentation.mayInline(source)) {
+        node->wireBoundary = true;
+        node->boundary = source;
+        return node;
+    }
     // Preserve the established known-condition facts/structured simplifier,
     // as well as producers which an earlier rendering decision retained.
     if (!root && (names.contains(source) || readableRetained.contains(source) ||
@@ -95,7 +100,8 @@ FailureOr<std::string> readableSelectExpression(Value value) {
     if (!plan->select) return failure();
     llvm::DenseSet<Value> uses;
     bool materialize = readableRetained.contains(value) ||
-        !ac::sourceValueNames(value).empty() || readableUseCount(value, uses) != 1;
+        !ac::sourceValueNames(value).empty() || readableUseCount(value, uses) != 1 ||
+        !presentation.mayInline(value);
     std::string name;
     if (materialize) {
         name = sourceNetName(value, "selected_value");

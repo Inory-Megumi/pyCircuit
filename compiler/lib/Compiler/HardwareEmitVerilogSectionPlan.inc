@@ -1,6 +1,13 @@
 ReadableRtlSections::Guard readableSection(Value value) {
     if (!readableSections.isEnabled()) return readableSections.select("", "", 0);
     value = readableSource(value);
+    if (presentation.complete())
+        if (auto node = presentation.find(value); node && !node->scope.empty() && !node->sharedOwner) {
+            auto scope = StringRef(node->scope);
+            return readableSections.select("source:" + scope.str(),
+                (readableSections.isRoot(scope) ? "Source rule: " : "Source method: ") + scope.str(),
+                readableSections.sourceOrder(scope));
+        }
     llvm::StringSet<> admissions;
     for (auto origin : readableScopedRoles(value)) {
         auto role = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");

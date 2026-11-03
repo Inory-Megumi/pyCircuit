@@ -172,9 +172,8 @@ def test_storage_write_enable_is_the_original_endpoint_with_a_role_name(
 ):
     text, _ = role_views["Sequence", mode]
     if mode == "synthesis":
-        assert (
-            "entries_write_enable" in text and "else if (entries_write_enable)" in text
-        )
+        enable = re.search(r"else if \((\w*entries\w*enable)\)", text)
+        assert enable and re.search(r"assign " + enable[1] + r"\s*=", text)
         assert text.count("always_ff") == 1 and text.count("for (genvar") == 2
     else:
         assert ".pyc_root_commit_ok(__checks_allow)" in text

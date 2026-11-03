@@ -145,4 +145,4 @@ def test_layout_bound_emits_wire_boundaries_instead_of_unbounded_expansion(
     assignments = re.findall(r"assign\s+\S+\s*=\s*(.*?);", text, re.S)
     assert sum(item.count("?") for item in assignments) == 40
     assert max(item.count("?") for item in assignments) <= 32
-    assert "selected_value" in text
+    assert re.search(r"assign \w*choice\w*\s*=", text)

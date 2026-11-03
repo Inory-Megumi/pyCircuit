@@ -89,6 +89,7 @@ public:
   mlir::FailureOr<std::string> rtlPortName(mlir::Operation *definition,
                                           llvm::StringRef name) const;
   std::string rtlProtocolName(llvm::StringRef name) const;
+  std::string rtlAllocationStem(mlir::Operation *allocation) const;
   // Omit compiler-private identity returns whose callers can use the input.
   std::optional<unsigned> rtlForwardedInput(mlir::Operation *definition,
                                             unsigned output) const;
@@ -182,6 +183,7 @@ private:
   mutable llvm::DenseMap<std::pair<mlir::Operation *, unsigned>, mlir::Attribute> rtlConstantOutputs_;
 };
 mlir::Value rtlOwnershipSource(mlir::Value value, const HardwareEmitContext *context = nullptr);
+std::string rtlGeneratedStem(llvm::StringRef preferred, mlir::Operation *site);
 mlir::LogicalResult prepareRtlOwnership(HardwareEmitContext &context);
 mlir::LogicalResult emitHardwareCppDefinition(HardwareEmitContext &context,
                                               ac::ModuleOp definition,

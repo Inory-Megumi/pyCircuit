@@ -273,20 +273,19 @@ void inheritReadableLaneEnvironment(NetEmitter &local) {
     local.readableNames = readableNames;
     local.readableRetained = readableRetained;
     local.readableInlineExpressions = readableInlineExpressions;
-    local.readableInlineCosts = readableInlineCosts;
     local.readableControlViews = readableControlViews;
     local.readableControlUses = readableControlUses;
     local.readableEndpointValues = readableEndpointValues;
     local.readableRoleHints = readableRoleHints;
     local.readableAmbiguousBindings = readableAmbiguousBindings;
     local.readableAuthoredNames = readableAuthoredNames;
-    local.readablePurposes = readablePurposes;
-    local.readableValueOrdinals = readableValueOrdinals;
+    local.presentation = presentation;
     local.readableSections.inherit(readableSections);
     local.next = next;
 }
 
 void collectReadableLaneEnvironment(NetEmitter &local, StringRef scope) {
+    presentation.absorbEmissions(local.presentation);
     llvm::append_range(readableFactProofs, local.readableFactProofs);
     for (auto [value, view] : local.readableControlViews) readableControlViews.try_emplace(value, view);
     for (auto [value, expression] : local.names)

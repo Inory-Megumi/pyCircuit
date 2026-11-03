@@ -1457,6 +1457,32 @@ std::string HardwareEmitContext::rtlProtocolName(StringRef name) const {
     if (name == "pyc_local_error") return "__checks_error";
     return name.str();
 }
+std::string rtlGeneratedStem(StringRef preferred, Operation *site) {
+    auto raw = rtlIdentifierStem(preferred);
+    std::string stem;
+    for (char byte : raw) {
+        if (isAsciiAlpha(byte) || isAsciiDigit(byte)) stem += byte;
+        else if (!stem.empty() && stem.back() != '_') stem += '_';
+    }
+    while (!stem.empty() && stem.back() == '_') stem.pop_back();
+    if (stem.empty()) stem = "signal";
+    if (isAsciiDigit(stem.front())) stem = "signal_" + stem;
+    if (StringRef(stem).starts_with("pyc_")) stem = "signal_" + StringRef(stem).drop_front(4).str();
+    if (stem.size() > 80) stem = stem.substr(0, 48) + "_" + stem.substr(stem.size() - 24);
+    auto token = rtlIdentifier(stem, [&] { return site->emitOpError(); });
+    if (succeeded(token) && StringRef(*token).starts_with("\\")) stem += "_signal";
+    return stem;
+}
+std::string HardwareEmitContext::rtlAllocationStem(Operation *allocation) const {
+    auto raw = allocation->getAttrOfType<StringAttr>("instance_name").getValue();
+    auto *callee = isa<ac::InstanceOp>(allocation) ? analysis.resolveCallee(cast<ac::InstanceOp>(allocation))
+                                                : analysis.resolveCallee(cast<ac::CollectionOp>(allocation));
+    uint64_t ordinal = 0;
+    if (auto module = dyn_cast_or_null<ac::ModuleOp>(callee))
+        if (raw.starts_with("__pyc_call_") && !raw.drop_front(11).getAsInteger(10, ordinal))
+            return rtlGeneratedStem(names(module).rtl, allocation);
+    return rtlGeneratedStem(raw, allocation);
+}
 #include "HardwareEmitVerilogInterfaces.inc"
 std::optional<unsigned> HardwareEmitContext::rtlForwardedInput(
     Operation *definition, unsigned output) const {
@@ -1618,7 +1644,17 @@ FailureOr<std::string> HardwareEmitContext::rtlPortName(Operation *definition,
             }
             auto resource = readableResourceInputStem(*this, module, index);
             auto state = readableStateInputStem(*this, module, index);
-            preferred = resource ? *resource : state ? *state : owners.size() == 1 ? owners.begin()->getKey().str() : "argument_" + std::to_string(index);
+            auto methodArgument = readableArgumentInputStem(module, index);
+            preferred = resource ? *resource : state ? *state : methodArgument ? *methodArgument :
+                owners.size() == 1 ? owners.begin()->getKey().str() :
+                !original.getValue().starts_with("__") ? original.getValue().str() :
+                isa<ac::BitsType>(argument.getType()) ? "call_input" : "payload_input";
+            for (auto [payload, companion] : llvm::enumerate(layout->inputValidity))
+                if (companion == static_cast<int64_t>(index)) {
+                    auto sourceName = cast<StringAttr>(module.getInputNames()[payload]).getValue();
+                    preferred = sourceName.str() + "_valid";
+                }
+            preferred = rtlGeneratedStem(preferred, definition);
         }
         if (failed(append(original, preferred))) return failure();
     }
@@ -1656,7 +1692,12 @@ FailureOr<std::string> HardwareEmitContext::rtlPortName(Operation *definition,
             if (auto argument = dyn_cast<BlockArgument>(value))
                 if (argument.getOwner()->getParentOp() == definition)
                     preferred = rtlIdentifierStem(ports[argument.getArgNumber()].second) + "_capture";
-            if (preferred.empty()) preferred = "capture_" + std::to_string(index);
+            if (preferred.empty()) {
+                auto *producer = value.getDefiningOp();
+                auto kind = producer ? producer->getName().getStringRef().rsplit('.').second : StringRef("input");
+                preferred = kind.str() + "_result";
+            }
+            preferred = rtlGeneratedStem(preferred, definition);
         }
         if (failed(append(cast<StringAttr>(raw), preferred))) return failure();
     }

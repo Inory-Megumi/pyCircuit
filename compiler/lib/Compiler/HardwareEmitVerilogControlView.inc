@@ -23,72 +23,12 @@ static unsigned readableControlResult(StringRef operation, ArrayRef<unsigned> in
     return a == 1 ? b : a == 0 ? c : b == c ? b : 2;
 }
 
-ReadableControlView readableControlView(Value raw, unsigned depth = 0) {
+ReadableControlView readableControlView(Value raw) {
     Value value = readableSource(raw);
-    if (auto found = readableControlViews.find(value); found != readableControlViews.end()) return found->second;
-    ReadableControlView result{value};
-    if (depth > 128 || readableWidth(value) != 1 || ownershipOpaque.contains(value)) return result;
-    auto publish = [&] {
-        readableControlViews.try_emplace(value, result);
-        return result;
-    };
-    if (auto literal = readableLiteral(value)) {
-        for (unsigned bit = 0; bit < 4; ++bit)
-            if (*literal == std::string("1'b") + "01xz"[bit] ||
-                (bit < 2 && *literal == std::string("1'd") + "01"[bit])) {
-                result.domain = 1u << bit;
-                result.literal = bit;
-                return publish();
-            }
-    }
-    auto *operation = value.getDefiningOp();
-    if (!operation) return publish();
-    StringRef opcode;
-    if (auto binary = dyn_cast<ac::BitsBinaryOp>(operation))
-        if (llvm::is_contained(ArrayRef<StringRef>{"and", "or", "xor"}, binary.getOpcode())) opcode = binary.getOpcode();
-    if (auto unary = dyn_cast<ac::BitsUnaryOp>(operation))
-        if (unary.getOpcode() == "not") opcode = "not";
-    if (auto compare = dyn_cast<ac::BitsCompareOp>(operation)) {
-        result.domain = compare.getPredicate() == "case_eq" ? 3 : 7;
-        if (llvm::is_contained(ArrayRef<StringRef>{"eq", "ne", "case_eq"}, compare.getPredicate())) opcode = compare.getPredicate();
-    }
-    if (isa<ac::BitsSelectOp>(operation)) opcode = "select";
-    if (isa<ac::ValueRequireOp>(operation)) opcode = "require";
-    auto operands = operation->getOperands();
-    if (opcode == "require") operands = operands.drop_front();
-    if (opcode.empty() || operands.empty() || operands.size() > 3 ||
-        !llvm::all_of(operands, [&](Value input) { return readableWidth(input) == 1; })) return publish();
-    SmallVector<ReadableControlView> inputs;
-    for (Value input : operands) inputs.push_back(readableControlView(input, depth + 1));
-    unsigned domain = 0, projections = (1u << inputs.size()) - 1;
-    for (unsigned tuple = 0; tuple < (1u << (2 * inputs.size())); ++tuple) {
-        SmallVector<unsigned, 3> bits;
-        bool possible = true;
-        for (auto [index, input] : llvm::enumerate(inputs)) {
-            unsigned bit = (tuple >> (2 * index)) & 3;
-            bits.push_back(bit);
-            possible &= bool(input.domain & (1u << bit));
-            for (unsigned earlier = 0; earlier < index; ++earlier)
-                if (input.literal == 4 && inputs[earlier].literal == 4 && input.value == inputs[earlier].value)
-                    possible &= bit == bits[earlier];
-        }
-        if (!possible) continue;
-        unsigned bit = readableControlResult(opcode, bits);
-        domain |= 1u << bit;
-        for (unsigned index = 0; index < inputs.size(); ++index)
-            if (bit != bits[index]) projections &= ~(1u << index);
-    }
-    result.domain = domain;
-    // Authored identities remain visible even when their payload is constant.
-    if (ac::sourceValueNames(value).empty()) {
-        if (llvm::isPowerOf2_32(domain)) {
-            result.literal = llvm::Log2_32(domain);
-        } else {
-            for (unsigned index = 0; index < inputs.size(); ++index)
-                if (projections & (1u << index)) { result = inputs[index]; break; }
-        }
-    }
-    return publish();
+    auto view = presentation.view(value);
+    ReadableControlView result{view.value, view.domain, view.literal};
+    readableControlViews[value] = result;
+    return result;
 }
 
 FailureOr<std::string> readableControlProjection(Value value) {
@@ -100,121 +40,16 @@ FailureOr<std::string> readableControlProjection(Value value) {
 }
 
 void initializeReadableControlUses() {
-    // Count the actual presentation edges from outputs, primitive/module pins
-    // and retained checks. Verifier witnesses are not runtime consumers. Walk
-    // each producer once, but count every incoming edge before that cut.
-    llvm::DenseSet<Value> visited;
-    std::function<void(Value)> visit = [&](Value raw) {
-        Value value = readableSource(raw);
-        if (readableWidth(value) == 1) {
-            auto view = readableControlView(value);
-            if (view.literal < 4) return;
-            value = view.value;
-            ++readableControlUses[value];
-        }
-        if (!visited.insert(value).second || ownershipOpaque.contains(value)) return;
-        auto *operation = value.getDefiningOp();
-        if (!operation || isa<ac::InstanceOp, ac::CollectionOp>(operation)) return;
-        auto operands = operation->getOperands();
-        if (isa<ac::ValueRequireOp>(operation)) operands = operands.drop_front();
-        for (Value input : operands) visit(input);
-        for (Region &region : operation->getRegions())
-            for (Block &block : region)
-                if (!block.empty())
-                    if (auto yield = dyn_cast<ac::YieldOp>(block.back()))
-                        for (Value input : yield.getValues()) visit(input);
-    };
-    for (Value value : cast<ac::YieldOp>(definition.getBody().front().back()).getValues()) visit(value);
-    if (ownership)
-        for (const auto &port : ownership->exports) visit(port.value);
-    for (Operation &operation : definition.getBody().front())
-        if (isa<ac::InstanceOp, ac::CollectionOp>(operation))
-            for (Value input : operation.getOperands()) visit(input);
-    if (context.hasPhysicalChecks()) {
-        for (const auto &binding : context.sourceChecks().bindings)
-            if (binding.definition == definition) { visit(binding.condition); visit(binding.path); }
-        for (const auto &control : context.physicalProjection().controls)
-            if (control.definition == definition) { visit(control.raw); visit(control.reached); }
-    }
+    if (failed(presentation.census(presentationRoots()))) return;
+    for (Value value : readableOrderedValues())
+        if (auto node = presentation.find(value); node && node->oneBit)
+            readableControlUses[node->value] = node->uses;
 }
 
 bool readablePrivateControl(Value value) {
     value = readableSource(value);
     return ac::sourceValueNames(value).empty() && !ownershipOpaque.contains(value) &&
         readableWidth(value) == 1 && readableControlUses.lookup(value) == 1;
-}
-
-std::optional<std::string> readableControlAtomStem(Value value, unsigned depth = 0) {
-    value = readableSource(value);
-    if (depth > 5) return std::nullopt;
-    if (auto function = readableFunction(value); function && function->leaf && function->leaf != value) {
-        std::string suffix;
-        if (function->values == std::array<unsigned, 4>{0, 1, 0, 0}) suffix = "_active";
-        if (function->values == std::array<unsigned, 4>{1, 0, 0, 0}) suffix = "_zero";
-        if (function->values == std::array<unsigned, 4>{1, 1, 0, 0}) suffix = "_known";
-        if (!suffix.empty())
-            if (auto anchor = readableNameAnchor(function->leaf)) return *anchor + suffix;
-    }
-    if (auto anchor = readableNameAnchor(value)) return anchor;
-    if (auto binary = value.getDefiningOp<ac::BitsBinaryOp>(); binary && binary.getOpcode() == "and") {
-        auto left = readableControlAtomStem(binary.getLhs(), depth + 1), right = readableControlAtomStem(binary.getRhs(), depth + 1);
-        if (left && right && left->size() + right->size() < 80) return *left + "_and_" + *right;
-    }
-    if (auto unary = value.getDefiningOp<ac::BitsUnaryOp>(); unary && unary.getOpcode() == "not")
-        if (auto input = readableControlAtomStem(unary.getOperand(), depth + 1)) return "not_" + *input;
-    return std::nullopt;
-}
-
-std::optional<std::string> readableControlRelationStem(Value value, unsigned depth = 0) {
-    value = readableSource(value);
-    if (depth > 6 || readableWidth(value) != 1) return std::nullopt;
-    if (auto atom = readableControlAtomStem(value)) return atom;
-    auto *operation = value.getDefiningOp();
-    if (!operation) return std::nullopt;
-    if (auto compare = dyn_cast<ac::BitsCompareOp>(operation); compare && compare.getPredicate() == "case_eq") {
-        auto bit = readableBit(compare.getRhs());
-        if (bit)
-            if (auto input = readableControlRelationStem(compare.getLhs(), depth + 1)) return *input + (*bit ? "_active" : "_zero");
-    }
-    Value condition, term;
-    if (auto select = dyn_cast<ac::BitsSelectOp>(operation))
-        if (readableControlView(select->getOperand(2)).literal == 1) {
-            condition = select->getOperand(0); term = select->getOperand(1);
-        }
-    if (auto require = dyn_cast<ac::ValueRequireOp>(operation)) {
-        condition = require->getOperand(2); term = require->getOperand(1);
-    }
-    if (condition) {
-        auto guard = readableControlRelationStem(condition, depth + 1);
-        auto requirement = readableControlRelationStem(term, depth + 1);
-        if (guard && requirement && guard->size() + requirement->size() < 112)
-            return *requirement + "_when_" + *guard;
-    }
-    if (auto binary = dyn_cast<ac::BitsBinaryOp>(operation))
-        if (binary.getOpcode() == "and" || binary.getOpcode() == "or") {
-            auto left = readableControlRelationStem(binary.getLhs(), depth + 1), right = readableControlRelationStem(binary.getRhs(), depth + 1);
-            if (left && right && left->size() + right->size() < 112)
-                return *left + (binary.getOpcode() == "and" ? "_and_" : "_or_") + *right;
-        }
-    return std::nullopt;
-}
-
-std::optional<std::string> readableGuardedControlStem(Value value) {
-    if (readableWidth(value) != 1) return std::nullopt;
-    auto *operation = value.getDefiningOp();
-    Value condition, term;
-    if (auto select = dyn_cast_or_null<ac::BitsSelectOp>(operation))
-        if (readableControlView(select->getOperand(2)).literal == 1) {
-            condition = select->getOperand(0); term = select->getOperand(1);
-        }
-    if (auto require = dyn_cast_or_null<ac::ValueRequireOp>(operation)) {
-        condition = require->getOperand(2); term = require->getOperand(1);
-    }
-    if (!condition || readableControlView(condition).domain > 3) return std::nullopt;
-    auto guard = readableControlAtomStem(condition), requirement = readableControlAtomStem(term);
-    if (!guard || !requirement) return std::nullopt;
-    if (guard->size() + requirement->size() > 104) return *requirement + "_guarded";
-    return *requirement + "_when_" + *guard;
 }
 
 // Requirements are a conjunction, with conditional requirements represented by

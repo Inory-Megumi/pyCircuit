@@ -131,6 +131,31 @@ Attribute HardwareEmitContext::rtlConstantOutput(Operation *definition, unsigned
     return result;
 }
 
+std::optional<std::string> readableArgumentInputStem(ac::ModuleOp module, unsigned input) {
+    SmallVector<Value> pending{module.getBody().front().getArgument(input)};
+    llvm::DenseSet<Value> seen;
+    llvm::StringSet<> choices;
+    while (!pending.empty()) {
+        Value value = pending.pop_back_val();
+        if (!seen.insert(value).second) continue;
+        for (auto role : ac::sourceRtlRoles(value)) {
+            auto kind = role.getAs<StringAttr>("role"), scope = role.getAs<StringAttr>("scope");
+            auto name = role.getAs<StringAttr>("name");
+            if (kind && kind.getValue() == "argument" && scope && name && !name.getValue().empty())
+                choices.insert(scope.getValue().str() + "_" + name.getValue().str());
+        }
+        for (OpOperand &use : value.getUses()) {
+            if (auto rule = dyn_cast<ac::RuleOp>(use.getOwner()))
+                pending.push_back(rule.getBody().front().getArgument(use.getOperandNumber()));
+            else if (isa<ac::YieldOp>(use.getOwner())) {
+                if (auto rule = dyn_cast<ac::RuleOp>(use.getOwner()->getParentOp())) pending.push_back(rule.getResult(use.getOperandNumber()));
+            } else if (auto require = dyn_cast<ac::ValueRequireOp>(use.getOwner()); require && use.getOperandNumber() == 1)
+                pending.push_back(require.getResult());
+        }
+    }
+    return choices.size() == 1 ? std::optional<std::string>(choices.begin()->getKey().str()) : std::nullopt;
+}
+
 std::optional<std::string> readableResourceInputStem(const HardwareEmitContext &context, ac::ModuleOp module, unsigned input) {
     auto wiring = module->getAttrOfType<DictionaryAttr>("ac.queue_wiring");
     auto incoming = wiring ? wiring.getAs<ArrayAttr>("incoming") : ArrayAttr();
@@ -155,14 +180,14 @@ std::optional<std::string> readableResourceInputStem(const HardwareEmitContext &
                 if (instance.getOccurrence() == occurrence) selected = instance;
             auto child = selected ? dyn_cast_or_null<ac::ModuleOp>(context.analysis.resolveCallee(selected)) : ac::ModuleOp();
             if (!child) { resolved = false; break; }
-            prefix += selected.getInstanceName().str() + "_";
+            prefix += context.rtlAllocationStem(selected) + "_";
             current = child;
         }
         if (!resolved) continue;
         for (auto instance : current.getBody().front().getOps<ac::InstanceOp>())
             if (instance.getOccurrence() == declaration) {
                 auto kind = binding.getAs<StringAttr>("kind");
-                if (kind) return prefix + instance.getInstanceName().str() + "_" + kind.getValue().str() + (isData ? "_data" : "");
+                if (kind) return prefix + context.rtlAllocationStem(instance) + "_" + kind.getValue().str() + (isData ? "_data" : "");
             }
     }
     return std::nullopt;
@@ -190,7 +215,7 @@ std::optional<std::string> readableStateInputStem(const HardwareEmitContext &con
                 if (instance.getOccurrence() == occurrence) selected = instance;
             auto child = selected ? dyn_cast_or_null<ac::ModuleOp>(context.analysis.resolveCallee(selected)) : ac::ModuleOp();
             if (!child) return std::nullopt;
-            prefix += selected.getInstanceName().str() + "_";
+            prefix += context.rtlAllocationStem(selected) + "_";
             current = child;
         }
         for (auto storage : current.getBody().front().getOps<ac::InstanceOp>())

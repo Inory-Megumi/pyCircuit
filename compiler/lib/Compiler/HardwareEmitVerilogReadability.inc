@@ -18,6 +18,13 @@ Value readableSource(Value value) {
                         .getValues()[cast<OpResult>(value).getResultNumber()];
             continue;
         }
+        if (context.isPhysical())
+            if (auto result = dyn_cast<OpResult>(value))
+                if (auto instance = dyn_cast<ac::InstanceOp>(result.getOwner()))
+                    if (auto input = context.rtlForwardedInput(context.analysis.resolveCallee(instance), result.getResultNumber())) {
+                        value = instance.getOperand(*input);
+                        continue;
+                    }
         break;
     }
     return value;
@@ -186,53 +193,15 @@ bool readableInlineUses(Value value, llvm::DenseSet<Value> &visited) {
     return true;
 }
 
-bool canInlineReadable(Value value, Operation *op) {
-    bool projection = isa<ac::StructGetOp, ac::BitsExtractOp>(op);
-    if (!ac::sourceValueNames(value).empty() || (!projection && !readableWidth(value)) ||
-        !isa<ac::BitsUnaryOp, ac::BitsBinaryOp, ac::BitsCompareOp,
-             ac::BitsSelectOp, ac::BitsConcatOp, ac::BitsResizeOp,
-             ac::ValueRequireOp, ac::StructGetOp, ac::BitsExtractOp>(op))
-        return false;
-    if (auto binary = dyn_cast<ac::BitsBinaryOp>(op))
-        if (binary.getOpcode() == "udiv" || binary.getOpcode() == "urem")
-            return false;
-    llvm::DenseSet<Value> visited;
-    if (!readableInlineUses(value, visited))
-        return false;
-    visited.clear();
-    return readableWidth(value) == 1 && readableControlUses.contains(readableSource(value))
-        ? readableControlUses.lookup(readableSource(value)) == 1
-        : readableUseCount(value, visited) == 1;
+bool canInlineReadable(Value value, Operation *) {
+    return presentation.mayInline(value);
 }
 
-// Materialization is a typed graph decision. Spelling a source identifier or
-// choosing a longer diagnostic name must never change this decision. Each
-// operation/literal/wire is one display unit; a materialized input is a leaf.
+// Display cost is computed before printing, independent of identifier length.
 static constexpr unsigned readableExpressionLimit = 12;
-unsigned readableOperandCost(Value value, unsigned depth = 0) {
-    if (depth > 16) return 1;
-    value = readableSource(value);
-    if (readableWidth(value) == 1) {
-        auto view = readableControlView(value);
-        if (view.literal < 4) return 1;
-        value = view.value;
-    }
-    if (auto found = readableInlineCosts.find(value); found != readableInlineCosts.end()) return found->second;
-    Value carrier = readableEnumOperand(value);
-    return carrier == value ? 1 : readableOperandCost(carrier, depth + 1);
-}
-
 unsigned readableExpressionCost(Value value) {
-    unsigned cost = 1;
-    auto *operation = value.getDefiningOp();
-    if (!operation) return cost;
-    auto operands = operation->getOperands();
-    if (isa<ac::ValueRequireOp>(operation)) operands = operands.drop_front();
-    for (Value input : operands) {
-        cost += readableOperandCost(input);
-        if (cost > readableExpressionLimit) break;
-    }
-    return cost;
+    if (auto node = presentation.find(value)) return node->inlineExpression ? node->cost : readableExpressionLimit + 1;
+    return readableExpressionLimit + 1;
 }
 
 // Remove a sizing shell only through typed information, never by parsing RTL
@@ -267,31 +236,9 @@ std::string readableTypedOperand(Value input, Value output, Operation *consumer,
 
 // Count real consumers through source-level forwarding. Preserve SSA sharing
 // instead of duplicating even a short arithmetic DAG at several use sites.
-unsigned readableUseCount(Value value, llvm::DenseSet<Value> &visited) {
-    if (!visited.insert(value).second)
-        return 2;
-    unsigned count = 0;
-    for (OpOperand &use : value.getUses()) {
-        auto *owner = use.getOwner();
-        if (auto rule = dyn_cast<ac::RuleOp>(owner)) {
-            count += readableUseCount(rule.getBody().front().getArgument(
-                                          use.getOperandNumber()), visited);
-        } else if (isa<ac::YieldOp>(owner) && isa<ac::RuleOp>(owner->getParentOp())) {
-            auto rule = cast<ac::RuleOp>(owner->getParentOp());
-            count += readableUseCount(rule.getResult(use.getOperandNumber()), visited);
-        } else if (auto extract = dyn_cast<ac::BitsExtractOp>(owner);
-                   extract && readableFullExtract(extract.getResult()) != extract.getResult()) {
-            count += readableUseCount(extract.getResult(), visited);
-        } else if (isa<ac::EnumToBitsOp, ac::EnumFromBitsOp>(owner)) {
-            for (Value result : owner->getResults())
-                count += readableUseCount(result, visited);
-        } else {
-            ++count;
-        }
-        if (count > 1)
-            return 2;
-    }
-    return count;
+unsigned readableUseCount(Value value, llvm::DenseSet<Value> &) {
+    auto node = presentation.find(value);
+    return node ? node->uses : 0;
 }
 
 bool isReadableRegister(Operation *op) {
@@ -360,6 +307,7 @@ bool readableImplies(Value enabled, Value condition, unsigned depth = 0) {
 }
 
 std::string readableGeneratedStem(StringRef preferred) {
+    if (context.isPhysical()) return rtlGeneratedStem(preferred, definition);
     auto raw = rtlIdentifierStem(preferred);
     std::string stem;
     for (char byte : raw) {
@@ -381,7 +329,7 @@ std::string readableName(StringRef preferred, bool authored = false) {
     // collision suffixes on that identity, before restoring the terminator.
     bool escaped = preferred.starts_with("\\") && preferred.ends_with(" ");
     std::string generated;
-    if (escaped && !authored && context.isPhysical()) {
+    if (!authored && context.isPhysical()) {
         generated = readableGeneratedStem(preferred);
         preferred = generated;
         escaped = false;
@@ -410,7 +358,8 @@ FailureOr<std::string> readableInstanceName(Operation *operation) {
         uint64_t ordinal = 0;
         if (raw.starts_with("__pyc_call_") &&
             !raw.drop_front(StringRef("__pyc_call_").size()).getAsInteger(10, ordinal))
-            preferred = rtlIdentifierStem(context.names(module).rtl) + "_inst_" + std::to_string(ordinal);
+            preferred = context.isPhysical() ? context.rtlAllocationStem(operation)
+                : rtlIdentifierStem(context.names(module).rtl) + "_inst_" + std::to_string(ordinal);
     }
     auto id = rtlIdentifier(preferred, [&] { return operation->emitOpError(); });
     if (failed(id)) return failure();
@@ -476,29 +425,12 @@ std::string sourceNetName(Value value, StringRef fallback = {}) {
             auto id = rtlIdentifier(*name, [&] { return definition.emitOpError(); });
             if (succeeded(id)) return readableName(*id);
         }
-    if (context.isPhysical()) {
-        auto hint = readableRoleHints.find(value);
-        if (hint == readableRoleHints.end())
-            if (auto auxiliary = readableAuxiliaryStem(value)) return readableDerivedName(*auxiliary);
-        auto role = hint != readableRoleHints.end() ? std::optional<std::string>(hint->second) : readableRoleStem(value);
-        if (role) {
-            auto id = rtlIdentifier(*role, [&] { return definition.emitOpError(); });
-            if (succeeded(id)) return readableName(*id);
-        }
+    if (context.isPhysical() && presentation.complete()) {
+        if (auto node = presentation.find(value); node && !node->label.empty())
+            return readableDerivedName(node->label);
+        return readableDerivedName(readableSemanticKind(value));
     }
-    if (!fallback.empty())
-        return readableName(fallback);
-    if (context.isPhysical())
-        if (auto construction = readableConstructionStem(value)) return readableDerivedName(*construction);
-    if (context.isPhysical())
-        if (auto pin = readablePrimitiveResultStem(value)) return readableDerivedName(*pin);
-    if (context.isPhysical())
-        if (auto guarded = readableGuardedControlStem(value)) return readableDerivedName(*guarded);
-    if (context.isPhysical())
-        if (auto control = readableControlRelationStem(value)) return readableDerivedName(*control);
-    if (context.isPhysical())
-        if (auto operation = readableOperationStem(value)) return readableDerivedName(*operation);
-    if (context.isPhysical()) return readableDerivedName(readablePurposeStem(value));
+    if (!fallback.empty()) return readableName(fallback);
     std::string role = "value";
     auto *operation = value.getDefiningOp();
     if (auto binary = dyn_cast_or_null<ac::BitsBinaryOp>(operation))

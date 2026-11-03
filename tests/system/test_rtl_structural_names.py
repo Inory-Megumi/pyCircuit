@@ -129,7 +129,9 @@ def test_anonymous_keyword_callee_uses_a_logical_identifier_stem(
     structural_views, mode
 ):
     text, _ = structural_views["AnonymousParent", mode]
-    assert re.search(r"\\cell\s+cell_inst_[0-9]+\s*\(", text)
+    assert re.search(
+        r"\\cell\s+cell(?:_signal|_instance|_inst_\d+)(?:_\d+)?\s*\(", text
+    )
     assert not re.search(r"\bpyc_[0-9a-f]+\b", text)
 
 
@@ -145,7 +147,9 @@ def test_escaped_table_binding_has_legal_derived_generate_names(structural_views
 def test_table_routes_name_the_actual_storage_ancestor(structural_views, mode):
     text, _ = structural_views["Route", mode]
     assert (
-        "begin : wire_update" in text if mode == "synthesis" else "wire_mapped_" in text
+        "begin : wire_update" in text
+        if mode == "synthesis"
+        else re.search(r"wire\w*_mapped", text)
     )
     assert "pyc_lane_" not in text
 

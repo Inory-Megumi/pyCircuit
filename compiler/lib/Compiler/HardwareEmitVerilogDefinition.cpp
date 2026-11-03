@@ -1,5 +1,6 @@
 #include "FinalCppNames.h"
 #include "HardwareEmitCommon.h"
+#include "RtlPresentationPlan.h"
 #include "pycircuit/Dialect/ACIR/SourceValueNames.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "llvm/ADT/DenseMap.h"
@@ -73,7 +74,11 @@ public:
         ownershipOpaque.insert(port.value);
       }
     }
+    if (context.isPhysical() && failed(preparePresentationGraph()))
+      return definition.emitOpError() << "cannot prepare typed RTL presentation graph";
     initializeReadableRoles();
+    if (context.isPhysical() && !presentation.complete())
+      return definition.emitOpError() << "RTL presentation plan does not cover its runtime roots";
     return initializeReadableInstanceArrays();
   }
   FailureOr<std::string> physicalInitializer(Value value, unsigned depth = 0) {
@@ -442,6 +447,7 @@ public:
 #include "HardwareEmitVerilogTableLanes.inc"
 #include "HardwareEmitVerilogInstanceArrays.inc"
   FailureOr<std::string> net(Value value) {
+    if (context.isPhysical()) presentation.emitted(value);
     auto section = readableSection(value);
     if (auto alias = ownershipAliases.find(value); alias != ownershipAliases.end())
       return net(alias->second);
@@ -628,16 +634,15 @@ public:
       names.try_emplace(value, *source);
       return *source;
     }
-    if (isa<ac::TableCreateOp, ac::TableSplatOp, ac::TableMapOp,
-            ac::TableViewOp, ac::TableIndexOp, ac::TableReadOp, ac::TableGetOp, ac::TableMatchOp,
-            ac::TableChooseOp, ac::TableFoldOp, ac::ValueMergeOp>(op)) {
+    if (readableTableOperation(op)) {
       if (failed(tableOperation(op, value)))
         return failure();
       return names.lookup(value);
     }
     // Register the complete net before following producers. A legal
     // field-level graph can refer to another field of this same aggregate.
-    auto name = sourceNetName(value);
+    bool deferName = context.isPhysical() && presentation.mayInline(value);
+    auto name = deferName ? std::string() : sourceNetName(value);
     auto type = context.rtlType(value.getType(), op);
     if (failed(type))
       return failure();
@@ -647,7 +652,7 @@ public:
           binary.getOpcode() == "udiv" || binary.getOpcode() == "urem";
     if (!context.isPhysical())
       readableDeclaration(combinationalDivRem ? "" : "wire", *type, name);
-    names.try_emplace(value, name);
+    if (!name.empty()) names.try_emplace(value, name);
     readablePending.insert(value);
     SmallVector<std::string> operands;
     auto runtimeOperands = op->getOperands();
@@ -825,9 +830,9 @@ public:
         rendered = "$unsigned(" + rendered + ")";
       names[value] = rendered;
       readableInlineExpressions[value] = expression;
-      readableInlineCosts[value] = readableExpressionCost(value);
       return rendered;
     }
+    if (name.empty()) { name = sourceNetName(value); names[value] = name; }
     if (context.isPhysical())
       readableDeclaration(combinationalDivRem ? "" : "wire", *type, name);
     readableAssignment(name, expression, combinationalDivRem);
@@ -836,6 +841,7 @@ public:
   LogicalResult tableOperation(Operation *op, Value requested) {
     for (Value result : op->getResults()) {
       if (readableUnusedTableResult(result, requested)) continue;
+      if (context.isPhysical()) presentation.emitted(result);
       auto type = context.rtlType(result.getType(), op);
       if (failed(type))
         return failure();
@@ -1656,6 +1662,7 @@ public:
     }
     for (unsigned index = 0; index < controlValues.size(); ++index) {
       Value value = controlValues[index];
+      readableControlView(value);
       if (auto found = readableControlViews.find(value); found != readableControlViews.end()) appendControl(found->second.value);
       if (auto *operation = value.getDefiningOp()) {
         auto operands = operation->getOperands();
@@ -1665,8 +1672,9 @@ public:
       }
     }
     for (Value value : controlValues) {
+      readableControlView(value);
       auto found = readableControlViews.find(value);
-      auto view = found == readableControlViews.end() ? ReadableControlView{value} : found->second;
+      auto view = found->second;
       auto *operation = value.getDefiningOp();
       std::string opcode = "atom";
       if (found != readableControlViews.end()) {
@@ -1856,6 +1864,8 @@ public:
         {"rtl_file", context.names(definition).verilog},
         {"kind", rootKind && rootKind.getValue() == "system" ? "system_harness" : "hardware_module"},
         {"values", std::move(values)}, {"allocations", std::move(allocations)},
+        {"presentation_plan", context.isPhysical() ? llvm::json::Value(presentation.report(
+            [&](Value value) { return context.rtlOriginalValueIds.lookup(value); })) : llvm::json::Value(nullptr)},
         {"control_views", std::move(controlViews)}, {"fact_proofs", std::move(factProofs)},
         {"nonvalue_uses", std::move(nonvalueUses)},
         {"interface", llvm::json::Object{
@@ -1874,14 +1884,12 @@ private:
   llvm::DenseMap<Value, std::string> readableRoleHints;
   llvm::StringSet<> readableAmbiguousBindings;
   llvm::StringSet<> readableAuthoredNames;
-  llvm::DenseMap<Value, llvm::StringSet<>> readablePurposes;
-  llvm::DenseMap<Value, uint64_t> readableValueOrdinals;
+  RtlPresentationPlan presentation;
   const RtlOwnershipPartition *ownership;
   llvm::DenseMap<Value, Value> ownershipAliases;
   llvm::DenseSet<Value> ownershipOpaque;
   llvm::DenseMap<Value, std::string> initializers;
   llvm::DenseMap<Value, std::string> readableInlineExpressions;
-  llvm::DenseMap<Value, unsigned> readableInlineCosts;
   llvm::StringSet<> readableNames;
   llvm::DenseMap<Operation *, std::string> readableInstanceNames;
   llvm::DenseMap<std::pair<Value, unsigned>, std::string> readableBitNames;

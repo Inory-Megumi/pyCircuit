@@ -20,8 +20,16 @@ std::optional<std::string> readableRoleStem(Value value) {
         if (!role || !scope) continue;
         unsigned rank = 0;
         std::string name;
-        if (role.getValue() == "admission") {
+        if (role.getValue() == "effect_event") {
+            rank = 6; name = scope.getValue().str() + "_effect";
+        } else if (role.getValue() == "state_enable" && state) {
+            rank = 6; name = scope.getValue().str() + "_" + state.getValue().str() + "_enable";
+        } else if (role.getValue() == "admission") {
             rank = 5; name = scope.getValue().str() + "_admitted";
+        } else if (role.getValue() == "admission_step") {
+            rank = 4; name = scope.getValue().str() + "_conditions";
+        } else if (role.getValue() == "control_value" || role.getValue() == "control_reached" || role.getValue() == "control_accepted") {
+            rank = 2; name = scope.getValue().str() + "_" + role.getValue().str();
         } else if (role.getValue() == "after" && state && !state.getValue().empty()) {
             rank = 4; name = state.getValue().str() + "_after_" + scope.getValue().str();
         } else if (role.getValue() == "index_match" && state) {
@@ -30,17 +38,12 @@ std::optional<std::string> readableRoleStem(Value value) {
             rank = 3; name = scope.getValue().str() + "_" + state.getValue().str() + "_lane_value";
         } else if (role.getValue() == "write_value" && state) {
             rank = 2; name = scope.getValue().str() + "_" + state.getValue().str() + "_value";
+        } else if (role.getValue() == "argument") {
+            if (auto argument = origin.getAs<StringAttr>("name"); argument && !argument.getValue().empty()) {
+                rank = 2; name = scope.getValue().str() + "_" + argument.getValue().str();
+            }
         } else if (role.getValue() == "condition") {
             rank = 2; name = scope.getValue().str() + "_condition";
-            auto *operation = readableSource(value).getDefiningOp();
-            if (auto get = dyn_cast_or_null<ac::StructGetOp>(operation)) {
-                if (auto owner = readableNameAnchor(get.getOperand()))
-                    name = scope.getValue().str() + "_" + *owner + "_" + get.getField().str();
-                else name = scope.getValue().str() + "_" + get.getField().str();
-            }
-            if (auto compare = dyn_cast_or_null<ac::BitsCompareOp>(operation)) {
-                if (auto subject = readableComparisonStem(value)) name = scope.getValue().str() + "_" + *subject;
-            }
         } else if (role.getValue() == "source" &&
                    origin.getAs<StringAttr>("definition") == definition.getSymNameAttr() &&
                    origin.getAs<StringAttr>("root_scope") == scope) {
@@ -54,6 +57,12 @@ std::optional<std::string> readableRoleStem(Value value) {
     if (choices.size() == 1) return choices.begin()->getKey().str();
     if (choices.size() > 1) {
         if (kinds.size() != 1) return "shared_value";
+        llvm::StringSet<> roots;
+        for (auto origin : readableScopedRoles(value))
+            if (auto root = origin.getAs<StringAttr>("root_scope")) roots.insert(root.getValue());
+        auto prefix = roots.size() == 1 ? roots.begin()->getKey().str() : std::string("shared");
+        if (kinds.contains("state_enable")) return prefix + "_write_enable";
+        if (kinds.contains("effect_event")) return prefix + "_effect";
         return llvm::StringSwitch<std::optional<std::string>>(kinds.begin()->getKey())
             .Case("admission", "shared_admission")
             .Case("after", "shared_candidate")

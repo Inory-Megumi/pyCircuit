@@ -31,6 +31,7 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
         const auto &plan = *preparation.plan;
         auto &actual = candidate.transactions[ordinal];
         auto routingModule = plan.routingModule;
+        auto rootRegistration = plan.transaction;
         auto scope = [&](unsigned frame) {
             auto method = plan.frames[frame].method;
             auto transaction = plan.transaction;
@@ -40,6 +41,10 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
             if (!value) return;
             auto definition = plan.instances[plan.frames[frame].anchor].definition;
             auto rootDefinition = plan.instances[plan.frames[plan.rootFrame].anchor].definition;
+            auto rootIdentity = builder.getDictionaryAttr({
+                builder.getNamedAttr("definition", rootDefinition.getSymNameAttr()),
+                builder.getNamedAttr("receiver", plan.instances[plan.frames[plan.rootFrame].anchor].occurrencePath),
+                builder.getNamedAttr("registration", rootRegistration.getOccurrence())});
             ac::retainSourceRtlRole(value, builder.getDictionaryAttr({
                 builder.getNamedAttr("scope", scope(frame)),
                 builder.getNamedAttr("definition", definition.getSymNameAttr()),
@@ -48,6 +53,7 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
                 builder.getNamedAttr("frame", builder.getI64IntegerAttr(frame)),
                 builder.getNamedAttr("root_scope", scope(plan.rootFrame)),
                 builder.getNamedAttr("root_definition", rootDefinition.getSymNameAttr()),
+                builder.getNamedAttr("root_identity", rootIdentity),
                 builder.getNamedAttr("role", builder.getStringAttr(kind)),
                 builder.getNamedAttr("state", builder.getStringAttr(state)),
                 builder.getNamedAttr("name", builder.getStringAttr(name))}));
@@ -56,6 +62,22 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
         role(yielded.getValues()[preparation.fireResult], plan.rootFrame, "admission");
         role(actual.rule.getResult(preparation.fireResult), plan.rootFrame, "admission");
         auto stateName = [&](unsigned id) { auto state = plan.owners[id].declaration; return state.getInstanceName(); };
+        // The validated materialization owns these roles. Presentation must not
+        // rediscover events/permissions from an opcode recipe or a Method name.
+        for (auto value : actual.prefixes) role(value, plan.rootFrame, "admission_step");
+        for (const auto &control : actual.controls) {
+            role(control.raw, plan.rootFrame, "control_value");
+            role(control.reached, plan.rootFrame, "control_reached");
+            role(control.accepted, plan.rootFrame, "control_accepted");
+        }
+        for (const auto &proposal : preparation.queueProposals) {
+            role(yielded.getValues()[proposal.pathResult], plan.rootFrame, "effect_event");
+            role(actual.rule.getResult(proposal.pathResult), plan.rootFrame, "effect_event");
+        }
+        for (const auto &proposal : preparation.memoryProposals)
+            role(yielded.getValues()[proposal.pathResult], plan.rootFrame, "effect_event");
+        for (auto [id, commit] : llvm::enumerate(actual.commits))
+            role(commit.enable, plan.rootFrame, "state_enable", stateName(preparation.outputs[id].binding.owner));
         auto frameOwner = [&](unsigned frame) {
             const auto &instance = plan.instances[plan.frames[frame].anchor];
             return owner(plan.routingModule, instance.definition, instance.occurrencePath);
@@ -88,6 +110,15 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
             auto *parent = sourceValue.getParentRegion()->getParentOp();
             if (method && (parent == method || parent->getParentOfType<ac::SourceMethodOp>() == method))
                 role(actual.boundValues[id], ref.frame, "source");
+            if (method)
+                if (auto argument = dyn_cast<BlockArgument>(sourceValue);
+                    argument && argument.getOwner()->getParentOp() == method &&
+                    argument.getArgNumber() >= method.getCaptures().size()) {
+                    unsigned slot = argument.getArgNumber() - method.getCaptures().size();
+                    if (slot < method.getArgumentNames().size())
+                        role(actual.boundValues[id], ref.frame, "argument", {},
+                            cast<StringAttr>(method.getArgumentNames()[slot]).getValue());
+                }
         }
         for (auto [id, join] : llvm::enumerate(plan.joins))
             role(actual.stateJoins[id].value, plan.branches[join.branch].frame, "after", stateName(join.owner));

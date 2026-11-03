@@ -190,15 +190,15 @@ def test_broadcast_element_name_tracks_real_method_and_storage(
     derived_views, mode, name, method, state
 ):
     text, _ = derived_views[name, mode]
-    assert method + "_" + state + "_element_value" in text
+    assert re.search(method + "_" + state + r"_\w*element\w*", text)
     assert "complete_" not in text and "flush_" not in text
 
 
 @pytest.mark.parametrize("mode", ["physical", "synthesis"])
 def test_nested_constructor_tracks_the_actual_output_field(derived_views, mode):
     text, _ = derived_views["Nested", mode]
-    assert "result_payload_value" in text
-    assert "result_value" in text and "payload" in text
+    assert "result_payload_record" in text
+    assert "assign result_record = {result_payload_record, tag};" in text
 
 
 @pytest.mark.parametrize("mode", ["physical", "synthesis"])
@@ -213,7 +213,11 @@ def test_original_independent_constructors_are_not_merged_for_names(
         for value in module["values"]
         if value["opcode"] == "ac.struct.create" and value["rtl_expression"]
     }
-    assert constructors == {"result_0_value", "result_1_value"}
+    assert len(constructors) == 2
+    assert all(
+        any(name.startswith(port + "_") for name in constructors)
+        for port in ("result_0", "result_1")
+    )
 
 
 @pytest.mark.parametrize("mode", ["physical", "synthesis"])
@@ -383,7 +387,7 @@ def test_native_anonymous_auxiliary_slots_keep_distinct_meanings(native_slots, m
     assert "rows_match_mask_choice_0_index_in_range" in text
     assert "raw == pycircuit_types::Mode_t__IDLE" in text
     assert "guard ? candidate" in text and "| guard" in text
-    assert text.count("assign shared_Cell_value =") == 1
+    assert text.count("assign shared_record =") == 1
     assert "choice_rows_match_mask_choice_0_index_mask_1 [0:2]" in text
     assert (
         text.count("assign shared_write_value =") == 1

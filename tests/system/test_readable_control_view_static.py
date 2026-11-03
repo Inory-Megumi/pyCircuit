@@ -363,7 +363,8 @@ def test_multileaf_path_facts_keep_a_shared_conditional_requirement(
     control_views, mode
 ):
     data, text = control_views[mode]
-    assert re.search(r"assign b_check(?:_\d+)? = .*\? \(b === 1'b1\) : 1'b1;", text)
+    match = re.search(r"assign (\w+) = .*\? \(b === 1'b1\) : 1'b1;", text)
+    assert match and text.count(match[1]) >= 3
     assert any(
         module.get("fact_proofs") for module in data["rtl_value_names"]["modules"]
     )
