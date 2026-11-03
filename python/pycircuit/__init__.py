@@ -9,7 +9,9 @@ __all__ = [
     "instance_ref",
     "rule",
     "method",
-    "compose",
+    "guard",
+    "fired",
+    "forward",
     "struct",
     "bits",
     "table",
@@ -58,13 +60,23 @@ def rule(declaration=None, *, guard=None):
     raise RuntimeError("pyCircuit declarations require pycircuit compile")
 
 
-def method(declaration=None, *, guard=None):
+def method(declaration=None, *, guard=None, kind=None, private=False):
     """Declare an instance operation within its caller's Rule transaction."""
     raise RuntimeError("pyCircuit declarations require pycircuit compile")
 
 
-def compose(*, target, operations):
-    """Define readiness and resolve overlapping successful Method operations."""
+def guard(predicate):
+    """Require a predicate sampled at this statement for the caller to commit."""
+    raise RuntimeError("pyCircuit declarations require pycircuit compile")
+
+
+def fired(rule):
+    """Observe the successful event of one statically registered nested Rule."""
+    raise RuntimeError("pyCircuit declarations require pycircuit compile")
+
+
+def forward(state, *, source):
+    """Read a source operation's actual write, with committed-state fallback."""
     raise RuntimeError("pyCircuit declarations require pycircuit compile")
 
 

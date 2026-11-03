@@ -18,7 +18,12 @@
     }
     auto declared = llvm::find_if(preparation.writeDomains,
         [&](const auto &domain) { return domain.write == id; });
-    if (declared == preparation.writeDomains.end()) return success();
+    if (!charge(budget, site, 1 + preparation.forwardWrites.size())) return failure();
+    bool observationOnly = declared == preparation.writeDomains.end() &&
+        llvm::is_contained(preparation.forwardWrites, id);
+    if (declared == preparation.writeDomains.end() && !observationOnly) return success();
+    if (observationOnly && !write.selectors.empty())
+      return reject("original observation-only mask is not a whole-owner write");
     if (id >= materialized.selectedWrites.size()) return reject("original selected write inventory differs");
     const auto &record = materialized.selectedWrites[id];
     Builder b(site->getContext());
@@ -56,10 +61,10 @@
     ArrayAttr suffix = b.getArrayAttr(table ? after : before);
     Type bit = materialized.rule->getOperand(preparation.clockCapture).getType();
     Type maskType = table ? Type(ac::TableType::get(b.getContext(), table.getShape(), bit)) : bit;
-    if (declared->selectors != write.selectors || declared->prefix != prefix ||
+    if ((!observationOnly && (declared->selectors != write.selectors || declared->prefix != prefix ||
         declared->suffix != suffix || declared->table != table ||
         declared->index != (table ? std::optional<ac::BoundValueId>(write.indices.front()) : std::nullopt) ||
-        declared->maskType != maskType || !payload ||
+        declared->maskType != maskType)) || !payload ||
         !ac::areEquivalentHardwareTypes(current, payload.getType()))
       return reject("original selected write preparation differs");
     uint64_t cursor = 0;

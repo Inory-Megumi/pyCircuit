@@ -4,10 +4,10 @@
 
 # pyCircuit
 
-This downstream fork keeps compiler improvements and architecture extensions on
-one development branch, `codex/archlab`. See the
-[extension guide](docs/extensions/architecture.md) for Pipe, Table, Arbiter, FSM,
-the `pycircuit elaborate` command, source provenance and qualification limits.
+This downstream fork maintains compiler improvements on `codex/archlab`.
+Reusable components are moving to ordinary pyCircuit source libraries; see
+the [library guide](docs/extensions/architecture.md) for the retired expansion
+entry and the current implementation boundary.
 The canonical upstream remains [PTO-ISA/pyCircuit](https://github.com/PTO-ISA/pyCircuit).
 
 **Describe hardware in Python. Compile once. Simulate in C++ or Verilog.**

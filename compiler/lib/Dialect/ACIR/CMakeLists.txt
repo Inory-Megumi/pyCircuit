@@ -1,4 +1,5 @@
 add_acir_library(ACIRDialect SOURCES
+  HardwareActionViews.cpp
   ACIRConstantOps.cpp
   ACIRSourceControlFlowOps.cpp
   ACIRDialect.cpp

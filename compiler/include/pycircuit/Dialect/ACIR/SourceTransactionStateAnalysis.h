@@ -410,6 +410,17 @@ struct TransactionObservation {
   TransactionPoint point;
 };
 
+struct TransactionActionRead {
+  SourceActionReadOp operation;
+  InvocationFrameId frame = 0;
+  BoundValueId authoredPath = 0, result = 0;
+  TransactionPoint point;
+  SourceMethodOp method;
+  SourceTransactionOp root;
+  std::optional<StateOwnerId> forwardOwner;
+  mlir::ArrayAttr forwardFields;
+};
+
 enum class TransactionStateEventKind {
   TransactionEnter,
   GuardEnter,
@@ -467,6 +478,7 @@ struct TransactionStateEvent {
 /// all package transactions succeed; its IR handles require reconstruction
 /// after mutation.
 struct TransactionStatePlan {
+  llvm::SmallVector<TransactionActionRead, 0> actionReads;
   SourceTransactionOp transaction;
   ModuleOp lexicalModule;
   /// Routing is anchored at an actual allocation ancestor, never a rebinding

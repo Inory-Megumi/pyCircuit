@@ -95,6 +95,7 @@ struct SourceMethodView {
   unsigned getNumPublicResults() const;
   mlir::StringAttr getReturnForm() const;
   mlir::StringAttr getVisibility() const;
+  mlir::StringAttr getKind() const;
   mlir::DictionaryAttr getDeclaration() const;
   mlir::DictionaryAttr getGuardLocation() const;
   mlir::SymbolRefAttr getSymbol() const;

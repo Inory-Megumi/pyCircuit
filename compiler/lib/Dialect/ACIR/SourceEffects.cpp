@@ -32,6 +32,11 @@ void SourceStateWriteOp::getEffects(
   effects.emplace_back(mlir::MemoryEffects::Write::get(),
                        SourceStateResource::get());
 }
+void SourceActionReadOp::getEffects(
+    llvm::SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
+  effects.emplace_back(mlir::MemoryEffects::Read::get(), SourceStateResource::get());
+  effects.emplace_back(mlir::MemoryEffects::Write::get(), SourceCheckResource::get());
+}
 void SourceQueuePeekOp::getEffects(
     llvm::SmallVectorImpl<mlir::MemoryEffects::EffectInstance> &effects) {
   effects.emplace_back(mlir::MemoryEffects::Read::get(),

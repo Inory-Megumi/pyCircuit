@@ -17,7 +17,9 @@ enum class MarkerKind {
   System,
   Rule,
   Method,
-  Compose,
+  Guard,
+  Fired,
+  Forward,
   Struct,
   Bits,
   Table,
@@ -62,6 +64,8 @@ struct CapturedCallableSyntax {
   MarkerKind marker;
   AstNode guard;
   AstNode after;
+  mlir::StringAttr methodKind;
+  bool privateMethod = false;
 };
 
 /// Decode only the bound Rule/Method decorator and its guard lambda signature.

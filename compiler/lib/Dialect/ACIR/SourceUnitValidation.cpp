@@ -141,10 +141,17 @@ FailureOr<SourceUnitStructure> verifyStructure(mlir::ModuleOp unit, bool body,
         std::pair<StringRef, bool>{"ac.reference_parameters", isa<ModuleOp, ModuleImportOp>(operation)},
         {"ac.reference_bindings", isa<InstanceOp>(operation)},
         {"ac.reference", isa<SourceMethodCallOp>(operation)},
+        {"ac.method_kind", isa<SourceMethodOp>(operation)},
+        {"ac.forward_state", isa<SourceActionReadOp>(operation)},
+        {"ac.forward_fields", isa<SourceActionReadOp>(operation)},
         {"receiver_kind", isa<SourceMethodCallOp>(operation)},
         {"ancestor_depth", isa<SourceMethodCallOp>(operation)},
         {"ac.callable_after", false},
-        {"ac.after", false}}) {
+        {"ac.after", false},
+        {"ac.compose", false},
+        {"ac.compose_hold", false},
+        {"ac.state_composition", false},
+        {"ac.peer_admissions", false}}) {
       if (operation->hasAttr(name) && !allowed) {
         operation->emitOpError() << name << " is invalid on this source operation";
         return WalkResult::interrupt();
@@ -155,7 +162,7 @@ FailureOr<SourceUnitStructure> verifyStructure(mlir::ModuleOp unit, bool body,
           "ac.routed_output_validity", "ac.sampled_admission",
           "ac.execution_policy", "ac.transaction_wiring", "ac.queue_wiring",
           "ac.routed_contract", "ac.registration_path", "ac.lexical_registration",
-          "ac.registration_owner", "ac.transaction_returns", "ac.entry_boundary"}) {
+          "ac.registration_owner", "ac.transaction_returns", "ac.entry_boundary", "ac.action_view"}) {
       if (!operation->hasAttr(name))
         continue;
       operation->emitOpError()

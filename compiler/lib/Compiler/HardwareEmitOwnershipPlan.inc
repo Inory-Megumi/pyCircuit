@@ -336,11 +336,25 @@ LogicalResult prepareRtlOwnershipScopes(HardwareEmitContext &context,
                 }
             } else {
                 llvm::StringSet<> choices;
+                unsigned priority = 0;
                 for (auto origin : ac::sourceRtlRoles(value)) {
                     auto kind = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");
                     auto state = origin.getAs<StringAttr>("state");
-                    if (kind && scope && state && kind.getValue() == "after" && !state.getValue().empty())
-                        choices.insert(state.getValue().str() + "_after_" + scope.getValue().str());
+                    if (!kind || !scope) continue;
+                    unsigned rank = 0;
+                    std::string stem;
+                    if (state && kind.getValue() == "after" && !state.getValue().empty()) {
+                        rank = 4; stem = state.getValue().str() + "_after_" + scope.getValue().str();
+                    } else if (context.isPhysical() && state && kind.getValue() == "write_value" && !state.getValue().empty()) {
+                        rank = 2; stem = scope.getValue().str() + "_" + state.getValue().str() + "_value";
+                    } else if (context.isPhysical() && kind.getValue() == "source" &&
+                               origin.getAs<StringAttr>("definition") == part.definition.getSymNameAttr() &&
+                               origin.getAs<StringAttr>("root_scope") == scope) {
+                        rank = 1; stem = scope.getValue().str() + "_value";
+                    }
+                    if (!rank || rank < priority) continue;
+                    if (rank > priority) { choices.clear(); priority = rank; }
+                    choices.insert(stem);
                 }
                 if (choices.size() == 1) role = choices.begin()->getKey().str();
             }

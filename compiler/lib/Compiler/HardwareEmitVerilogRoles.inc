@@ -1,15 +1,28 @@
 // Names and source-call annotations only. No method spelling selects behavior.
+SmallVector<DictionaryAttr> readableScopedRoles(Value value) {
+    auto roles = ac::sourceRtlRoles(value);
+    bool local = llvm::any_of(roles, [&](auto role) {
+        return role.template getAs<StringAttr>("definition") == definition.getSymNameAttr();
+    });
+    SmallVector<DictionaryAttr> result;
+    for (auto role : roles)
+        if (!local || role.getAs<StringAttr>("definition") == definition.getSymNameAttr()) result.push_back(role);
+    return result;
+}
+
 std::optional<std::string> readableRoleStem(Value value) {
     unsigned priority = 0;
     llvm::StringSet<> choices;
     llvm::StringSet<> kinds;
-    for (auto origin : ac::sourceRtlRoles(value)) {
+    for (auto origin : readableScopedRoles(value)) {
         auto role = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");
         auto state = origin.getAs<StringAttr>("state");
         if (!role || !scope) continue;
         unsigned rank = 0;
         std::string name;
-        if (role.getValue() == "after" && state && !state.getValue().empty()) {
+        if (role.getValue() == "admission") {
+            rank = 5; name = scope.getValue().str() + "_admitted";
+        } else if (role.getValue() == "after" && state && !state.getValue().empty()) {
             rank = 4; name = state.getValue().str() + "_after_" + scope.getValue().str();
         } else if (role.getValue() == "index_match" && state) {
             rank = 3; name = scope.getValue().str() + "_" + state.getValue().str() + "_hit";
@@ -28,6 +41,10 @@ std::optional<std::string> readableRoleStem(Value value) {
             if (auto compare = dyn_cast_or_null<ac::BitsCompareOp>(operation)) {
                 if (auto subject = readableComparisonStem(value)) name = scope.getValue().str() + "_" + *subject;
             }
+        } else if (role.getValue() == "source" &&
+                   origin.getAs<StringAttr>("definition") == definition.getSymNameAttr() &&
+                   origin.getAs<StringAttr>("root_scope") == scope) {
+            rank = 1; name = scope.getValue().str() + "_value";
         }
         if (!rank || rank < priority) continue;
         if (rank > priority) { choices.clear(); kinds.clear(); priority = rank; }
@@ -38,6 +55,7 @@ std::optional<std::string> readableRoleStem(Value value) {
     if (choices.size() > 1) {
         if (kinds.size() != 1) return "shared_value";
         return llvm::StringSwitch<std::optional<std::string>>(kinds.begin()->getKey())
+            .Case("admission", "shared_admission")
             .Case("after", "shared_candidate")
             .Case("index_match", "shared_index_match")
             .Case("lane_value", "shared_lane_value")
@@ -49,7 +67,7 @@ std::optional<std::string> readableRoleStem(Value value) {
 
 std::optional<std::string> readableMethodScope(Value value) {
     llvm::StringSet<> scopes;
-    for (auto origin : ac::sourceRtlRoles(value))
+    for (auto origin : readableScopedRoles(value))
         if (auto role = origin.getAs<StringAttr>("role"); role && role.getValue() == "source")
             if (auto scope = origin.getAs<StringAttr>("scope")) scopes.insert(scope.getValue());
     if (scopes.size() == 1) return scopes.begin()->getKey().str();
@@ -73,6 +91,17 @@ std::string readableBindingName(Value value, ArrayRef<ac::SourceValueName> bindi
 
 void initializeReadableRoles() {
     if (!context.isPhysical()) return;
+    // Routed root Rules may live above their source object. Restored expressions
+    // still belong to the original Rule, not to a same-spelled helper Method.
+    for (Value value : readableOrderedValues())
+        for (auto origin : ac::sourceRtlRoles(value)) {
+            auto root = origin.getAs<StringAttr>("root_scope");
+            if (root && origin.getAs<StringAttr>("root_definition") == definition.getSymNameAttr())
+                readableSections.noteRoot(root.getValue());
+            auto role = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");
+            if (role && role.getValue() == "admission" && scope)
+                if (auto hint = readableRoleStem(readableSource(value))) readableRoleHints.try_emplace(readableSource(value), *hint);
+        }
     llvm::StringMap<llvm::StringSet<>> scopes;
     definition.walk([&](Operation *operation) {
         for (Value value : operation->getResults()) {

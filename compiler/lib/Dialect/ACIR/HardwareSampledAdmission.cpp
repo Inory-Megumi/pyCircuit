@@ -2,7 +2,8 @@
 #include "HardwareQueueResources.h"
 #include "HardwareValueAvailability.h"
 #include "HardwareGrantProof.h"
-#include "SourceCompose.h"
+#include "HardwareActionViews.h"
+#include "SourceForwarding.h"
 #include "ACIRSourceContracts.h"
 #include "HardwareSourceCheckPreflight.h"
 #include "HardwareSourceChecks.h"
@@ -12,6 +13,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringSet.h"
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -435,6 +437,13 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
   core.erase("queue_proposals");
   core.erase("memory_proposals");
   core.erase("write_domains");
+  core.erase("actions");
+  core.erase("action_inputs");
+  auto actions = row ? row.getAs<ArrayAttr>("actions") : ArrayAttr();
+  auto actionInputs = row ? row.getAs<ArrayAttr>("action_inputs") : ArrayAttr();
+  if (row && ((row.get("actions") && (!actions || actions.empty())) ||
+              (row.get("action_inputs") && (!actionInputs || actionInputs.empty()))))
+    return rule.emitOpError() << "action transport inventories require nonempty arrays";
   auto writeDomains = row ? row.getAs<ArrayAttr>("write_domains") : ArrayAttr();
   if (row && row.get("write_domains") && (!writeDomains || writeDomains.empty()))
     return rule->emitOpError() << "write_domains requires a nonempty array";
@@ -507,6 +516,14 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
       total = SourceCheckBudget::add(total, SourceCheckBudget::add(2, arguments.size()));
     }
   total = SourceCheckBudget::add(total, writeDomains ? writeDomains.size() : 0);
+  if (actions) for (Attribute raw : actions) {
+    auto action = dyn_cast<DictionaryAttr>(raw);
+    auto arguments = action ? action.getAs<ArrayAttr>("arguments") : ArrayAttr();
+    if (!arguments) return rule.emitOpError() << "action export requires its argument inventory";
+    total = SourceCheckBudget::add(total, SourceCheckBudget::add(1, arguments.size()));
+    if (auto forwards = action.getAs<ArrayAttr>("forwards"))
+      total = SourceCheckBudget::add(total, forwards.size());
+  }
   if (total == std::numeric_limits<uint64_t>::max() ||
       total != rule->getNumResults() || yielded->getNumOperands() != total)
     return rule->emitOpError() << "sampled admission requires exact "
@@ -1083,6 +1100,7 @@ parseSampledAdmissionImpl(RuleOp rule, const HardwareAnalysis &analysis,
   }
 #include "HardwareMemoryProposalParsing.inc"
 #include "HardwareWriteDomainParsing.inc"
+#include "HardwareActionParsing.inc"
   return result;
 }
 
@@ -1678,6 +1696,12 @@ normalizeIdentityEndpointImpl(const HardwareIdentityEndpoint &endpoint,
     currentBindings = nullptr;
     ownedBindings.reset();
   }
+}
+
+FailureOr<HardwareBindings> getIdentityScopeBindings(
+    const HardwareIdentityScope &scope, const HardwareAnalysis &analysis,
+    SourceCheckBudget &budget, Operation *site) {
+  return scopeBindings(scope, analysis, budget, site);
 }
 
 FailureOr<HardwareIdentityEndpoint>
@@ -2703,6 +2727,8 @@ LogicalResult proveSampledAdmission(const SampledAdmissionView &view,
   for (const auto &observation : view.observations)
     if (failed(effect(observation.path, observation.executionPath)))
       return failure();
+  for (const auto &action : view.actions)
+    if (failed(effect(action.active, action.executionPath))) return failure();
   return proveQueueProposalPrefixes(view, prepared, analysis, budget, proof);
 }
 
@@ -3134,7 +3160,6 @@ struct State {
   // The complete candidate set is immutable after writers(). This theorem is
   // state-wide; incoming-stage and physical D/E proofs remain per connection.
   bool writeDomainsProven = false;
-  bool composed = false;
 };
 struct PrivateRoute {
   HardwareIdentityEndpoint endpoint;
@@ -3204,7 +3229,7 @@ public:
     HardwareIdentityScope scope{root, bindings, {}};
     scope.rootBindings.owner = root;
     if (failed(expand(scope, std::nullopt, {})) ||
-        failed(buildOccurrenceIndex()))
+        failed(buildOccurrenceIndex()) || failed(actionClosures()))
       return failure();
     budget.setPhase("sampled wiring state inventory");
     if (failed(inventory()))
@@ -3212,16 +3237,14 @@ public:
     budget.setPhase("sampled wiring writers");
     if (failed(writers()))
       return failure();
-    budget.setPhase("sampled wiring peer admission");
-    if (failed(peerAdmissions())) return failure();
-    budget.setPhase("sampled wiring composition");
-    if (failed(compositions())) return failure();
     budget.setPhase("sampled wiring external inputs");
     if (failed(externalInputs()))
       return failure();
     budget.setPhase("sampled wiring connections");
     if (failed(connections()))
       return failure();
+    budget.setPhase("sampled wiring forward writer origin");
+    if (failed(forwardValues())) return failure();
     budget.setPhase("sampled wiring private uses");
     if (failed(privateUses()))
       return failure();
@@ -3230,6 +3253,74 @@ public:
   }
 
 private:
+#include "HardwareForwardProof.inc"
+
+  // Local adapters prove the complete source set only after all observations
+  // of one actual action have been routed to the same graph occurrence.
+  LogicalResult actionClosures() {
+    DenseMap<Attribute, size_t> routing;
+    DenseMap<Attribute, DictionaryAttr> declarations;
+    for (auto [ordinal, entry] : llvm::enumerate(occurrences)) {
+      auto bind = [&](DictionaryAttr action, Operation *site) -> LogicalResult {
+        if (!action) return site->emitOpError() << "missing action identity";
+        auto owner = action.getAs<ArrayAttr>("owner");
+        auto callee = action.getAs<SymbolRefAttr>("callee");
+        if (!owner || !callee || failed(budget.debit(32 + owner.size() * 8 +
+                entry.scope.path.size() * 8, site))) return failure();
+        auto declaration = action.getAs<DictionaryAttr>("declaration");
+        NamedAttrList declarationKey;
+        declarationKey.append("callee", callee);
+        if (auto registration = action.getAs<DictionaryAttr>("registration"))
+          declarationKey.append("registration", registration);
+        auto definitionKey = declarationKey.getDictionary(site->getContext());
+        auto prior = declarations.find(definitionKey);
+        if (!declaration || (prior != declarations.end() && prior->second != declaration))
+          return site->emitOpError() << "action Method has inconsistent declaration identities";
+        declarations.try_emplace(definitionKey, declaration);
+        ModuleOp target = entry.module;
+        SmallVector<Attribute> absolute;
+        for (auto instance : entry.scope.path) absolute.push_back(instance.getOccurrence());
+        for (Attribute step : owner) {
+          InstanceOp selected;
+          for (auto instance : target.getBody().front().getOps<InstanceOp>()) {
+            if (failed(budget.debit(1, site))) return failure();
+            if (instance.getOccurrence() != step) continue;
+            if (selected) return site->emitOpError() << "ambiguous action owner occurrence";
+            selected = instance;
+          }
+          auto child = selected ? dyn_cast_or_null<ModuleOp>(analysis.resolveCallee(selected)) : ModuleOp();
+          if (!child || !analysis.getPrimitiveKind(child).empty())
+            return site->emitOpError() << "action owner is not an ordinary instance path";
+          absolute.push_back(step);
+          target = child;
+        }
+        if (target.getSymName() != callee.getRootReference().getValue())
+          return site->emitOpError() << "action owner does not match its defining Module";
+        NamedAttrList key(action);
+        key.set("owner", ArrayAttr::get(site->getContext(), absolute));
+        auto identity = key.getDictionary(site->getContext());
+        if (failed(budget.debit(16, site))) return failure();
+        auto found = routing.find(identity);
+        if (found != routing.end() && found->second != ordinal)
+          return site->emitOpError() << "actual action producers and observers require one routing occurrence";
+        routing.try_emplace(identity, ordinal);
+        return success();
+      };
+      for (auto rule : entry.module.getBody().front().getOps<RuleOp>()) {
+        if (failed(budget.debit(1, rule))) return failure();
+        if (auto view = rule->getAttrOfType<DictionaryAttr>("ac.action_view"))
+          if (failed(bind(view.getAs<DictionaryAttr>("action"), rule))) return failure();
+        auto metadata = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+        auto exports = metadata ? metadata.getAs<ArrayAttr>("actions") : ArrayAttr();
+        if (exports) for (Attribute raw : exports) {
+          auto row = dyn_cast<DictionaryAttr>(raw);
+          if (!row || failed(bind(row.getAs<DictionaryAttr>("action"), rule))) return failure();
+        }
+      }
+    }
+    return success();
+  }
+
   static uint64_t occurrenceHash(const HardwareIdentityScope &scope) {
     llvm::hash_code hash = llvm::hash_value(scope.root.operator->());
     for (InstanceOp instance : scope.path)
@@ -3327,8 +3418,13 @@ private:
         return failure();
       witness |= isa<SourceStateOp>(operation);
       if (auto rule = dyn_cast<RuleOp>(operation)) {
+        if (rule->hasAttr("ac.action_view") && !actionViewProofs.contains(rule)) {
+          auto proof = verifyActionView(rule, analysis, budget);
+          if (failed(proof)) return failure();
+          actionViewProofs.try_emplace(rule, std::move(*proof));
+        }
         witness |= rule->hasAttr("ac.sampled_admission");
-        witness |= rule->hasAttr("ac.state_composition");
+        witness |= rule->hasAttr("ac.action_view");
         if (auto required =
                 rule->getAttrOfType<ArrayAttr>("ac.required_checks"))
           for (auto raw : required) {
@@ -3819,8 +3915,6 @@ private:
   }
 
 #include "HardwareWriteDomainProof.inc"
-#include "HardwareComposeProof.inc"
-#include "HardwarePeerAdmissionProof.inc"
 
   using IndexedWriteEndpoints =
       std::pair<HardwareIdentityEndpoint, HardwareIdentityEndpoint>;
@@ -4692,12 +4786,11 @@ private:
       Operation *consumer = use.getOwner();
       unsigned operand = use.getOperandNumber();
       bool sanctioned = false;
-      if (route.kind == PrivateRoute::EffectOperand && route.operand == 0) {
-        if (failed(budget.debit(orderedLookupCost(compositionControlUses.size()), consumer)))
-          return failure();
-        sanctioned = compositionControlUses.count(
-            {currentOccurrence, consumer, operand, route.terminal});
+      if (route.kind == PrivateRoute::EffectOperand) {
+        if (failed(budget.debit(orderedLookupCost(forwardEffectUses.size()), consumer))) return failure();
+        sanctioned = forwardEffectUses.count({currentOccurrence, consumer, operand});
       }
+
       if (route.kind != PrivateRoute::EffectOperand) {
         auto first = allowedUses.lower_bound(
             {currentOccurrence, consumer, operand, 0, PrivateRoute::Data});
@@ -4716,6 +4809,10 @@ private:
         }
       }
       if (sanctioned) continue;
+      if (auto view = dyn_cast<RuleOp>(consumer); view && view->hasAttr("ac.action_view")) {
+        auto proof = actionViewProofs.find(view);
+        if (proof != actionViewProofs.end() && proof->second.uses.contains(&use)) continue;
+      }
       if (route.kind == PrivateRoute::Mask)
         return consumer->emitOpError() << "private write-domain mask escapes its verified composition";
 
@@ -4920,8 +5017,8 @@ private:
   SmallVector<State, 0> states;
   SmallVector<HardwareIdentityEndpoint> stops;
   SmallVector<PrivateRoute> privateRoutes;
-  using CompositionControlUse = std::tuple<size_t, Operation *, unsigned, Operation *>;
-  std::set<CompositionControlUse> compositionControlUses;
+  llvm::DenseMap<Operation *, ActionViewProof> actionViewProofs;
+  std::set<std::tuple<size_t, Operation *, unsigned>> forwardEffectUses;
   llvm::DenseMap<uint64_t, SmallVector<size_t>> occurrenceIndex;
   llvm::DenseMap<std::pair<size_t, Operation *>, size_t> stateIndex;
   llvm::DenseMap<std::pair<size_t, Attribute>, size_t> stateTargetProofs;

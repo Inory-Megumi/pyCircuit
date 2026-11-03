@@ -39,16 +39,22 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
         auto role = [&](Value value, unsigned frame, StringRef kind, StringRef state = {}, StringRef name = {}) {
             if (!value) return;
             auto definition = plan.instances[plan.frames[frame].anchor].definition;
+            auto rootDefinition = plan.instances[plan.frames[plan.rootFrame].anchor].definition;
             ac::retainSourceRtlRole(value, builder.getDictionaryAttr({
                 builder.getNamedAttr("scope", scope(frame)),
                 builder.getNamedAttr("definition", definition.getSymNameAttr()),
                 builder.getNamedAttr("root", routingModule.getSymNameAttr()),
                 builder.getNamedAttr("path", plan.instances[plan.frames[frame].anchor].occurrencePath),
                 builder.getNamedAttr("frame", builder.getI64IntegerAttr(frame)),
+                builder.getNamedAttr("root_scope", scope(plan.rootFrame)),
+                builder.getNamedAttr("root_definition", rootDefinition.getSymNameAttr()),
                 builder.getNamedAttr("role", builder.getStringAttr(kind)),
                 builder.getNamedAttr("state", builder.getStringAttr(state)),
                 builder.getNamedAttr("name", builder.getStringAttr(name))}));
         };
+        auto yielded = cast<ac::YieldOp>(actual.rule.getBody().front().back());
+        role(yielded.getValues()[preparation.fireResult], plan.rootFrame, "admission");
+        role(actual.rule.getResult(preparation.fireResult), plan.rootFrame, "admission");
         auto stateName = [&](unsigned id) { auto state = plan.owners[id].declaration; return state.getInstanceName(); };
         auto frameOwner = [&](unsigned frame) {
             const auto &instance = plan.instances[plan.frames[frame].anchor];
@@ -136,12 +142,5 @@ void retainTransactionRtlProvenance(const PreparedTransactionLowering &prepared,
             for (auto *operation : actual.commits[id].data.generated)
                 ac::retainSourceRtlOwner(operation, stateOwner(output.binding.owner));
     }
-    for (auto &composition : candidate.compositions) {
-        auto definition = composition.source.composer->getParentOfType<ac::ModuleOp>();
-        SmallVector<Attribute> path;
-        for (auto instance : composition.source.path) path.push_back(instance.getOccurrence());
-        auto provenance = owner(composition.source.module, definition, builder.getArrayAttr(path));
-        ac::retainSourceRtlOwner(composition.rule, provenance);
-        for (auto *operation : composition.generated) ac::retainSourceRtlOwner(operation, provenance);
-    }
+
 }

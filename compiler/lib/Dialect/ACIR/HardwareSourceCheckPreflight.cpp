@@ -508,6 +508,8 @@ private:
     auto proposals = sampled ? sampled.getAs<ArrayAttr>("queue_proposals") : ArrayAttr();
     auto memoryProposals = sampled ? sampled.getAs<ArrayAttr>("memory_proposals") : ArrayAttr();
     auto domains = sampled ? sampled.getAs<ArrayAttr>("write_domains") : ArrayAttr();
+    auto actions = sampled ? sampled.getAs<ArrayAttr>("actions") : ArrayAttr();
+    auto actionInputs = sampled ? sampled.getAs<ArrayAttr>("action_inputs") : ArrayAttr();
     auto fail = [&]() -> LogicalResult {
       emitError(UnknownLoc::get(site->getContext()))
           << "sampled admission raw layout requires closed schema and "
@@ -528,7 +530,9 @@ private:
     auto clock = rawIndex(sampled, "clock_capture"),
          reset = rawIndex(sampled, "reset_capture"),
          fire = rawIndex(sampled, "fire_result");
-    if (!sampled || sampled.size() != (6 + bool(requirements) + bool(resources) + bool(proposals) + bool(memoryProposals) + bool(domains)) || !controls || controls.empty() ||
+    if (!sampled || sampled.size() != (6 + bool(requirements) + bool(resources) + bool(proposals) + bool(memoryProposals) + bool(domains) + bool(actions) + bool(actionInputs)) ||
+        (sampled.get("actions") && (!actions || actions.empty())) ||
+        (sampled.get("action_inputs") && (!actionInputs || actionInputs.empty())) || !controls || controls.empty() ||
         !checks || !observations || !clock || !reset || !fire ||
         *clock >= site->getNumOperands() || *reset >= site->getNumOperands())
       return fail();
@@ -874,6 +878,64 @@ private:
         total = add(total, 1);
       }
     }
+    if (actions) for (Attribute raw : actions) {
+      if (failed(budget.debit(1, site))) return failure();
+      auto row = dyn_cast<DictionaryAttr>(raw);
+      auto active = rawIndex(row, "active");
+      auto arguments = row ? row.getAs<ArrayAttr>("arguments") : ArrayAttr();
+      auto invocation = row ? row.getAs<ArrayAttr>("invocation") : ArrayAttr();
+      auto forwards = row ? row.getAs<ArrayAttr>("forwards") : ArrayAttr();
+      if (!row || row.size() != 6 + bool(forwards) || (row.get("forwards") && (!forwards || forwards.empty())) ||
+          !active || *active != total || !arguments ||
+          !invocation || !row.getAs<DictionaryAttr>("action") ||
+          !row.getAs<DictionaryAttr>("call") || failed(pathCost(row, invocation, g)) ||
+          failed(callableCost(invocation, g, false))) return fail();
+      total = add(total, 1);
+      frames = add(frames, invocation.size());
+      cost = add(cost, schemaRecordCost<SampledAdmissionView::Action>());
+      for (Attribute rawArgument : arguments) {
+        if (failed(budget.debit(1, site))) return failure();
+        auto argument = dyn_cast<DictionaryAttr>(rawArgument);
+        auto result = rawIndex(argument, "result");
+        if (!argument || argument.size() != 2 || !argument.getAs<StringAttr>("name") ||
+            !result || *result != total) return fail();
+        total = add(total, 1);
+        cost = add(cost, schemaRecordCost<Value>());
+      }
+      if (forwards) for (Attribute rawForward : forwards) {
+        if (failed(budget.debit(1, site))) return failure();
+        auto view = dyn_cast<DictionaryAttr>(rawForward);
+        auto result = rawIndex(view, "result");
+        auto writes = view ? view.getAs<ArrayAttr>("writes") : ArrayAttr();
+        if (!view || view.size() != 4 || !result || *result != total || !writes || writes.empty() ||
+            !view.getAs<DictionaryAttr>("state") || !view.getAs<ArrayAttr>("fields")) return fail();
+        total = add(total, 1);
+        cost = add(cost, schemaRecordCost<SampledAdmissionView::Forward>());
+        for (Attribute rawWrite : writes) {
+          auto path = dyn_cast<DictionaryAttr>(rawWrite);
+          auto frames = path ? path.getAs<ArrayAttr>("invocation") : ArrayAttr();
+          auto domain = rawIndex(path, "domain");
+          auto whole = path ? path.getAs<BoolAttr>("whole_owner") : BoolAttr();
+          if (!path || path.size() != 2 || !frames || bool(domain) == bool(whole) ||
+              (whole && !whole.getValue()) ||
+              failed(callableCost(frames, g, false))) return fail();
+          cost = add(cost, schemaRecordCost<std::optional<uint64_t>>());
+          cost = add(cost, schemaRecordCost<Value>());
+        }
+      }
+    }
+    if (actionInputs) for (Attribute raw : actionInputs) {
+      if (failed(budget.debit(1, site))) return failure();
+      auto row = dyn_cast<DictionaryAttr>(raw);
+      auto capture = rawIndex(row, "capture");
+      bool forward = row && row.getAs<StringAttr>("member") && row.getAs<StringAttr>("member").getValue() == "forward";
+      if (!row || row.size() != 5 + 2 * unsigned(forward) ||
+          (forward && (!row.getAs<DictionaryAttr>("state") || !row.getAs<ArrayAttr>("fields"))) ||
+          !capture || *capture >= site->getNumOperands() ||
+          !row.getAs<DictionaryAttr>("action") || !row.getAs<StringAttr>("member") ||
+          !row.getAs<StringAttr>("argument") || !row.getAs<DictionaryAttr>("occurrence")) return fail();
+      cost = add(cost, schemaRecordCost<Value>());
+    }
     if (total == std::numeric_limits<uint64_t>::max() ||
         total != site->getNumResults() || site->getNumRegions() != 1 ||
         !site->getRegion(0).hasOneBlock() || site->getRegion(0).front().empty() ||
@@ -1160,12 +1222,22 @@ private:
               Budget::add(local.observationMetadata, *cost);
         }
       }
+      for (StringRef key : {"ac.compose", "ac.compose_hold", "ac.state_composition", "ac.peer_admissions"})
+        if (op->hasAttr(key)) {
+          op->emitOpError() << "retired Compose metadata is not admitted: " << key;
+          return WalkResult::interrupt();
+        }
+      for (StringRef key : {"ac.forward_state", "ac.forward_fields"})
+        if (op->hasAttr(key) && !isa<SourceActionReadOp>(op)) {
+          op->emitOpError() << "source forward receiver is invalid on this operation";
+          return WalkResult::interrupt();
+        }
       for (StringRef key :
            {"occurrence", "ac.required_checks", "ac.check_id", "location",
             "ac.message", "ac.sampled_admission", "ac.transaction_wiring",
             "ac.queue_wiring", "ac.system_samples", "ac.registration_path",
             "ac.lexical_registration", "ac.registration_owner",
-            "ac.transaction_returns", "ac.compose", "ac.state_composition"}) {
+            "ac.transaction_returns", "ac.action_view"}) {
         Attribute attribute = op->getAttr(key);
         auto cost = structureCost(attribute, op);
         if (failed(cost))
@@ -1181,18 +1253,17 @@ private:
         }
         if (attribute &&
             (key == "ac.sampled_admission" || key == "ac.transaction_wiring" ||
-             key == "ac.queue_wiring" || key == "ac.state_composition"))
+             key == "ac.queue_wiring"))
           local.hasSamplingMetadata = true;
-        if (attribute && key == "ac.state_composition") {
+
+
+        if (attribute && key == "ac.action_view") {
           auto stage = analysis.getPackage()->getAttrOfType<StringAttr>("ac.stage");
           if (!directRule || !stage || (stage.getValue() != "routed" && stage.getValue() != "final")) {
-            op->emitOpError() << "ac.state_composition requires a direct Rule in a routed or final package";
+            op->emitOpError() << "action view requires a direct Rule in a routed or final package";
             return WalkResult::interrupt();
           }
-        }
-        if (attribute && key == "ac.compose" && !isa<SourceMethodOp>(op)) {
-          op->emitOpError() << "ac.compose requires a source Method";
-          return WalkResult::interrupt();
+          local.hasSamplingMetadata = true;
         }
         if (directRule && key == "ac.sampled_admission" && attribute) {
           auto schema = sampledSchemaCost(attribute, op);

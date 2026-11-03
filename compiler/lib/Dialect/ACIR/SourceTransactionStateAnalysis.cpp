@@ -2215,7 +2215,34 @@ private:
     for (Operation &op : block.without_terminator()) {
       if (!budget.charge(&op))
         return failure();
-      if (auto access = dyn_cast<SourceStateReadOp>(op)) {
+      if (auto action = dyn_cast<SourceActionReadOp>(op)) {
+        auto path = useValue(action.getPath(), plan.frames[frame].anchor, frame, action);
+        auto result = value(action.getValue(), plan.frames[frame].anchor, frame);
+        if (failed(path) || failed(result) || failed(truePath(*path, action)) ||
+            failed(assignValidity(*result, point(), action)) ||
+            !budget.chargeStorage<TransactionActionRead>(action, 1) ||
+            !budget.reserve(action, plan.actionReads, 1)) return failure();
+        auto module = plan.instances[plan.frames[frame].anchor].definition;
+        if (!budget.charge(action, module.getBody().front().getOperations().size())) return failure();
+        if (action->hasAttr("registration")) {
+          SourceTransactionOp target;
+          for (auto candidate : module.getBody().front().getOps<SourceTransactionOp>())
+            if (candidate.getOccurrence() == action->getAttr("registration")) target = candidate;
+          if (!target) return action.emitOpError() << "root observation registration is absent";
+          plan.actionReads.push_back({action, frame, *path, *result, point(), {}, target});
+        } else {
+          auto target = lookupSourceMethod(module, action.getCalleeAttr().getLeafReference().getValue(), action);
+          if (failed(target) || !target->definition) return failure();
+          plan.actionReads.push_back({action, frame, *path, *result, point(), target->definition, {}});
+        }
+        if (action.getMember() == "forward") {
+          auto state = owner(action, plan.frames[frame].anchor,
+              action->getAttrOfType<StringAttr>("ac.forward_state"));
+          if (failed(state)) return failure();
+          plan.actionReads.back().forwardOwner = *state;
+          plan.actionReads.back().forwardFields = action->getAttrOfType<ArrayAttr>("ac.forward_fields");
+        }
+      } else if (auto access = dyn_cast<SourceStateReadOp>(op)) {
         if (failed(read(access, frame, touched, seen)))
           return failure();
       } else if (auto intent = dyn_cast<SourceStateWriteOp>(op)) {
@@ -3387,9 +3414,13 @@ void runTransactionStateAnalysis(
   ClosedLayoutProofs closedTypes;
   HardwareAnalysis hardware(package);
   llvm::DenseSet<Operation *> allocated, referenceDefinitions,
-      relativeDefinitions, contextualDefinitions;
+      relativeDefinitions, contextualDefinitions, observationDefinitions;
   for (const auto &entry : inventory.operationCosts) {
     if (!budget.charge(entry.first)) return;
+    if (isa<SourceActionReadOp>(entry.first)) {
+      if (!budget.reserveMapInsert(entry.first, observationDefinitions)) return;
+      observationDefinitions.insert(entry.first->getParentOfType<ModuleOp>());
+    }
     auto call = dyn_cast<SourceMethodCallOp>(entry.first);
     if (!call || (!call->hasAttr("receiver_kind") &&
                   !call->hasAttr("ancestor_depth"))) continue;
@@ -3541,7 +3572,8 @@ void runTransactionStateAnalysis(
       for (auto module : closures[root]) {
         if (!budget.charge(root)) return;
         affected |= referenceDefinitions.contains(module) ||
-                    relativeDefinitions.contains(module) || !module.getParameters().empty() ||
+                    relativeDefinitions.contains(module) || observationDefinitions.contains(module) ||
+                    !module.getParameters().empty() ||
                     liftedDefinitions.contains(module);
       }
       if (!affected || !liftedRoots.insert(root).second) continue;
@@ -3649,6 +3681,29 @@ void runTransactionStateAnalysis(
           if (!budget.charge(a.transaction)) return;
           connected |= left.declaration == right.declaration && left.instancePath == right.instancePath;
         }
+      auto observes = [&](const TransactionStatePlan &observer,
+                          const TransactionStatePlan &producer) {
+        for (const auto &read : observer.actionReads) {
+          if (read.root) {
+            if (!budget.charge(observer.transaction)) { componentValid = false; return false; }
+            if (read.root == producer.transaction &&
+                observer.instances[observer.frames[read.frame].anchor].occurrencePath ==
+                    producer.instances[producer.lexicalAnchor].occurrencePath) return true;
+            continue;
+          }
+          for (const auto &call : producer.calls) {
+            if (!budget.charge(observer.transaction)) { componentValid = false; return false; }
+            const auto &frame = producer.frames[call.callee];
+            SourceMethodView method{producer.instances[frame.anchor].definition, frame.method, {}};
+            if (read.operation->getAttrOfType<SymbolRefAttr>("callee") == method.getSymbol() &&
+                observer.instances[observer.frames[read.frame].anchor].occurrencePath ==
+                    producer.instances[frame.anchor].occurrencePath) return true;
+          }
+        }
+        return false;
+      };
+      connected |= observes(a, b) || observes(b, a);
+      if (!componentValid) return;
       if (connected) {
         auto left = leader(i), right = leader(j);
         if (!componentValid) return;
@@ -3697,6 +3752,8 @@ void runTransactionStateAnalysis(
     for (const auto &owner : plan.owners) intersect(group, owner.instancePath);
     for (const auto &owner : plan.queueOwners) intersect(group, owner.instancePath);
     for (const auto &owner : plan.memoryOwners) intersect(group, owner.instancePath);
+    for (const auto &read : plan.actionReads)
+      intersect(group, plan.instances[plan.frames[read.frame].anchor].occurrencePath);
   }
   if (!componentValid) return;
   // If any context needs a lifted registration, every other context of that

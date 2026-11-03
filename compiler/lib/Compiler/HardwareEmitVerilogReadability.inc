@@ -62,6 +62,18 @@ Value readableEnumOperand(Value value) {
 
 std::optional<std::string> readableLiteral(Value value) {
     value = readableSource(value);
+    if (auto instance = value.getDefiningOp<ac::InstanceOp>()) {
+        auto literal = context.rtlConstantOutput(context.analysis.resolveCallee(instance), cast<OpResult>(value).getResultNumber());
+        if (auto pattern = dyn_cast_or_null<StringAttr>(literal))
+            return std::to_string(pattern.getValue().size()) + "'b" + pattern.getValue().str();
+        if (auto integer = dyn_cast_or_null<ac::MathIntAttr>(literal)) {
+            auto text = integer.getCanonicalValue().str();
+            if (auto width = readableWidth(value); width && !StringRef(text).starts_with("-"))
+                return std::to_string(*width) + "'d" + text;
+            auto width = context.payloadWidth(value.getType(), definition, true);
+            if (succeeded(width)) return "$unsigned((" + *width + ")'(" + text + "))";
+        }
+    }
     if (auto member = value.getDefiningOp<ac::EnumCreateOp>()) {
         auto symbol = context.rtlEnumMember(value.getType(), member.getMemberAttr(), member);
         if (succeeded(symbol)) return *symbol;

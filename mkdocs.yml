@@ -90,8 +90,8 @@ nav:
       - Enums: reference/spec-enums.md
       - Queues: reference/spec-queues.md
       - Architecture Extensions: extensions/architecture.md
-      - Method Composition Contract: extensions/compose.md
-      - Method Composition Reference: reference/method-compose.md
+      - Native Operation Interfaces: extensions/native-actions.md
+      - Retired Compose: extensions/compose.md
   - Architecture:
       - Overview: architecture/overview.md
       - Compiler Pipeline: architecture/compiler-pipeline.md

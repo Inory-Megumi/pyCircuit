@@ -409,6 +409,10 @@ private:
   LogicalResult collect(const Callable &callable,
                         const HardwareBindings &bindings,
                         SourceModuleLookup lookup) {
+    auto kind = callable.definition
+        ? callable.definition->getAttrOfType<StringAttr>("ac.method_kind")
+        : callable.row.getAs<StringAttr>("ac.method_kind");
+    bool query = kind && kind.getValue() == "query";
     auto key = callable.definition ? Attribute() : Attribute(callable.row);
     auto &calls =
         callable.definition ? nativeCalls[callable.definition] : rowCalls[key];
@@ -428,6 +432,15 @@ private:
                                        callable.module, &fees);
       if (failed(resolved))
         return failure();
+      if (query) {
+        auto calleeKind = resolved->method.getKind();
+        bool pure = calleeKind && calleeKind.getValue() == "query";
+        pure |= resolved->method.isNativeQueueTerminal() &&
+                resolved->method.nativeQueueAction == NativeQueueAction::Peek;
+        if (!pure)
+          return (op ? op : callable.module)->emitOpError()
+                 << "query Method can call only queries or read-only Queue peek";
+      }
       auto symbol = resolved->method.getSymbol();
       bool terminal = resolved->method.isNativeTerminal();
       if (!append(calls, Call{op, row, std::move(*resolved)}, callable.module))
@@ -454,6 +467,10 @@ private:
         if (depth > maxDepth)
           return operation->emitOpError()
                  << "source Method callable traversal depth exceeded";
+        if (query && isa<SourceStateWriteOp, SourceFormalWriteOp,
+                         SourceExpectOp, SourceObserveOp>(operation))
+          return operation->emitOpError()
+                 << "query Method cannot write state or emit side effects";
         if (auto call = dyn_cast<SourceMethodCallOp>(operation)) {
           Operation *parent = operation->getParentOp();
           while (isa_and_nonnull<SourceBranchOp>(parent)) {
@@ -502,6 +519,9 @@ private:
             return failure();
           auto row = cast<DictionaryAttr>(raw);
           auto kind = row.getAs<StringAttr>("kind").getValue();
+          if (query && kind != "read" && kind != "action_read" && kind != "call" && kind != "branch")
+            return callable.module->emitOpError()
+                   << "query Method summary contains a write or side effect";
           if (kind == "call") {
             if (failed(add(nullptr, row)))
               return failure();

@@ -1616,7 +1616,7 @@ FailureOr<std::string> HardwareEmitContext::rtlPortName(Operation *definition,
                 else if (depends(instance.getOperand(kind == "dffe" ? 3 : 2), argument))
                     owners.insert(rtlIdentifierStem(*state) + "_next");
             }
-            auto resource = readableResourceInputStem(module, index);
+            auto resource = readableResourceInputStem(*this, module, index);
             auto state = readableStateInputStem(*this, module, index);
             preferred = resource ? *resource : state ? *state : owners.size() == 1 ? owners.begin()->getKey().str() : "argument_" + std::to_string(index);
         }

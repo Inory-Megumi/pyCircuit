@@ -95,6 +95,8 @@ public:
   bool rtlOmittedInput(mlir::Operation *definition, unsigned input) const;
   std::optional<RtlOutputProjection> rtlOutputProjection(mlir::Operation *definition, unsigned output) const;
   bool rtlOmittedOutput(mlir::Operation *definition, unsigned output) const;
+  // Only compiler-private Bits returns with an exact closed literal producer.
+  mlir::Attribute rtlConstantOutput(mlir::Operation *definition, unsigned output) const;
   mlir::FailureOr<std::string> cppType(mlir::Type type,
                                        mlir::Operation *site) const;
   mlir::FailureOr<std::string> cppType(mlir::Type type,
@@ -177,6 +179,7 @@ private:
   llvm::DenseMap<mlir::StringAttr, std::string> nominalNames_;
   mutable llvm::DenseMap<std::pair<mlir::Operation *, unsigned>, std::optional<RtlOutputProjection>> rtlOutputProjections_;
   mutable llvm::DenseMap<std::pair<mlir::Operation *, unsigned>, bool> rtlOmittedOutputs_;
+  mutable llvm::DenseMap<std::pair<mlir::Operation *, unsigned>, mlir::Attribute> rtlConstantOutputs_;
 };
 mlir::Value rtlOwnershipSource(mlir::Value value, const HardwareEmitContext *context = nullptr);
 mlir::LogicalResult prepareRtlOwnership(HardwareEmitContext &context);

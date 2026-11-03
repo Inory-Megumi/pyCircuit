@@ -162,3 +162,88 @@ def test_physical_check_interfaces_keep_the_existing_port_inventory(
     )
     assert not any(row["omitted"] for row in module["interface"]["outputs"])
     assert rtl.count("." + module["interface"]["outputs"][3]["rtl_port"] + "(") == 3
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected", "public"),
+    [
+        (0, "8'd0", False),
+        (31, "8'd31", False),
+        ("1xz01", "8'b0001xz01", False),
+        ("1xz01", "8'b0001xz01", True),
+    ],
+)
+def test_private_constant_transport_preserves_width_four_state_and_public_ports(
+    tmp_path, literal, expected, public
+):
+    def integer(value):
+        return (
+            '#ac.static_expr<{kind = "literal", value = {kind = "integer", value = #ac.math_int<'
+            + str(value)
+            + '>}, origin = {site = {definition = @top, ast_path = []}, expansion = []}, location = {path = "top.py", line = 1 : i64, column = 1 : i64, end_line = 1 : i64, end_column = 2 : i64}}>'
+        )
+
+    text = f"#w5 = {integer(5)}\n#w8 = {integer(8)}\n!b5 = !ac.bits<#w5>\n!b8 = !ac.bits<#w8>\n"
+    text += 'module attributes {ac.stage = "final", ac.source_units = [{package = "", path = "top.py"}]} {\n'
+    zero = f'%zero = "ac.bits.constant"() {{value = {integer(0)}}} : () -> !b5\n'
+    value = (
+        f'%value = "ac.bits.constant4"() {{pattern = "{literal}"}} : () -> !b5\n'
+        if isinstance(literal, str)
+        else f'%value = "ac.bits.constant"() {{value = {integer(literal)}}} : () -> !b5\n'
+    )
+    private = ", ac.transaction_wiring = {states = [], incoming = [], writers = []}, ac.internal_ports = {source_inputs = 0 : i64, source_outputs = 1 : i64, root_inputs = []}"
+
+    def module(name, body, private_ports=True, returned="%value"):
+        return (
+            '"ac.module"() ({\n'
+            + body
+            + '"ac.yield"(%zero, '
+            + returned
+            + ') : (!b5, !b5) -> ()\n}) {sym_name = "'
+            + name
+            + '", source_owner = {package = "", path = "top.py"}, parameters = [], type_parameters = [], function_type = () -> (!b5, !b5), input_names = [], output_names = ["visible", "transport"]'
+            + (private if private_ports else "")
+            + "} : () -> ()\n"
+        )
+
+    def instance(name, callee, parent="top"):
+        return (
+            f'%{name}:2 = "ac.instance"() {{callee = @{callee}, instance_name = "{name}", parameters = [], type_arguments = [], occurrence = '
+            + "{site = {definition = @"
+            + parent
+            + ", ast_path = []}, expansion = []}} : () -> (!b5, !b5)\n"
+        )
+
+    text += module("Leaf", zero + value, private_ports=not public)
+    text += module(
+        "Relay", instance("leaf", "Leaf", "Relay") + zero, returned="%leaf#1"
+    )
+    text += '"ac.module"() ({\n' + instance("relay", "Relay")
+    text += '%wide = "ac.bits.resize"(%relay#1) {mode = "zext"} : (!b5) -> !b8\n'
+    text += '"ac.yield"(%wide) : (!b8) -> ()\n}) {sym_name = "top", source_owner = {package = "", path = "top.py"}, parameters = [], type_parameters = [], function_type = () -> !b8, input_names = [], output_names = ["result"]} : () -> ()\n'
+    text += '"ac.system"() {entry = {callee = @top, parameters = [], type_arguments = []}, domain = "default"} : () -> ()\n}\n'
+    source = tmp_path / "literal.mlir"
+    source.write_text(text)
+    command = [
+        os.environ["PYCIRCUIT_EMITTER"],
+        str(source),
+        "--target",
+        "verilog",
+        "--rtl-mode",
+        "synthesis",
+    ]
+    data = json.loads(_ok(_run(command)))
+    rtl = _ok(_run(command + ["--format", "source"]))
+    leaf = next(
+        row for row in data["rtl_value_names"]["modules"] if row["rtl_module"] == "Leaf"
+    )
+    assert leaf["interface"]["outputs"][1]["omitted"] != public
+    assert not leaf["interface"]["outputs"][0]["omitted"]
+    design = tmp_path / "design.sv"
+    design.write_text(
+        rtl
+        + f'\nmodule tb;wire [7:0] result;design_top dut(.result(result));initial begin #1;if(result!=={expected})$fatal(1,"literal");$finish;end endmodule\n'
+    )
+    binary = tmp_path / "literal.vvp"
+    _ok(_run(["iverilog", "-g2012", "-s", "tb", "-o", str(binary), str(design)]))
+    _ok(_run(["vvp", str(binary)]))

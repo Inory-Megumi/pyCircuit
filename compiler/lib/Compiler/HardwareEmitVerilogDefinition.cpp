@@ -481,6 +481,15 @@ public:
     if (!op)
       return definition.emitOpError() << "RTL wire has no producer";
     if (context.isPhysical()) {
+      // A private constant return is an exact value alias, not a new operator.
+      // Keep its instance: other results or storage effects may still be live.
+      if (auto instance = dyn_cast<ac::InstanceOp>(op))
+        if (auto literal = readableLiteral(value)) {
+          names.try_emplace(value, *literal);
+          readableBypassedResults.insert(value);
+          instances.insert(instance);
+          return *literal;
+        }
       if (auto rendered = readableControlProjection(value); succeeded(rendered)) {
         if (readableEndpointValues.contains(readableSource(value))) {
           auto name = sourceNetName(readableSource(value));
@@ -1720,6 +1729,10 @@ public:
       auto projection = context.rtlOutputProjection(definition, index);
       auto canonical = rtlOwnershipSource(cast<ac::YieldOp>(definition.getBody().front().back()).getValues()[index], &context);
       auto forwarded = context.rtlForwardedInput(definition, index);
+      auto constant = context.rtlConstantOutput(definition, index);
+      std::string constantText;
+      if (auto integer = dyn_cast_or_null<ac::MathIntAttr>(constant)) constantText = integer.getCanonicalValue().str();
+      if (auto pattern = dyn_cast_or_null<StringAttr>(constant)) constantText = pattern.getValue().str();
       llvm::json::Array fields;
       if (projection) for (const auto &field : projection->fields) fields.emplace_back(field);
       interfaceOutputs.emplace_back(llvm::json::Object{{"ordinal", index}, {"source_port", original.str()},
@@ -1729,6 +1742,7 @@ public:
           {"forwarded_input", forwarded ? llvm::json::Value(*forwarded) : llvm::json::Value(nullptr)},
           {"projection_output", projection ? llvm::json::Value(projection->output) : llvm::json::Value(nullptr)},
           {"projection_fields", std::move(fields)}});
+      if (constant) (*interfaceOutputs.back().getAsObject())["constant_return"] = constantText;
     }
     for (Value value : ordered) {
       auto rendered = names.find(value);

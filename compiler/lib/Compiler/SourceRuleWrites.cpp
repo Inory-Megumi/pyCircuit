@@ -465,6 +465,25 @@ LogicalResult SourceRuleWritesAnalysis::analyze() {
           if (failed(self(self, arguments.item("defaults", k), AstNode(),
                           bindingShadows, true, nullptr, transactionScope))) return failure();
       }
+      if (callableScope && node.kind() == "Call" &&
+          resolves(node.child("func"), MarkerKind::Forward)) {
+        if (node.array("args").size() != 1 || node.array("keywords").size() != 1 ||
+            node.item("keywords", 0).string("arg") != "source" ||
+            node.item("keywords", 0).child("value").kind() != "Name")
+          return diagnostic(node) << "forward requires one static source operation";
+        // Receiver and source are static identities, checked by typed capture.
+        return success();
+      }
+      if (callableScope && node.kind() == "Call" &&
+          resolves(node.child("func"), MarkerKind::Fired)) {
+        auto target = node.item("args", 0);
+        if (node.array("args").size() != 1 || !node.array("keywords").empty() ||
+            target.kind() != "Name" || !nestedRuleNames.contains(target.string("id")) ||
+            scope->contains(target.string("id")))
+          return diagnostic(node) << "fired requires an unambiguous registered nested Rule";
+        // A static registration reference does not read the Rule's payload.
+        return success();
+      }
       if (callableScope && node.kind() == "Name" &&
           ruleResultAliases.contains(node.string("id")) && !scope->contains(node.string("id")))
         return diagnostic(node) << "local Rule result alias is not a Rule input; wire through a child Module interface";

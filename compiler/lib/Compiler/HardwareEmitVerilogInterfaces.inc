@@ -72,6 +72,7 @@ bool HardwareEmitContext::rtlOmittedOutput(Operation *definition, unsigned outpu
     auto compute = [&]() -> bool {
     auto module = dyn_cast<ac::ModuleOp>(definition);
     if (!module || !readablePrivateOutput(*this, module, output)) return false;
+    if (rtlConstantOutput(module, output)) return true;
     if (rtlOutputProjection(module, output)) return true;
     bool used = false, found = false;
     auto scope = package;
@@ -103,7 +104,34 @@ bool HardwareEmitContext::rtlOmittedOutput(Operation *definition, unsigned outpu
     return result;
 }
 
-std::optional<std::string> readableResourceInputStem(ac::ModuleOp module, unsigned input) {
+Attribute HardwareEmitContext::rtlConstantOutput(Operation *definition, unsigned output) const {
+    auto key = std::make_pair(definition, output);
+    if (auto found = rtlConstantOutputs_.find(key); found != rtlConstantOutputs_.end()) return found->second;
+    // A null entry also makes the query conservative for a recursive definition.
+    rtlConstantOutputs_.try_emplace(key, Attribute());
+    auto module = dyn_cast<ac::ModuleOp>(definition);
+    if (!module || !readablePrivateOutput(*this, module, output) ||
+        !isa<ac::BitsType>(module.getFunctionType().getResult(output))) return {};
+    auto yield = cast<ac::YieldOp>(module.getBody().front().back());
+    Value value = rtlOwnershipSource(yield.getValues()[output], this);
+    Attribute result;
+    if (auto constant = value.getDefiningOp<ac::BitsConstantOp>()) {
+        if (isClosedStatic(constant.getValue())) {
+            ac::HardwareBindings bindings;
+            bindings.owner = module;
+            auto evaluated = analysis.evaluateStatic(constant.getValue(), bindings, constant);
+            if (succeeded(evaluated) && isa<ac::MathIntAttr>(*evaluated)) result = *evaluated;
+        }
+    } else if (auto pattern = value.getDefiningOp<ac::BitsConstant4Op>()) {
+        result = pattern.getPatternAttr();
+    } else if (auto instance = value.getDefiningOp<ac::InstanceOp>()) {
+        result = rtlConstantOutput(analysis.resolveCallee(instance), cast<OpResult>(value).getResultNumber());
+    }
+    rtlConstantOutputs_[key] = result;
+    return result;
+}
+
+std::optional<std::string> readableResourceInputStem(const HardwareEmitContext &context, ac::ModuleOp module, unsigned input) {
     auto wiring = module->getAttrOfType<DictionaryAttr>("ac.queue_wiring");
     auto incoming = wiring ? wiring.getAs<ArrayAttr>("incoming") : ArrayAttr();
     if (!incoming) return std::nullopt;
@@ -117,11 +145,24 @@ std::optional<std::string> readableResourceInputStem(ac::ModuleOp module, unsign
         auto declaration = queue ? queue.getAs<DictionaryAttr>("declaration") : DictionaryAttr();
         auto owner = queue ? queue.getAs<DictionaryAttr>("owner") : DictionaryAttr();
         auto ownerPath = owner ? owner.getAs<ArrayAttr>("instance_path") : ArrayAttr();
-        if (!declaration || !ownerPath || !ownerPath.empty()) continue;
-        for (auto instance : module.getBody().front().getOps<ac::InstanceOp>())
+        if (!declaration || !ownerPath) continue;
+        auto current = module;
+        std::string prefix;
+        bool resolved = true;
+        for (Attribute occurrence : ownerPath) {
+            ac::InstanceOp selected;
+            for (auto instance : current.getBody().front().getOps<ac::InstanceOp>())
+                if (instance.getOccurrence() == occurrence) selected = instance;
+            auto child = selected ? dyn_cast_or_null<ac::ModuleOp>(context.analysis.resolveCallee(selected)) : ac::ModuleOp();
+            if (!child) { resolved = false; break; }
+            prefix += selected.getInstanceName().str() + "_";
+            current = child;
+        }
+        if (!resolved) continue;
+        for (auto instance : current.getBody().front().getOps<ac::InstanceOp>())
             if (instance.getOccurrence() == declaration) {
                 auto kind = binding.getAs<StringAttr>("kind");
-                if (kind) return instance.getInstanceName().str() + "_" + kind.getValue().str() + (isData ? "_data" : "");
+                if (kind) return prefix + instance.getInstanceName().str() + "_" + kind.getValue().str() + (isData ? "_data" : "");
             }
     }
     return std::nullopt;

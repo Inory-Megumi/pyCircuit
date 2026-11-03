@@ -84,6 +84,19 @@ struct SampledWriteDomainView {
   mlir::ArrayAttr prefix, suffix;
 };
 struct SampledAdmissionView {
+  struct Action {
+    SampledPathRef executionPath;
+    uint64_t activeResult = 0;
+    mlir::Value active;
+  };
+  struct Forward {
+    mlir::DictionaryAttr stateID;
+    mlir::ArrayAttr fields;
+    BitsSelectOp select;
+    mlir::Value candidate, sourceMask, support;
+    llvm::SmallVector<mlir::Value, 0> sourceTerms;
+    llvm::SmallVector<std::optional<uint64_t>, 0> sourceDomains;
+  };
   ModuleOp definition;
   RuleOp rule;
   uint64_t clockCapture = 0, resetCapture = 0, fireResult = 0;
@@ -97,6 +110,8 @@ struct SampledAdmissionView {
   llvm::SmallVector<SampledQueueProposalView> queueProposals;
   llvm::SmallVector<SampledMemoryProposalView> memoryProposals;
   llvm::SmallVector<SampledWriteDomainView> writeDomains;
+  llvm::SmallVector<Action, 0> actions;
+  llvm::SmallVector<Forward, 0> forwards;
 };
 struct TransactionStateInventoryEntry {
   mlir::DictionaryAttr declaration;
@@ -298,6 +313,9 @@ mlir::FailureOr<HardwareIdentityEndpoint>
 makeIdentityEndpoint(mlir::Value value, const HardwareIdentityScope &scope,
                      const HardwareAnalysis &analysis,
                      SourceCheckBudget &budget);
+mlir::FailureOr<HardwareBindings> getIdentityScopeBindings(
+    const HardwareIdentityScope &scope, const HardwareAnalysis &analysis,
+    SourceCheckBudget &budget, mlir::Operation *site);
 mlir::FailureOr<HardwareIdentityEndpoint>
 normalizeIdentityEndpoint(const HardwareIdentityEndpoint &endpoint,
                           const HardwareIdentityStopPolicy &stops,

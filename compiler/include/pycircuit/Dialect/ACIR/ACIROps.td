@@ -392,13 +392,7 @@ def ACIR_StateUpdateOp : ACIR_Op<"state.update", [
   let hasVerifier = 1;
 }
 
-def ACIR_SourceAdmitOp : ACIR_Op<"admit", [Pure]> {
-    let summary = "Admit from local readiness or a same-owner peer commit";
-    let arguments = (ins ACIR_BitsType:$local, ArrayAttr:$releases,
-        DictionaryAttr:$occurrence);
-    let results = (outs ACIR_BitsType:$ready);
-    let hasVerifier = 1;
-}
+
 
 def ACIR_SourceStateReadOp : ACIR_Op<"state.read", [
     DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
@@ -489,6 +483,16 @@ def ACIR_SourceMethodOp : ACIR_Op<"method", [Symbol, IsolatedFromAbove,
   let regions = (region AnyRegion:$guard, AnyRegion:$body);
   let hasVerifier = 1;
   let hasRegionVerifier = 1;
+}
+
+def ACIR_SourceActionReadOp : ACIR_Op<"action.read", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+  let summary = "Observe a lexical action event or callpoint argument snapshot";
+  let arguments = (ins ACIR_BitsType:$path, SymbolRefAttr:$callee,
+      StrAttr:$member, StrAttr:$argument, DictionaryAttr:$occurrence,
+      DictionaryAttr:$location, OptionalAttr<DictionaryAttr>:$registration);
+  let results = (outs ACIR_HardwareType:$value);
+  let hasVerifier = 1;
 }
 
 def ACIR_SourceMethodCallOp : ACIR_Op<"method.call", [

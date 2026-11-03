@@ -41,6 +41,7 @@ nightly_python_tests=(
   tests/system/test_source_literal_constants.py
   tests/system/test_sibling_calls_and_order.py
   tests/system/test_auto_rule_dataflow.py
+  tests/system/test_native_actions.py
   tests/system/test_four_state_frontend_system.py
   tests/system/test_four_state_runtime_unknown.py
   tests/system/test_module_statement_parity.py

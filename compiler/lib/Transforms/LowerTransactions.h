@@ -136,12 +136,26 @@ struct TransactionPreparedControl {
   std::optional<uint64_t> resource;
 };
 
+struct TransactionForwardExport {
+  ac::StateOwnerId owner = 0;
+  ac::StateVersionId version = 0;
+  mlir::ArrayAttr fields;
+  uint64_t result = 0;
+  llvm::SmallVector<ac::StateWriteId> writes;
+};
+struct TransactionActionExport {
+  std::optional<ac::CallBindingId> call;
+  uint64_t activeResult = 0;
+  llvm::SmallVector<uint64_t, 0> arguments;
+  llvm::SmallVector<TransactionForwardExport, 0> forwards;
+};
+struct TransactionActionInput {
+  uint64_t read = 0, capture = 0;
+  llvm::SmallVector<std::pair<uint64_t, uint64_t>, 0> producers;
+};
+
 struct TransactionPreparation {
-  struct PeerAdmission {
-    ac::SourceAdmitOp operation;
-    ac::InvocationFrameId frame;
-    uint64_t capture;
-  };
+
   const ac::TransactionStatePlan *plan = nullptr;
   llvm::SmallVector<ac::BoundValueId> liveIns;
   llvm::SmallVector<TransactionCandidatePreparation> outputs;
@@ -149,10 +163,13 @@ struct TransactionPreparation {
   llvm::SmallVector<TransactionPreparedControl, 0> controls;
   llvm::SmallVector<TransactionQueueResource, 0> resources;
   llvm::SmallVector<TransactionQueueExternalPop, 0> externalPops;
-  llvm::SmallVector<PeerAdmission, 0> peerAdmissions;
+  llvm::SmallVector<TransactionActionExport, 0> actionExports;
+  llvm::SmallVector<TransactionActionInput, 0> actionInputs;
   llvm::SmallVector<TransactionQueueProposal, 0> queueProposals;
   llvm::SmallVector<TransactionMemoryProposal, 0> memoryProposals;
   llvm::SmallVector<TransactionWriteDomain, 0> writeDomains;
+  // Raw paths used only by forward views; never participate in commit routing.
+  llvm::SmallVector<ac::StateWriteId, 0> forwardWrites;
   llvm::SmallVector<uint64_t, 0> sourceControls;
   uint64_t clockCapture = 0, resetCapture = 0, fireResult = 0;
   uint64_t checkBase = 0, totalResults = 0;
@@ -210,6 +227,7 @@ struct MaterializedCommit {
 
 struct MaterializedTransaction {
   ac::RuleOp rule;
+  llvm::SmallVector<mlir::Operation *, 0> actionPlaceholders;
   llvm::SmallVector<mlir::Value, 0> prefixes;
   llvm::SmallVector<MaterializedAdmissionControl, 0> controls;
   llvm::SmallVector<MaterializedSelection, 0> selections;
@@ -252,38 +270,15 @@ struct MaterializedMemoryPin {
   llvm::SmallVector<MaterializedBranchResult, 0> selections;
 };
 
-struct ComposeContribution {
-    uint64_t transaction = 0, operation = 0;
-    llvm::SmallVector<uint64_t> outputs;
-    uint64_t frame = 0, write = 0, guard = 0;
-    llvm::SmallVector<std::pair<uint64_t, bool>> path;
-};
-struct ComposeGroup {
-    ac::ModuleOp module;
-    llvm::SmallVector<ac::InstanceOp> path;
-    ac::SourceMethodOp composer;
-    llvm::SmallVector<ac::SourceStateOp> states;
-    llvm::SmallVector<ComposeContribution> contributions;
-    bool expanded = false;
-    struct WriteView {
-        mlir::DictionaryAttr descriptor;
-        mlir::Type type;
-        llvm::SmallVector<std::pair<uint64_t, uint64_t>> domains;
-    };
-    llvm::SmallVector<WriteView> writes;
-};
-struct MaterializedCompose {
-    ComposeGroup source;
-    ac::RuleOp rule;
-    llvm::SmallVector<mlir::Value> inputs, results;
-    llvm::SmallVector<mlir::Value> arguments;
-    mlir::Value enable;
-    llvm::SmallVector<mlir::Operation *> generated;
-    llvm::SmallVector<MaterializedBranchResult, 0> branchSelections;
-    llvm::SmallVector<MaterializedBranchResult, 0> callSelections;
-};
+
+
+
 
 struct MaterializedTransactionLowering {
+  struct ActionView {
+    uint64_t transaction = 0, input = 0;
+    ac::RuleOp rule;
+  };
   mlir::OwningOpRef<mlir::ModuleOp> module;
   mlir::IRMapping packageMap;
   llvm::SmallVector<MaterializedTransaction, 0> transactions;
@@ -292,7 +287,7 @@ struct MaterializedTransactionLowering {
   llvm::SmallVector<MaterializedQueueMerge, 0> queueMerges;
   llvm::SmallVector<mlir::Value, 0> queueDisabled;
   llvm::SmallVector<MaterializedMemoryPin, 0> memoryPins;
-  llvm::SmallVector<MaterializedCompose, 0> compositions;
+  llvm::SmallVector<ActionView, 0> actionViews;
 };
 
 mlir::FailureOr<PreparedTransactionLowering>

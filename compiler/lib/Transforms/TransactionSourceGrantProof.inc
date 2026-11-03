@@ -78,6 +78,26 @@ public:
     return core.disjoint(*left, *right);
   }
   StringRef failureReason() const { return core.failureReason(); }
+  FailureOr<bool> disjointCalls(const ac::TransactionStatePlan &first,
+      ArrayRef<ac::InstanceOp> firstPrefix, ac::CallBindingId a,
+      const ac::TransactionStatePlan &second,
+      ArrayRef<ac::InstanceOp> secondPrefix, ac::CallBindingId b,
+      bool includeGuards) {
+    const auto &left = first.calls[a], &right = second.calls[b];
+    auto lp = path(first, firstPrefix, left.authoredPath,
+                   first.frames[left.callee].entry.path, false);
+    auto rp = path(second, secondPrefix, right.authoredPath,
+                   second.frames[right.callee].entry.path, false);
+    if (failed(lp) || failed(rp)) return failure();
+    auto disjoint = core.disjoint(*lp, *rp);
+    if (failed(disjoint) || *disjoint || !includeGuards) return disjoint;
+    lp = path(first, firstPrefix, left.authoredPath,
+              first.frames[left.callee].entry.path, true);
+    rp = path(second, secondPrefix, right.authoredPath,
+              second.frames[right.callee].entry.path, true);
+    if (failed(lp) || failed(rp)) return failure();
+    return core.disjoint(*lp, *rp);
+  }
 private:
   uint64_t lookupCost() const {
     uint64_t comparisons = 1;
@@ -404,8 +424,13 @@ private:
   FailureOr<Node> path(const ac::TransactionStatePlan &plan, ArrayRef<ac::InstanceOp> prefix,
                        ac::StateWriteId id, bool includeGuards = true) {
     const auto &write = plan.writes[id];
-    auto result = bind(plan, prefix, write.authoredPath); if (failed(result)) return failure();
-    auto ancestry = plan.versions[write.version].validity.path;
+    return path(plan, prefix, write.authoredPath,
+                plan.versions[write.version].validity.path, includeGuards);
+  }
+  FailureOr<Node> path(const ac::TransactionStatePlan &plan, ArrayRef<ac::InstanceOp> prefix,
+                       ac::BoundValueId authoredPath, ac::TransactionSourcePath ancestry,
+                       bool includeGuards) {
+    auto result = bind(plan, prefix, authoredPath); if (failed(result)) return failure();
     auto dominates = [&](ac::TransactionSourcePath definition) -> FailureOr<bool> {
       auto use = ancestry;
       for (unsigned depth = 0; depth <= 128; ++depth) {

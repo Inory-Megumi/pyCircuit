@@ -36,7 +36,9 @@ MarkerKind classifyImportedMarker(StringRef module, StringRef remoteName) {
       .Case("system", MarkerKind::System)
       .Case("rule", MarkerKind::Rule)
       .Case("method", MarkerKind::Method)
-      .Case("compose", MarkerKind::Compose)
+      .Case("guard", MarkerKind::Guard)
+      .Case("fired", MarkerKind::Fired)
+      .Case("forward", MarkerKind::Forward)
       .Case("struct", MarkerKind::Struct)
       .Case("bits", MarkerKind::Bits)
       .Case("table", MarkerKind::Table)
@@ -103,16 +105,34 @@ readCallableSyntax(const AstNode &declaration, LexicalBindings bindings,
     return result;
   if (!decorator.array("args").empty() || decorator.array("keywords").empty())
     return emitError() << "Rule/Method decorator accepts guard=lambda";
+  bool seenPrivate = false;
   for (size_t i = 0; i < decorator.array("keywords").size(); ++i) {
     auto keyword = decorator.item("keywords", i);
     StringRef name = keyword.string("arg");
     if (name == "guard" && !result.guard)
       result.guard = keyword.child("value");
+    else if (name == "kind" && marker == MarkerKind::Method && !result.methodKind) {
+      auto value = keyword.child("value");
+      auto kind = value.kind() == "Constant"
+          ? dyn_cast_or_null<StringAttr>(value.get("value")) : StringAttr();
+      if (!kind || (kind.getValue() != "action" && kind.getValue() != "query"))
+        return emitError() << "Method kind requires literal action or query";
+      result.methodKind = kind;
+    } else if (name == "private" && marker == MarkerKind::Method && !seenPrivate) {
+      auto value = keyword.child("value");
+      auto enabled = value.kind() == "Constant"
+          ? dyn_cast_or_null<BoolAttr>(value.get("value")) : BoolAttr();
+      if (!enabled) return emitError() << "Method private requires a Boolean literal";
+      seenPrivate = true;
+      result.privateMethod = enabled.getValue();
+    }
     else if (name == "after")
       return emitError() << "source after is retired; independent Rules read current state";
     else
       return emitError() << "duplicate or unsupported Rule/Method decorator option";
   }
+  if (result.privateMethod && result.methodKind && result.methodKind.getValue() == "action")
+    return emitError() << "observable action Methods require public visibility";
   if (!result.guard) return result;
   if (result.guard.kind() != "Lambda")
     return emitError() << "Rule/Method guard requires a lambda";

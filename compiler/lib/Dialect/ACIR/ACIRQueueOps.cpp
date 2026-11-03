@@ -326,7 +326,8 @@ FailureOr<ResolvedQueueConfig> checkQueue(const HardwareAnalysis &analysis,
   if ((source || queue->hasAttr("ac.payload_constraint")) &&
       (!constraint || failed(detail::verifySourceCallHardwareConstraint(
                           constraint, queue.getOutputs()[2].getType(), analysis,
-                          owner, queue, "queue payload"))))
+                          owner, queue, "queue payload",
+                          detail::SourceCallWidthMode::SymbolicFixedBits))))
     return error() << "source queue requires its declared payload constraint";
   auto config = getQueueConfiguration(queue);
   if (failed(config))

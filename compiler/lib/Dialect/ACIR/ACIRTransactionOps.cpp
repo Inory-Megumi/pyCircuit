@@ -1,5 +1,5 @@
 #include "ACIRSourceContracts.h"
-#include "SourceCompose.h"
+#include "SourceForwarding.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
@@ -121,7 +121,7 @@ LogicalResult region(Operation *operation, unsigned ordinal, TypeRange inputs,
     return yield.emitOpError() << "body yield types do not match results";
   }
   for (Operation &nested : block.without_terminator()) {
-    if (isa<SourceStateReadOp>(nested))
+    if (isa<SourceStateReadOp, SourceActionReadOp>(nested))
       continue;
     if (!guard &&
         isa<SourceStateWriteOp, SourceFormalWriteOp, SourceMethodCallOp,
@@ -179,7 +179,7 @@ LogicalResult branchPayload(Operation *operation, bool arm, unsigned depth,
     return success();
   }
   if (arm &&
-      isa<SourceFormalWriteOp, SourceMethodCallOp, SourceExpectOp,
+      isa<SourceFormalWriteOp, SourceMethodCallOp, SourceActionReadOp, SourceExpectOp,
           SourceObserveOp>(operation))
     return success();
   if (!isa<YieldOp>(operation) &&
@@ -897,36 +897,7 @@ LogicalResult StateUpdateOp::verify() {
                    "state update intent");
 }
 
-LogicalResult SourceAdmitOp::verify() {
-    auto method = dyn_cast<SourceMethodOp>((*this)->getParentOp());
-    if (!method || !method.getGuard().hasOneBlock() || (*this)->getBlock() != &method.getGuard().front())
-        return emitOpError() << "admit is only valid directly in a composed Method guard";
-    HardwareAnalysis analysis((*this)->getParentOfType<mlir::ModuleOp>());
-    if (failed(predicate(analysis, getLocal(), scope(*this), *this, "admit local readiness")) ||
-            !areEquivalentHardwareTypes(getLocal().getType(), getReady().getType()) ||
-            failed(occurrence(*this))) return failure();
-    auto module = method->getParentOfType<ModuleOp>();
-    SourceMethodOp composer;
-    for (auto other : module.getBody().front().getOps<SourceMethodOp>()) {
-        auto contract = other->getAttrOfType<DictionaryAttr>("ac.compose");
-        auto names = contract ? contract.getAs<ArrayAttr>("operations") : ArrayAttr();
-        if (names && llvm::is_contained(names, method.getSymNameAttr())) {
-            if (composer) return emitOpError() << "admit Method belongs to multiple compose groups";
-            composer = other;
-        }
-    }
-    if (!composer || getReleases().empty())
-        return emitOpError() << "admit requires nonempty releases in the same compose group";
-    auto names = composer->getAttrOfType<DictionaryAttr>("ac.compose").getAs<ArrayAttr>("operations");
-    llvm::StringSet<> seen;
-    for (Attribute raw : getReleases()) {
-        auto name = dyn_cast<StringAttr>(raw);
-        if (!name || !seen.insert(name.getValue()).second || name == method.getSymNameAttr() ||
-                !llvm::is_contained(names, name))
-            return emitOpError() << "admit releases must name distinct other operations in the same compose group";
-    }
-    return success();
-}
+
 
 LogicalResult SourceStateReadOp::verify() {
   if (failed(transactionPlacement(*this, true, true)))
@@ -1083,6 +1054,13 @@ LogicalResult SourceBranchOp::verifyRegions() {
 LogicalResult SourceMethodOp::verify() {
   if (failed(namedDeclaration(*this, getSymNameAttr())))
     return failure();
+  if (Attribute raw = (*this)->getAttr("ac.method_kind")) {
+    auto kind = dyn_cast<StringAttr>(raw);
+    if (!kind || (kind.getValue() != "action" && kind.getValue() != "query"))
+      return emitOpError() << "ac.method_kind requires action or query";
+    if (kind.getValue() == "action" && (*this)->hasAttr("sym_visibility"))
+      return emitOpError() << "observable action Methods require public visibility";
+  }
   if (Attribute raw = (*this)->getAttr("sym_visibility")) {
     auto visibility = dyn_cast<StringAttr>(raw);
     if (!visibility || visibility.getValue() != "private")
@@ -1165,7 +1143,63 @@ LogicalResult SourceMethodOp::verifyRegions() {
     return failure();
   if (failed(region(*this, 1, arguments, getFunctionType().getResults())))
     return failure();
-  return detail::verifySourceCompose(*this);
+  return success();
+}
+
+LogicalResult SourceActionReadOp::verify() {
+  if (failed(transactionPlacement(*this, true, true))) return failure();
+  auto owner = (*this)->getParentOfType<ModuleOp>();
+  auto callee = getCalleeAttr();
+  HardwareAnalysis analysis((*this)->getParentOfType<mlir::ModuleOp>());
+  if (failed(detail::verifySourceEffectMetadata(getOccurrence(), getLocation(), owner,
+          [&] { return emitOpError(); })) ||
+      failed(predicate(analysis, getPath(), scope(*this), *this, "observation path"))) return failure();
+  bool forward = getMember() == "forward";
+  if (forward) {
+    auto name = (*this)->getAttrOfType<StringAttr>("ac.forward_state");
+    auto fields = (*this)->getAttrOfType<ArrayAttr>("ac.forward_fields");
+    SourceStateOp state;
+    for (auto candidate : owner.getBody().front().getOps<SourceStateOp>())
+      if (candidate.getInstanceNameAttr() == name) state = candidate;
+    if (!state || !getArgument().empty()) return emitOpError() << "forward requires a persistent state leaf";
+    auto leaf = detail::forwardLeafType(analysis, state.getQ().getType(), fields, *this);
+    if (failed(leaf) || !areEquivalentHardwareTypes(*leaf, getValue().getType()))
+      return emitOpError() << "forward result must match its actual persistent leaf";
+  } else if ((*this)->hasAttr("ac.forward_state") || (*this)->hasAttr("ac.forward_fields"))
+    return emitOpError() << "only forward observations carry a state receiver";
+  if ((*this)->hasAttr("registration")) {
+    auto registration = (*this)->getAttrOfType<DictionaryAttr>("registration");
+    unsigned matches = 0;
+    for (auto root : owner.getBody().front().getOps<SourceTransactionOp>())
+      matches += root.getOccurrence() == registration && root.getDeclaration() == registration;
+    if (callee.getRootReference() != owner.getSymNameAttr() ||
+        !callee.getNestedReferences().empty() || !registration || matches != 1 ||
+        !getArgument().empty() || (!forward && getMember() != "fired"))
+      return emitOpError() << "fired requires one actual lexical autonomous registration";
+    if (forward) return success();
+    return predicate(analysis, getValue(), scope(*this), *this, "root event");
+  }
+  if (callee.getRootReference() != owner.getSymNameAttr() ||
+      callee.getNestedReferences().size() != 1)
+    return emitOpError() << "action observation requires a lexical Method";
+  auto method = lookupSourceMethod(owner, callee.getLeafReference().getValue(), *this);
+  if (failed(method)) return failure();
+  auto kind = method->getKind();
+  if (!kind || kind.getValue() != "action" || method->getVisibility())
+    return emitOpError() << "action observation requires an explicit public action";
+  if (forward) return success();
+  if (getMember() == "active") {
+    if (!getArgument().empty()) return emitOpError() << "action active has no argument selector";
+    return predicate(analysis, getValue(), scope(*this), *this, "action active");
+  }
+  if (getMember() != "argument")
+    return emitOpError() << "action read member requires active or argument";
+  auto names = method->getArgumentNames();
+  for (auto [index, raw] : llvm::enumerate(names))
+    if (cast<StringAttr>(raw).getValue() == getArgument())
+      return success(areEquivalentHardwareTypes(getValue().getType(),
+          method->getFunctionType().getInput(index)));
+  return emitOpError() << "action argument is absent from the Method contract";
 }
 
 LogicalResult SourceMethodCallOp::verify() {
@@ -1231,8 +1265,6 @@ LogicalResult SourceMethodCallOp::verifySymbolUses(SymbolTableCollection &) {
   if (failed(resolved))
     return failure();
   auto bindings = resolved->bindings;
-  if (resolved->method.definition && resolved->method.definition->hasAttr("ac.compose"))
-    return emitOpError() << "compose definitions cannot be called as Methods";
   auto signature = resolved->method.getFunctionType();
   if (getArguments().size() != signature.getNumInputs() ||
       getResults().size() != signature.getNumResults())

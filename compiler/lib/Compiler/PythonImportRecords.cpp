@@ -4,7 +4,7 @@
 #include "LiteralPayloadWires.h"
 #include "Dialect/ACIR/ACIRSourceContracts.h"
 #include "Dialect/ACIR/HardwareGrantProof.h"
-#include "Dialect/ACIR/SourceCompose.h"
+#include "Dialect/ACIR/SourceForwarding.h"
 #include "SourceDeclarationContext.h"
 #include "SourceRuleWrites.h"
 
@@ -111,12 +111,6 @@ struct SourceCallableDecl {
   bool autonomous = false;
   SmallVector<Value> actualFacts;
   SmallVector<DictionaryAttr> specializationAncestry;
-  DictionaryAttr composition;
-  llvm::StringMap<std::string> composeNames;
-  SmallVector<AstNode> composeReadyStatements;
-  AstNode composeReady;
-  llvm::StringMap<std::string> composeReadyStates;
-  llvm::StringMap<std::string> composeReadyPeers;
 };
 struct CallableDecl {
   FlatSymbolRefAttr symbol;
@@ -436,7 +430,7 @@ struct LoopLoweringContext {
 };
 
 class Importer final : public SourceDeclarationContext::Implementation {
-  const llvm::StringMap<std::string> *activeComposeNames = nullptr;
+  uint64_t statementGuardOrdinal = 0;
 public:
   Importer(const CapturedSource &source, DictionaryAttr owner,
            const SourceHeaderRegistry &headers,
@@ -3306,26 +3300,133 @@ FailureOr<Value> Importer::expression(
     llvm::StringMap<Value> &values, llvm::StringMap<Instance *> &instances,
     std::optional<Type> expected,
     llvm::StringMap<SmallVector<Value>> *captures) {
-  if (activeComposeNames) {
-    SmallVector<StringRef> parts;
-    AstNode root = node;
-    while (root.kind() == "Attribute") {
-      parts.push_back(root.string("attr"));
-      root = root.child("value");
+
+  if (!captures && activeRule && activeRule->outputs)
+    captures = activeRule->outputs;
+  if (node.kind() == "Call" && intrinsic(node.child("func"), "forward")) {
+    if (!activeSourceEffects || !activeSourceEffects->callable ||
+        !activeSourceEffects->callable->lexical || !activeSourceEffects->methods ||
+        !activeSourceEffects->states || node.array("args").size() != 1 ||
+        node.array("keywords").size() != 1 || node.item("keywords", 0).string("arg") != "source")
+      return error() << "forward requires a persistent leaf and one static source operation";
+    auto receiver = node.item("args", 0);
+    SmallVector<Attribute> fields;
+    while (receiver.kind() == "Attribute") {
+      fields.push_back(at.getStringAttr(receiver.string("attr")));
+      receiver = receiver.child("value");
     }
-    if (root.kind() == "Name") {
-      std::string name = root.string("id").str();
-      for (StringRef part : llvm::reverse(parts)) name += "." + part.str();
-      auto found = activeComposeNames->find(name);
-      if (found != activeComposeNames->end()) {
-        auto value = values.lookup(found->second);
-        if (!value) return error() << "compose input is unavailable";
+    std::reverse(fields.begin(), fields.end());
+    if (receiver.kind() != "Name") return error() << "forward receiver requires a persistent state name";
+    auto state = activeSourceEffects->states->find(receiver.string("id"));
+    if (state == activeSourceEffects->states->end()) return error() << "forward receiver is not persistent state";
+    auto reference = node.item("keywords", 0).child("value");
+    if (reference.kind() != "Name") return error() << "forward source requires a static operation name";
+    auto source = activeSourceEffects->methods->find(reference.string("id"));
+    if (source == activeSourceEffects->methods->end() ||
+        (!source->second.autonomous && (!source->second.syntax.methodKind ||
+            source->second.syntax.methodKind.getValue() != "action" || source->second.syntax.privateMethod)) ||
+        llvm::any_of(activeSourceEffects->callable->inputs,
+            [&](const Port &port) { return port.name == reference.string("id"); }))
+      return error() << "forward source requires an explicit public action or registered nested Rule";
+    ac::HardwareAnalysis hardware(*body);
+    auto fieldPath = at.getArrayAttr(fields);
+    DictionaryAttr leafField;
+    auto type = ac::detail::forwardLeafType(hardware, state->second.type, fieldPath, state->second.op,
+        [&](uint64_t work) { return chargeLoopDescriptorWork(node, "forward leaf type", work); }, &leafField);
+    auto path = trueValue(node, at, ownerSymbol);
+    if (failed(type) || failed(path)) return failure();
+    SmallVector<NamedAttribute> attributes{
+        at.getNamedAttr("callee", source->second.autonomous ? SymbolRefAttr::get(b.getContext(), ownerSymbol.getValue(), {}) :
+            SymbolRefAttr::get(b.getContext(), ownerSymbol.getValue(),
+                {FlatSymbolRefAttr::get(b.getContext(), reference.string("id"))})),
+        at.getNamedAttr("member", at.getStringAttr("forward")),
+        at.getNamedAttr("argument", at.getStringAttr("")),
+        at.getNamedAttr("ac.forward_state", at.getStringAttr(receiver.string("id"))),
+        at.getNamedAttr("ac.forward_fields", fieldPath),
+        at.getNamedAttr("occurrence", sourceOccurrence(at, ownerSymbol, node)),
+        at.getNamedAttr("location", sourceSpan(at, this->source.path, node))};
+    if (source->second.autonomous)
+      attributes.push_back(at.getNamedAttr("registration", sourceOccurrence(at, ownerSymbol, source->second.declaration)));
+    auto operation = createOp(at, node.location(b.getContext(), this->source.path),
+        ac::SourceActionReadOp::getOperationName(), {*path}, {*type}, attributes);
+    auto value = operation->getResult(0);
+    if (leafField) rememberStructField(value, leafField, node);
+    else rememberState(value, state->second);
+    fixedValues.insert(value);
+    return value;
+  }
+  if (node.kind() == "Call" && intrinsic(node.child("func"), "fired")) {
+    if (!activeSourceEffects || !activeSourceEffects->callable ||
+        !activeSourceEffects->callable->lexical || !activeSourceEffects->methods ||
+        node.array("args").size() != 1 || !node.array("keywords").empty() ||
+        node.item("args", 0).kind() != "Name")
+      return error() << "fired requires a lexical registered nested Rule";
+    auto name = node.item("args", 0).string("id");
+    auto found = activeSourceEffects->methods->find(name);
+    if (found == activeSourceEffects->methods->end() || !found->second.autonomous ||
+        llvm::any_of(activeSourceEffects->callable->inputs,
+            [&](const Port &port) { return port.name == name; }))
+      return error() << "fired requires an unambiguous registered nested Rule";
+    auto path = trueValue(node, at, ownerSymbol);
+    if (failed(path)) return failure();
+    auto operation = createOp(at, node.location(b.getContext(), source.path),
+        ac::SourceActionReadOp::getOperationName(), {*path},
+        {internalBits(1, node, ownerSymbol)}, {
+            at.getNamedAttr("callee", ownerSymbol),
+            at.getNamedAttr("registration", sourceOccurrence(at, ownerSymbol, found->second.declaration)),
+            at.getNamedAttr("member", at.getStringAttr("fired")),
+            at.getNamedAttr("argument", at.getStringAttr("")),
+            at.getNamedAttr("occurrence", sourceOccurrence(at, ownerSymbol, node)),
+            at.getNamedAttr("location", sourceSpan(at, source.path, node))});
+    auto value = operation->getResult(0);
+    remember(value, ac::detail::ValueKind::Boolean);
+    fixedValues.insert(value);
+    return value;
+  }
+  if (activeSourceEffects && activeSourceEffects->callable && activeSourceEffects->callable->lexical &&
+      activeSourceEffects->methods && node.kind() == "Attribute") {
+    AstNode reference = node.child("value");
+    StringRef argument;
+    StringRef member = node.string("attr");
+    if (reference.kind() == "Attribute" && reference.string("attr") == "args") {
+      argument = member;
+      member = "argument";
+      reference = reference.child("value");
+    }
+    if (reference.kind() == "Name" && !values.contains(reference.string("id")) &&
+        (member == "active" || member == "argument")) {
+      auto found = activeSourceEffects->methods->find(reference.string("id"));
+      if (found != activeSourceEffects->methods->end()) {
+        const auto &method = found->second;
+        if (!method.syntax.methodKind || method.syntax.methodKind.getValue() != "action" ||
+            method.syntax.privateMethod)
+          return error() << "aggregate observations require an explicit public action Method";
+        Type type;
+        const Port *formal = nullptr;
+        if (member == "active") type = internalBits(1, node, ownerSymbol);
+        else {
+          for (const auto &port : method.inputs)
+            if (port.name == argument) formal = &port;
+          if (!formal) return error() << "unknown action argument";
+          type = formal->type;
+        }
+        auto path = trueValue(node, at, ownerSymbol);
+        if (failed(path)) return failure();
+        auto op = createOp(at, node.location(b.getContext(), source.path),
+            ac::SourceActionReadOp::getOperationName(), {*path}, {type}, {
+                at.getNamedAttr("callee", SymbolRefAttr::get(b.getContext(), ownerSymbol.getValue(),
+                    {FlatSymbolRefAttr::get(b.getContext(), reference.string("id"))})),
+                at.getNamedAttr("member", at.getStringAttr(member)),
+                at.getNamedAttr("argument", at.getStringAttr(argument)),
+                at.getNamedAttr("occurrence", sourceOccurrence(at, ownerSymbol, node)),
+                at.getNamedAttr("location", sourceSpan(at, source.path, node))});
+        auto value = op->getResult(0);
+        remember(value, formal ? formal->sourceKind : ac::detail::ValueKind::Boolean);
+        if (!formal || formal->fixedBits) fixedValues.insert(value);
         return value;
       }
     }
   }
-  if (!captures && activeRule && activeRule->outputs)
-    captures = activeRule->outputs;
   if (node.kind() == "Name" &&
       failed(requireNestedRuleDataVisible(node.string("id"), node))) return failure();
   if (node.kind() == "Attribute" || node.kind() == "Subscript")

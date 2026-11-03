@@ -4,9 +4,8 @@ Write hardware in Python. Compile it to C++ simulation models and Verilog
 through one verified MLIR pipeline.
 
 pyCircuit has one Python frontend with `pycircuit compile`, `pycircuit link`,
-`pycircuit emit` and `pycircuit run`. The downstream
-[architecture extension stage](extensions/architecture.md), `pycircuit elaborate`,
-expands reusable components before that flow. Typed modules, persistent
+`pycircuit emit` and `pycircuit run`. Reusable components use
+[ordinary source libraries](extensions/architecture.md). Typed modules, persistent
 state and stateless rules describe hardware. Closed `@system` compositions
 generate their own C++ and Verilator simulation harnesses. Python capture parses
 the design without executing it; MLIR owns hardware analysis and lowering.

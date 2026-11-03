@@ -755,6 +755,11 @@ StringAttr SourceMethodView::getVisibility() const {
   return definition ? definition->getAttrOfType<StringAttr>("sym_visibility")
                     : row.getAs<StringAttr>("visibility");
 }
+StringAttr SourceMethodView::getKind() const {
+  if (isNativeTerminal()) return {};
+  return definition ? definition->getAttrOfType<StringAttr>("ac.method_kind")
+                    : row.getAs<StringAttr>("ac.method_kind");
+}
 DictionaryAttr SourceMethodView::getDeclaration() const {
   if (isNativeMemoryTerminal())
     return nativeMemoryInstance ? nativeMemoryInstance->getAttrOfType<DictionaryAttr>("occurrence")
@@ -1225,7 +1230,7 @@ FailureOr<ResolvedSourceMethod> resolve(Operation *caller, SymbolRefAttr symbol,
     if (!constraint ||
         failed(detail::verifySourceCallHardwareConstraint(
             constraint, payload, hardware, caller, site,
-            "native Queue payload")))
+            "native Queue payload", detail::SourceCallWidthMode::SymbolicFixedBits)))
       return site->emitOpError()
              << "native Queue method requires its checked logical payload constraint";
     method = SourceMethodView{owner, {}, {}, action, terminalInstance,
@@ -1343,6 +1348,7 @@ LogicalResult verifySourceRelativeMethodBinding(
       actual.getFormalProposals() != declaration.getFormalProposals() ||
       actual.getReturnForm() != declaration.getReturnForm() ||
       actual.getVisibility() != declaration.getVisibility() ||
+      actual.getKind() != declaration.getKind() ||
       actual.getDeclaration() != declaration.getDeclaration() ||
       actual.getGuardLocation() != declaration.getGuardLocation() ||
       actual.getNumPublicResults() != declaration.getNumPublicResults())

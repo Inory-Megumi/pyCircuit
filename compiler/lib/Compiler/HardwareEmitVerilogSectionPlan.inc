@@ -1,11 +1,21 @@
 ReadableRtlSections::Guard readableSection(Value value) {
     if (!readableSections.isEnabled()) return readableSections.select("", "", 0);
     value = readableSource(value);
+    llvm::StringSet<> admissions;
+    for (auto origin : readableScopedRoles(value)) {
+        auto role = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");
+        if (role && role.getValue() == "admission" && scope) admissions.insert(scope.getValue());
+    }
+    if (admissions.size() == 1) {
+        auto scope = admissions.begin()->getKey();
+        return readableSections.select("source:" + scope.str(),
+            "Source rule: " + scope.str(), readableSections.sourceOrder(scope));
+    }
     if (readableRoleHints.contains(value))
         return readableSections.select("commit_control", "Atomic update control", 2000);
     unsigned priority = 0;
     llvm::StringSet<> scopes;
-    for (auto origin : ac::sourceRtlRoles(readableSource(value))) {
+    for (auto origin : readableScopedRoles(value)) {
         auto role = origin.getAs<StringAttr>("role"), scope = origin.getAs<StringAttr>("scope");
         if (!role || !scope) continue;
         unsigned rank = llvm::StringSwitch<unsigned>(role.getValue())

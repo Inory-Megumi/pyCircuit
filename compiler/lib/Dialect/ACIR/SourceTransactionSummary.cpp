@@ -1,6 +1,7 @@
 #include "SourceTransactionSummary.h"
 #include "ACIRSourceContracts.h"
 #include "HardwareSourceChecks.h"
+#include "SourceForwarding.h"
 #include "mlir/IR/Builders.h"
 #include "pycircuit/Dialect/ACIR/SourceIdentifier.h"
 #include "llvm/ADT/DenseSet.h"
@@ -756,7 +757,7 @@ private:
       if (!budget.charge())
         return failure();
       if (isa<SourceBranchOp, SourceFormalWriteOp, SourceMethodCallOp,
-              SourceExpectOp, SourceObserveOp, SourceStateReadOp,
+              SourceExpectOp, SourceObserveOp, SourceStateReadOp, SourceActionReadOp,
               SourceStateWriteOp>(operation))
         ++count;
     }
@@ -885,6 +886,23 @@ private:
         if (!row)
           return failure();
         result.push_back(row);
+      } else if (auto read = dyn_cast<SourceActionReadOp>(operation)) {
+        auto row = dict({{"kind", str("action_read")},
+                         {"occurrence", read.getOccurrence()},
+                         {"path", fact(read.getPath(), scope)},
+                         {"callee", read.getCalleeAttr()},
+                         {"member", read.getMemberAttr()},
+                         {"argument", read.getArgumentAttr()},
+                         {"type", TypeAttr::get(read.getValue().getType())},
+                         {"location", read.getLocation()}});
+        if (!row || failed(metadata(read.getLocation()))) return failure();
+        NamedAttrList fields(row);
+        if (auto registration = read->getAttr("registration")) fields.append("registration", registration);
+        if (read.getMember() == "forward") {
+          fields.append("state", read->getAttr("ac.forward_state"));
+          fields.append("fields", read->getAttr("ac.forward_fields"));
+        }
+        result.push_back(fields.getDictionary(builder.getContext()));
       } else if (isa<SourceStateReadOp, SourceStateWriteOp>(operation)) {
         auto stateName = operation.getAttrOfType<StringAttr>("state");
         SourceStateOp state;
@@ -990,6 +1008,8 @@ private:
         row.append("ac.formal_proposals", proposals);
       if (auto visibility = method->getAttr("sym_visibility"))
         row.append("visibility", visibility);
+      if (auto kind = method->getAttr("ac.method_kind"))
+        row.append("ac.method_kind", kind);
     } else {
       auto transaction = cast<SourceTransactionOp>(operation);
       auto domain = getDomain(transaction.getClk(), transaction.getRst());
@@ -1097,6 +1117,7 @@ public:
         identity = state.getAs<DictionaryAttr>("declaration");
         stateRows[state] = row.getAs<TypeAttr>("type").getValue();
         stateNames.insert(name.getValue());
+        forwardStateTypes[name] = row.getAs<TypeAttr>("type").getValue();
       } else if (kind.getValue() == "instance") {
         NamedAttrList core(row);
         Attribute payloadConstraint = row.get("payload_constraint");
@@ -1202,7 +1223,8 @@ public:
           if (payloadConstraint &&
               failed(detail::verifySourceCallHardwareConstraint(
                   payloadConstraint, payload, hardware, declaration,
-                  declaration, "transaction summary queue payload")))
+                  declaration, "transaction summary queue payload",
+                  detail::SourceCallWidthMode::SymbolicFixedBits)))
             return failure();
           if ((unboundPush || unboundPop) && !payloadConstraint)
             return error("source Queue methods require a checked payload constraint");
@@ -1262,6 +1284,8 @@ public:
     // before checking any helper's calls into those bodies.
     for (Attribute raw : autonomous) {
       auto row = dyn_cast<DictionaryAttr>(raw);
+      if (row && row.getAs<DictionaryAttr>("registration"))
+        rootRows[row.getAs<DictionaryAttr>("registration")] = row;
       if (row && row.get("registration") == row.get("declaration") &&
           row.get("registration_entry"))
         autonomousBodies.insert(row.get("registration_entry"));
@@ -1535,6 +1559,14 @@ private:
     NamedAttrList core(row);
     core.erase("ac.formal_proposals");
     core.erase("visibility");
+    core.erase("ac.method_kind");
+    if (Attribute raw = row.get("ac.method_kind")) {
+      auto kind = dyn_cast<StringAttr>(raw);
+      if (!kind || (kind.getValue() != "action" && kind.getValue() != "query"))
+        return error("Method kind requires action or query");
+      if (kind.getValue() == "action" && row.get("visibility"))
+        return error("observable action Methods require public visibility");
+    }
     if (row.get("callable_after") || row.get("after"))
       return error("after ordering is retired; independent Rules read current state");
     if (Attribute raw = row.get("visibility")) {
@@ -1985,7 +2017,61 @@ private:
       }
       if (failed(fact(row.get("path"), scope)))
         return failure();
-      if (kind.getValue() == "call") {
+      if (kind.getValue() == "action_read") {
+        NamedAttrList core(row);
+        core.erase("registration");
+        core.erase("state"); core.erase("fields");
+        if (failed(exact(core.getDictionary(declaration->getContext()), {"kind", "occurrence", "path", "callee", "member",
+                              "argument", "type", "location"}))) return failure();
+        auto callee = row.getAs<SymbolRefAttr>("callee");
+        auto member = row.getAs<StringAttr>("member");
+        auto argument = row.getAs<StringAttr>("argument");
+        auto payload = row.getAs<TypeAttr>("type");
+        if (!callee || callee.getRootReference() != SymbolTable::getSymbolName(declaration) ||
+            !member || !argument || !payload ||
+            failed(type(payload)) || failed(detail::verifySourceEffectMetadata(
+                row.getAs<DictionaryAttr>("occurrence"), row.getAs<DictionaryAttr>("location"),
+                declaration, [&] { return declaration->emitOpError(); }))) return failure();
+        bool forward = member.getValue() == "forward";
+        if (forward) {
+          auto name = row.getAs<StringAttr>("state");
+          auto found = forwardStateTypes.find(name);
+          if (!name || found == forwardStateTypes.end() || !argument.getValue().empty())
+            return error("forward receiver requires a declared persistent owner");
+          auto leaf = detail::forwardLeafType(hardware, found->second, row.getAs<ArrayAttr>("fields"), declaration,
+              [&](uint64_t work) { return success(budget.charge(work)); });
+          if (failed(leaf) || !areEquivalentHardwareTypes(*leaf, payload.getValue())) return failure();
+        } else if (row.get("state") || row.get("fields")) return error("non-forward observation has a state receiver");
+        if (row.get("registration")) {
+          auto registration = row.getAs<DictionaryAttr>("registration");
+          auto root = rootRows.find(registration);
+          if (!registration || root == rootRows.end() ||
+              root->second.get("declaration") != registration || !callee.getNestedReferences().empty() ||
+              !argument.getValue().empty() || (!forward &&
+                (member.getValue() != "fired" || !oneBit(payload.getValue()))))
+            return error("fired observation requires a local autonomous registration");
+          continue;
+        }
+        if (row.get("registration") || callee.getNestedReferences().size() != 1)
+          return error("action Method observation requires a local Method");
+        auto found = methodRows.find(callee.getLeafReference());
+        if (found == methodRows.end()) return error("action observation requires a local Method");
+        auto methodKind = found->second.getAs<StringAttr>("ac.method_kind");
+        if (!methodKind || methodKind.getValue() != "action" || found->second.get("visibility"))
+          return error("action observation requires an explicit public action");
+        if (forward) continue;
+        if (member.getValue() == "active") {
+          if (!argument.getValue().empty() ||
+              !oneBit(payload.getValue())) return error("active observation requires one predicate bit");
+        } else if (member.getValue() == "argument") {
+          auto names = found->second.getAs<ArrayAttr>("argument_names");
+          auto position = llvm::find(names, argument);
+          auto signature = cast<FunctionType>(found->second.getAs<TypeAttr>("function_type").getValue());
+          if (position == names.end() ||
+              !areEquivalentHardwareTypes(payload.getValue(), signature.getInput(position - names.begin())))
+            return error("action argument observation disagrees with its Method formal");
+        } else return error("action observation requires active or argument");
+      } else if (kind.getValue() == "call") {
         if (guard)
           return error("guard effects permit reads only");
         if (failed(call(row, scope)))
@@ -2132,6 +2218,8 @@ private:
   llvm::StringSet<> stateNames;
   llvm::DenseMap<DictionaryAttr, DictionaryAttr> instanceRows;
   llvm::DenseMap<StringAttr, DictionaryAttr> methodRows;
+  llvm::DenseMap<DictionaryAttr, DictionaryAttr> rootRows;
+  llvm::DenseMap<StringAttr, Type> forwardStateTypes;
 };
 } // namespace
 
