@@ -6,42 +6,14 @@ import json
 import re
 from pathlib import Path
 
-
-class ValidationProfileError(ValueError):
-    """The artifact cannot be checked by this explicitly bounded profile."""
-
-
-def _require(condition, message):
-    if not condition:
-        raise ValidationProfileError(message)
-
-
-def _natural(value):
-    return type(value) is int and value >= 0
-
-
-def _type(value):
-    _require(isinstance(value, dict), "term type must be an object")
-    if value == {"kind": "bool"}:
-        return ("bool", 1)
-    _require(set(value) == {"kind", "width"}, "unsupported term type")
-    width = value["width"]
-    _require(
-        value["kind"] == "bits" and _natural(width) and 0 < width <= 4096,
-        "Bits width outside validation profile",
-    )
-    return ("bits", width)
-
-
-def _decimal(value, width):
-    _require(
-        isinstance(value, str) and re.fullmatch(r"0|[1-9][0-9]*", value),
-        "unsigned literals must be canonical decimal strings",
-    )
-    _require(len(value) <= 1234, "literal outside validation width limit")
-    integer = int(value)
-    _require(integer.bit_length() <= width, "literal does not fit its width")
-    return integer
+from formal_rule_model import (
+    RuleFormula,
+    _natural,
+    _require,
+)
+from formal_rule_model import (
+    ValidationProfileError as ValidationProfileError,
+)
 
 
 def _identifier(value):
@@ -82,214 +54,50 @@ class RuleRtlValidation:
         self.reference_path = self.work_dir / "reference.sv"
         self.normalized_path = self.work_dir / "normalized.il"
         self.rtl_files = []
-        self._nodes = 0
-        self._bit_work = 0
         self._wires = []
 
     def _load_model(self):
-        _require(
-            self.formula_path.stat().st_size <= 8 * 1024 * 1024, "formula too large"
-        )
-        model = json.loads(self.formula_path.read_text())
-        _require(
-            set(model)
-            == {"schema", "definition", "inputs", "registers", "outputs", "next"}
-            and model["schema"] == "pycircuit-rule-transition-v2"
-            and isinstance(model["definition"], str)
-            and bool(model["definition"]),
-            "unsupported formula schema",
-        )
-        self.definition = model["definition"]
-        self.inputs, self.registers, self.outputs = (
-            model["inputs"],
-            model["registers"],
-            model["outputs"],
-        )
-        _require(
-            isinstance(self.inputs, list)
-            and isinstance(self.registers, list)
-            and isinstance(self.outputs, list)
-            and len(self.inputs) <= 64
-            and 0 < len(self.registers) <= 64,
-            "invalid finite interface inventory",
-        )
-        for rows in (self.inputs, self.registers, self.outputs):
-            _require(
-                all(
-                    isinstance(row, dict) and isinstance(row.get("name"), str)
-                    for row in rows
-                ),
-                "invalid named interface row",
-            )
-            names = [row["name"] for row in rows]
-            _require(
-                all(names) and len(set(names)) == len(names), "duplicate or empty names"
-            )
-        self.input_types = []
-        for row in self.inputs:
-            _require(set(row) == {"name", "type"}, "invalid input row")
-            self.input_types.append(_type(row["type"]))
-        self.widths, self.initials = [], []
-        for row in self.registers:
-            _require(
-                set(row) == {"name", "owner", "width", "initial"},
-                "invalid register row",
-            )
-            _require(
-                isinstance(row["owner"], str) and bool(row["owner"]),
-                "missing register owner",
-            )
-            width = _type({"kind": "bits", "width": row["width"]})[1]
-            self.widths.append(width)
-            self.initials.append(_decimal(row["initial"], width))
-        self.owner_keys = [row["owner"] for row in self.registers]
-        _require(
-            len(set(self.owner_keys)) == len(self.owner_keys),
-            "duplicate register owner",
-        )
-        self.output_widths = []
-        for row in self.outputs:
-            _require(
-                set(row) == {"name", "type", "term"},
-                "invalid output expression row",
-            )
-            type_ = _type(row["type"])
-            _require(type_[0] == "bits", "public output must be packed Bits")
-            self.output_widths.append(type_[1])
-        _require(
-            0 < len(self.outputs) <= 64 and sum(self.output_widths) <= 4096,
-            "public output expansion exceeds validation profile",
-        )
-        _require(
-            sum(self.widths) + sum(width for _, width in self.input_types) <= 4096,
-            "combined state/input width exceeds validation profile",
-        )
-        _require(
-            isinstance(model["next"], list)
-            and len(model["next"]) == len(self.registers),
-            "incomplete next-state vector",
-        )
-        terms = [self._term(node, 0) for node in model["next"]]
-        for (type_, _), width in zip(terms, self.widths, strict=True):
-            _require(type_ == ("bits", width), "next-state type differs from register")
-        self.next_wires = [wire for _, wire in terms]
-        self.output_wires = []
-        for row, width in zip(self.outputs, self.output_widths, strict=True):
-            type_, wire = self._term(row["term"], 0)
-            _require(type_ == ("bits", width), "public output term type mismatch")
-            self.output_wires.append(wire)
+        self.formula = RuleFormula.load(self.formula_path)
+        for name in (
+            "definition",
+            "inputs",
+            "registers",
+            "outputs",
+            "input_types",
+            "widths",
+            "initials",
+            "owner_keys",
+            "output_widths",
+        ):
+            setattr(self, name, getattr(self.formula, name))
+        self.next_wires = [self._term(node)[1] for node in self.formula.data["next"]]
+        self.output_wires = [self._term(row["term"])[1] for row in self.outputs]
 
-    def _term(self, node, depth):
-        self._nodes += 1
-        _require(
-            self._nodes <= 100000 and depth <= 256, "formula expansion limit exceeded"
-        )
-        _require(
-            isinstance(node, dict) and "op" in node and "type" in node, "invalid term"
-        )
-        result_type = _type(node["type"])
-        self._bit_work += result_type[1]
-        _require(self._bit_work <= 1000000, "formula bit-work limit exceeded")
+    def _term(self, node):
+        return self.formula.fold(node, self._render)
+
+    def _render(self, node, type_, values):
         op = node["op"]
-        if op in ("boolLit", "bitsLit"):
-            _require(set(node) == {"op", "type", "value"}, "invalid literal term")
-            if op == "boolLit":
-                _require(
-                    result_type == ("bool", 1) and type(node["value"]) is bool,
-                    "invalid Bool literal",
-                )
-                expression = "1'b1" if node["value"] else "1'b0"
-            else:
-                _require(result_type[0] == "bits", "invalid Bits literal type")
-                expression = (
-                    f"{result_type[1]}'d{_decimal(node['value'], result_type[1])}"
-                )
-        elif op in ("input", "read"):
-            _require(
-                set(node) == {"op", "type", "index"} and _natural(node["index"]),
-                "invalid variable term",
-            )
-            index = node["index"]
-            types = (
-                self.input_types
-                if op == "input"
-                else [("bits", width) for width in self.widths]
-            )
-            _require(
-                index < len(types) and types[index] == result_type,
-                "variable type/index mismatch",
-            )
-            return result_type, f"i{index}" if op == "input" else f"r{index}"
+        if op in ("input", "read"):
+            return f"i{node['index']}" if op == "input" else f"r{node['index']}"
+        if op == "boolLit":
+            expression = "1'b1" if node["value"] else "1'b0"
+        elif op == "bitsLit":
+            expression = f"{type_[1]}'d{node['value']}"
+        elif op == "bit":
+            expression = values[0]
+        elif op == "concat":
+            expression = "{" + ", ".join(values) + "}"
+        elif op == "not":
+            expression = f"(!{values[0]})"
+        elif op == "ite":
+            expression = f"({values[0]} ? {values[1]} : {values[2]})"
         else:
-            arity = {
-                "add": 2,
-                "sub": 2,
-                "ult": 2,
-                "eq": 2,
-                "and": 2,
-                "not": 1,
-                "ite": 3,
-                "bit": 1,
-                "concat": 2,
-            }
-            _require(
-                op in arity and set(node) == {"op", "type", "args"},
-                "unsupported term operation",
-            )
-            _require(
-                isinstance(node["args"], list) and len(node["args"]) == arity[op],
-                "term arity mismatch",
-            )
-            children = [self._term(child, depth + 1) for child in node["args"]]
-            types, values = zip(*children, strict=True)
-            if op == "bit":
-                _require(
-                    result_type == ("bits", 1) and types == (("bool", 1),),
-                    "Boolean payload type mismatch",
-                )
-                expression = values[0]
-            elif op == "concat":
-                _require(
-                    all(t[0] == "bits" for t in types)
-                    and result_type == ("bits", sum(t[1] for t in types)),
-                    "concatenation width/type mismatch",
-                )
-                expression = "{" + ", ".join(values) + "}"
-            elif op in ("add", "sub"):
-                _require(
-                    result_type[0] == "bits" and all(t == result_type for t in types),
-                    "arithmetic type mismatch",
-                )
-                expression = f"({values[0]} {'+' if op == 'add' else '-'} {values[1]})"
-            elif op in ("ult", "eq"):
-                _require(
-                    result_type == ("bool", 1) and types[0] == types[1],
-                    "comparison type mismatch",
-                )
-                _require(
-                    op == "eq" or types[0][0] == "bits",
-                    "unsigned comparison requires Bits",
-                )
-                expression = f"({values[0]} {'<' if op == 'ult' else '=='} {values[1]})"
-            elif op in ("and", "not"):
-                _require(
-                    result_type == ("bool", 1) and all(t == result_type for t in types),
-                    "Boolean type mismatch",
-                )
-                expression = (
-                    f"({values[0]} && {values[1]})"
-                    if op == "and"
-                    else f"(!{values[0]})"
-                )
-            else:
-                _require(
-                    types[0] == ("bool", 1) and types[1] == types[2] == result_type,
-                    "conditional type mismatch",
-                )
-                expression = f"({values[0]} ? {values[1]} : {values[2]})"
+            operator = {"add": "+", "sub": "-", "ult": "<", "eq": "==", "and": "&&"}[op]
+            expression = f"({values[0]} {operator} {values[1]})"
         name = f"n{len(self._wires)}"
-        self._wires.append(f"  {_declaration(result_type[1], name)} = {expression};")
-        return result_type, name
+        self._wires.append(f"  {_declaration(type_[1], name)} = {expression};")
+        return name
 
     def _bind_ports(self):
         manifest = json.loads((self.rtl_dir / "generated.json").read_text())

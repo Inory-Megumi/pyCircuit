@@ -98,14 +98,17 @@ result must not be reported as a full nightly result.
 
 `tools/run_api_tests.sh --tier gate --formal` runs the ordinary API gate, builds
 the pinned Lean project, audits principal theorem axioms, and runs the exporter,
-artifact and source-library pytest modules. `--list --formal` lists that extra
+artifact, source-library and reachable-counterexample pytest modules. The latter
+checks Z3 search, concrete Lean witnesses and actual C++/RTL replay with VCDs.
+`--list --formal` lists that extra
 scope without claiming execution. The default API gate does not imply this
 optional formal coverage.
 
 Set `PYC_LAKE` if `lake` is not on PATH; `PYC_LEAN` may select an adapter invoking
 the actual Lean checker for pytest. The formal profile also requires Yosys
 (`YOSYS` may select it), Verilator, Icarus and the installed CompilerDev toolchain.
-Missing tools fail the run. Lean/pytest logs, formal test selection and JUnit
+Install `.[formal]` into `PYC_PYTHON_EXECUTABLE`'s environment for the pinned
+Z3 Python dependency. Missing tools fail the run. Lean/pytest logs, formal test selection and JUnit
 results are retained with the existing API gate evidence. Generated artifacts
 use `PYC_FORMAL_WORK_DIR` or the dedicated `formal-artifacts` directory beneath
 the native build; pytest clears that directory. Keep its path free of spaces

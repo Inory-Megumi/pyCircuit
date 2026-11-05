@@ -6,8 +6,16 @@ import RuleSemantics.SymbolicAcceptance
 import RuleSemantics.SymbolicSerialize
 import RuleSemantics.Library
 import RuleSemantics.LibraryAcceptance
+import RuleSemantics.Witness
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
+
+#print axioms RuleSemantics.Witness.stateOnly_input_irrelevant
+#print axioms RuleSemantics.Witness.check_sound
+#print axioms RuleSemantics.Witness.Trace.history
+#print axioms RuleSemantics.Witness.Trace.observations
+#print axioms RuleSemantics.Witness.Trace.environment
+#print axioms RuleSemantics.Witness.check_observations
 
 #print axioms RuleSemantics.Action.bind_rejects_left
 #print axioms RuleSemantics.Action.bind_rejects_right

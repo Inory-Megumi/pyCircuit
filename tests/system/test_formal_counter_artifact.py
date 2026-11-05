@@ -34,6 +34,7 @@ def _harness(root):
             for path in (
                 Path(__file__),
                 Path(__file__).with_name("formal_rule_validation.py"),
+                Path(__file__).with_name("formal_rule_model.py"),
                 FIXTURE / "checked_tb.sv",
             )
         }

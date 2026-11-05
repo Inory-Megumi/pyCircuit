@@ -58,6 +58,8 @@ at most 4,096 combined register/input bits, at most 64 public outputs totaling
 term-result bits (the sum of result widths over visited terms). These additional
 encoding limits reject oversized formulas before invoking Yosys.
 
+The shared checked term/model layer in `formal_rule_model.py` validates the same
+schema for both this SV verifier and the [Z3 counterexample search](COUNTEREXAMPLES.md).
 The reusable verifier in the existing system pytest suite emits explicitly
 sized unsigned SV wires for those terms and one reference register per source
 register. Addition/subtraction truncate at each declared result width. Typed

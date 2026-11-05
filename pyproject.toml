@@ -39,6 +39,9 @@ Issues = "https://github.com/PTO-ISA/pyCircuit/issues"
 Releases = "https://github.com/PTO-ISA/pyCircuit/releases"
 
 [project.optional-dependencies]
+formal = [
+    "z3-solver==4.15.4.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-xdist>=3.8.0",

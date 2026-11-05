@@ -17,6 +17,9 @@ The [symbolic validation](VALIDATION.md) proves lowering from Rule syntax to
 typed transition terms and compares a serialized model with same-unit RTL.
 The [contract and source-library stage](LIBRARY.md) extends that route to
 internal state, computed observations, Rule contracts and reusable buffers.
+The [counterexample workflow](COUNTEREXAMPLES.md) adds reachable Z3 search,
+kernel-checked concrete witnesses, and actual C++/RTL trace and waveform replay.
+The [roadmap](ROADMAP.md) records the original proposal and deferred directions.
 
 ## Reproduce
 
@@ -102,6 +105,7 @@ hardware realizability, infers resources, or establishes frontend admission.
 | [Contracts.lean](lean/RuleSemantics/Contracts.lean) | Pre/postconditions, sequential composition, frame/read-write locality, and sufficient independence for commutation and snapshot merge. |
 | [Library.lean](lean/RuleSemantics/Library.lean) | Register, ordered counter, single-entry FIFO and two-entry FIFO models; abstract list correspondence and capacity/history properties. |
 | [LibraryAcceptance.lean](lean/RuleSemantics/LibraryAcceptance.lean) | Independent frame/commutation checks, an order-sensitive guard dependency, and full FIFO replacement with arbitrary payloads. |
+| [Witness.lean](lean/RuleSemantics/Witness.lean) | Full concrete-trace checking implies reachable property violation, with state/output observations and environmental constraints tied to Core execution. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does

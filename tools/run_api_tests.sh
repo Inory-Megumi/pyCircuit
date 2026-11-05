@@ -8,6 +8,7 @@ formal_python_tests=(
   tests/system/test_formal_rule_export.py
   tests/system/test_formal_counter_artifact.py
   tests/system/test_formal_rule_library.py
+  tests/system/test_formal_counterexample.py
 )
 while (($#)); do
   case "$1" in
@@ -107,6 +108,7 @@ if [[ "$tier" == nightly ]]; then
 fi
 scope=common-ir-source-runtime
 if ((formal)); then
+  "${PYC_PYTHON_EXECUTABLE:-python3}" -c 'import z3; print("Z3 " + z3.get_full_version())'
   lake="${PYC_LAKE:-lake}"
   command -v "$lake" >/dev/null || pyc_die "--formal requires lake (or PYC_LAKE)"
   command -v "${YOSYS:-yosys}" >/dev/null || pyc_die "--formal requires Yosys (or YOSYS)"
@@ -130,7 +132,7 @@ if ((formal)); then
   if ((formal_status != 0 && status == 0)); then
     status=$formal_status
   fi
-  scope=common-ir-source-runtime-formal-rule-library
+  scope=common-ir-source-runtime-formal-rule-library-counterexample-replay
 fi
 ((status == 0)) || exit "$status"
 pyc_finish_test_run api "$tier" "$scope"
