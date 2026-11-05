@@ -1,0 +1,7 @@
+name = "rule-semantics"
+version = "0.1.0"
+defaultTargets = ["RuleSemantics"]
+
+[[lean_lib]]
+name = "RuleSemantics"
+moreLeanArgs = ["-DwarningAsError=true"]
