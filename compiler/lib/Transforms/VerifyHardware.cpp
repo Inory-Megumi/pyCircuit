@@ -60,6 +60,7 @@ void registerACIRPasses() {
   registerPass([] { return createSimplifyRecordWiresPass(); });
   registerPass([] { return createAnalyzeSourceMethodSummariesPass(); });
   registerPass([] { return createAnalyzeTransactionStateSSAPass(); });
+  registerPass([] { return createExportRuleLeanPass(); });
   registerPass([] { return createLowerTransactionsPass(); });
 }
 

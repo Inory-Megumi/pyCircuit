@@ -10,6 +10,9 @@ explicit capacity constraint. A fixed counter artifact experiment connects these
 models to actual compiler output through a separately checked RTL reference.
 The [minimal syntax core](SYNTAX.md) adds closed typed Rule expressions and
 commands whose behavior comes from generic interpreters.
+The [typed-IR model exporter](EXPORT.md) derives that syntax automatically from
+the native compiler's published source artifact within a deliberately bounded
+profile. It preserves the existing capture/compile/link/emit route.
 
 ## Reproduce
 

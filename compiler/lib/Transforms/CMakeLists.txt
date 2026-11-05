@@ -5,6 +5,7 @@ add_acir_library(ACIRTransforms SOURCES
   SimplifyRecordWires.cpp
   AnalyzeSourceMethods.cpp
   AnalyzeTransactionStateSSA.cpp
+  ExportRuleLean.cpp
   LowerTransactions.cpp
   TransactionValueAvailability.cpp
   LINK_LIBRARIES

@@ -81,9 +81,11 @@ counter's order-sensitive empty boundary. Both interpretations satisfy the
 independent expectations through kernel-checked concrete evaluation, without
 using the interpreter-correspondence theorem to derive either expected result.
 
-The mapping from the existing Python counter to this syntax is still manually
-reviewed. Automatic source/common-IR extraction and the SV-to-Lean bridge are
-separate future obligations. The earlier artifact verification remains scoped
+The handwritten `SyntaxCounter` mapping is manually reviewed. The
+[typed-IR exporter](EXPORT.md) separately constructs syntax data from the native
+compiler's published source artifact and checks it with independent obligations.
+The exporter and upstream capture/type analysis remain trusted; the SV-to-Lean
+reference correspondence is also still manually reviewed. Artifact verification remains scoped
 to its generated RTL; connecting this syntax to `CounterReference` adds a
 kernel-checked model link without changing that RTL verification's trust base.
 
