@@ -2,7 +2,7 @@
 
 This milestone gives Rules an explicit, closed syntax in Lean. It is a
 formalization layer, not a second pyCircuit compiler or a new authoring API.
-The existing Python compiler and generated-counter artifact test stay unchanged.
+The existing Python compiler remains the production compilation route.
 
 ## Scope and representation
 
@@ -84,10 +84,11 @@ using the interpreter-correspondence theorem to derive either expected result.
 The handwritten `SyntaxCounter` mapping is manually reviewed. The
 [typed-IR exporter](EXPORT.md) separately constructs syntax data from the native
 compiler's published source artifact and checks it with independent obligations.
-The exporter and upstream capture/type analysis remain trusted; the SV-to-Lean
-reference correspondence is also still manually reviewed. Artifact verification remains scoped
-to its generated RTL; connecting this syntax to `CounterReference` adds a
-kernel-checked model link without changing that RTL verification's trust base.
+The exporter and upstream capture/type analysis remain trusted. The subsequent
+[symbolic lowering](VALIDATION.md) proves a generic connection from this syntax
+to typed next-state terms, then generates a reference for actual RTL validation.
+Serialization, SV encoding and Yosys remain trusted; no kernel-checked theorem
+about the emitted RTL bytes is claimed.
 
 ## Validation and ownership
 

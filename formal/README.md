@@ -6,13 +6,15 @@ branch, with pyCircuit source baseline
 `8533455424d7a23d55cce284cd030dc899a19873`. Local Rule safety obligations compose
 into safety of ordered schedules and finite execution histories. A separately
 defined BitVec counter now refines the natural-number specification under an
-explicit capacity constraint. A fixed counter artifact experiment connects these
-models to actual compiler output through a separately checked RTL reference.
+explicit capacity constraint. An artifact experiment connects exported Rule
+models to actual compiler output through automatically generated RTL references.
 The [minimal syntax core](SYNTAX.md) adds closed typed Rule expressions and
 commands whose behavior comes from generic interpreters.
 The [typed-IR model exporter](EXPORT.md) derives that syntax automatically from
 the native compiler's published source artifact within a deliberately bounded
 profile. It preserves the existing capture/compile/link/emit route.
+The [symbolic validation](VALIDATION.md) proves lowering from Rule syntax to
+typed transition terms and compares a serialized model with same-unit RTL.
 
 ## Reproduce
 
@@ -89,6 +91,9 @@ hardware realizability, infers resources, or establishes frontend admission.
 | [Syntax.lean](lean/RuleSemantics/Syntax.lean) | Closed typed expressions and commands, direct candidate evaluation, structural Action interpretation, register-update laws and correspondence/invariant lifting. |
 | [SyntaxCounter.lean](lean/RuleSemantics/SyntaxCounter.lean) | A counter defined as Rule syntax, interpreted generically and connected to the existing reference and Nat history proofs. |
 | [SyntaxAcceptance.lean](lean/RuleSemantics/SyntaxAcceptance.lean) | Independent heterogeneous-register, forwarding, modular arithmetic, rejection/rollback and schedule-order expectations. |
+| [Symbolic.lean](lean/RuleSemantics/Symbolic.lean) | Typed symbolic terms, finite cached banks, and expression/command/Rule/schedule state correspondence with the syntax interpreter. |
+| [SymbolicSerialize.lean](lean/RuleSemantics/SymbolicSerialize.lean) | Bounded executable lowering and JSON serialization; output encoding remains trusted. |
+| [SymbolicAcceptance.lean](lean/RuleSemantics/SymbolicAcceptance.lean) | Independent literal checks of heterogeneous forwarding, rollback and preservation of earlier roots after symbolic lowering. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does
@@ -191,19 +196,20 @@ arithmetic is modeled; the guarded refinement proves that accepted updates do
 not wrap under its stated parameter condition. No product language, compiler
 or runtime semantics are changed.
 
-The [counter artifact experiment](artifact/README.md) uses a real pyCircuit
-source with three-bit state, capacity five, and increment-then-decrement order.
-It compiles and links that source, emits physical RTL and C++ from the same
-final IR, and checks the RTL state transition against an independent SV
-reference using Yosys. `CounterReference` proves the corresponding BitVec
-reference expression refines the Rule model and inherits Nat safety. Independent
-normal checked RTL simulation and a separately compiled reversed-schedule
-counterexample test the observation boundary and sensitivity to ordering.
+The [counter artifact experiment](artifact/README.md) compiles actual sources,
+exports their typed Rule models, and links/emits RTL from the same units. A
+generic proved symbolic lowerer produces next-state terms. Executing the Lean
+serializer and a verification-only SV encoder replaces the handwritten SV
+reference. Yosys compares arbitrary related states across one clock edge.
+The original counter and a renamed four-bit variant exercise this route;
+guard, arithmetic and schedule mutations require concrete semantic mismatches.
+Hidden state is rejected by the current observation profile.
 
-This connection is deliberately state-only and specific to one generated
-artifact's known-two-state, reset-deasserted synthesis projection. The SV-to-Lean
-expression correspondence and Yosys frontend/lowering/SAT remain trusted; no
-RTL certificate is checked by Lean. Module contracts, general compiler
+This connection covers state and public outputs of each generated artifact's
+known-two-state, reset-deasserted synthesis projection. Model extraction,
+serialization, SV encoding and Yosys frontend/lowering/SAT remain trusted; no
+RTL certificate is checked by Lean. The model-level counter proofs still
+connect the original counter to Nat safety. Module contracts, general compiler
 refinement, and the excluded behaviors remain separate proof obligations.
 LLVM/MLIR, Yosys and Verilator are prerequisites for the artifact tests, not for
 the standalone Lean proofs.

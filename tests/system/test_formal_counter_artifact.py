@@ -1,373 +1,321 @@
-"""Bind the fixed counter reference to an actual public physical RTL artifact."""
+"""Validate actual RTL against a reference generated from its exported Lean AST."""
 
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import json
 import os
-import re
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
-from test_source_system_execution import ROOT, _cli, _compile, _ok, _run
+from formal_rule_validation import RuleRtlValidation, ValidationProfileError
+from test_formal_rule_export import (
+    FIXTURES,
+    LEAN_ROOT,
+    ORIGINAL,
+    ExportRun,
+    _obligations,
+    _sha256,
+)
+from test_source_system_execution import ROOT, _cli
 
 pytestmark = pytest.mark.system
 FIXTURE = ROOT / "formal/artifact"
-SIGNALS = ("dut_count", "ref_count", "matched", "inc_request", "dec_request")
 
 
-def _sha256(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _harness(root):
+    harness = ExportRun(root)
+    harness.receipt["scope"] = "automatic known-two-state reset-inactive RTL validation"
+    harness.receipt["inputs"].update(
+        {
+            str(path.relative_to(ROOT)): _sha256(path)
+            for path in (
+                Path(__file__),
+                Path(__file__).with_name("formal_rule_validation.py"),
+                FIXTURE / "checked_tb.sv",
+            )
+        }
+    )
+    yosys = os.environ.get("YOSYS", "yosys")
+    assert shutil.which(yosys), "automatic RTL validation requires Yosys"
+    executable = Path(shutil.which(yosys)).resolve()
+    harness.receipt["tools"]["yosys"] = {
+        "path": str(executable),
+        "sha256": _sha256(executable),
+    }
+    if "yowasp" in executable.name:
+        distribution = importlib.metadata.distribution("yowasp-yosys")
+        wasm = [
+            Path(distribution.locate_file(path))
+            for path in distribution.files
+            if str(path).endswith(".wasm")
+        ]
+        assert wasm, "record the actual Yosys implementation, not only its launcher"
+        harness.receipt["yosys_wasm"] = {str(path): _sha256(path) for path in wasm}
+        harness.receipt["yowasp_versions"] = {
+            name: importlib.metadata.version(name)
+            for name in ("yowasp-yosys", "yowasp-runtime", "wasmtime")
+        }
+    harness.run("yosys-version", [yosys, "-V"])
+    return harness
 
 
-def _wrapper(generated, destination):
-    manifest = json.loads((generated / "generated.json").read_text())
-    ports = json.loads((generated / "ports.json").read_text())
-    assert manifest["rtl_mode"] == "physical"
-    assert ports["controls"] == []
-    assert len(ports["inputs"]) == 4
-    bindings = []
-    names = set()
-    for row in ports["inputs"]:
-        assert row["width"] == 1
-        if row["ordinal"] == ports["domains"]["clock"]:
-            name = "clk"
-        elif row["ordinal"] == ports["domains"]["reset"]:
-            name = "rst"
-        else:
-            name = row["name"]
-        names.add(name)
-        bindings.append(f".{row['wire']}({name})")
-    assert names == {"clk", "rst", "inc_request", "dec_request"}
-    assert len(ports["outputs"]) == 1
-    output = ports["outputs"][0]
-    assert output["width"] == 3 and output["availability"] is None
-    bindings.append(f".{output['wire']}(count)")
-    destination.write_text(
+def _cli_checked(harness, label, *arguments):
+    return harness.record(
+        label,
+        [sys.executable, "-m", "pycircuit.cli", *arguments],
+        _cli(*arguments),
+    )
+
+
+def _emit(harness, *, cpp=False):
+    final = harness.root / "final.ac"
+    _cli_checked(
+        harness,
+        "link",
+        "link",
+        str(harness.root / "unit"),
+        "--top",
+        harness.receipt["selected_top"],
+        "-o",
+        str(final),
+    )
+    rtl = harness.root / "rtl"
+    _cli_checked(
+        harness,
+        "emit-rtl",
+        "emit",
+        str(final),
+        "--target",
+        "verilog",
+        "--rtl-mode",
+        "physical",
+        "-o",
+        str(rtl),
+    )
+    if cpp:
+        _cli_checked(
+            harness,
+            "emit-cpp",
+            "emit",
+            str(final),
+            "--target",
+            "cpp",
+            "-o",
+            str(harness.root / "cpp"),
+        )
+    return rtl
+
+
+def _serialize(harness, body):
+    model = harness.root / "Exported.lean"
+    harness.export("export-model", body, model)
+    driver = harness.root / "SerializeModel.lean"
+    driver.write_text(
+        "import RuleSemantics.SymbolicSerialize\n"
+        + model.read_text()
+        + """
+def main : IO Unit := do
+  match RuleSemantics.SymbolicSerialize.serialize
+      PycircuitExport.signature PycircuitExport.rules PycircuitExport.initialState
+      PycircuitExport.inputNames PycircuitExport.registerNames
+      PycircuitExport.outputNames PycircuitExport.outputRegisters with
+  | .ok encoded => IO.print encoded
+  | .error reason => throw (IO.userError reason)
+"""
+    )
+    result = harness.run(
+        "serialize-model",
+        [*harness.lean, "-DwarningAsError=true", "--run", str(driver)],
+        cwd=LEAN_ROOT,
+    )
+    json.loads(result.stdout)
+    formula = harness.root / "formula.json"
+    formula.write_text(result.stdout)
+    return model, formula
+
+
+def _validation(harness, formula, rtl):
+    def run(label, arguments, *, cwd):
+        result = harness.run(label, arguments, cwd=cwd)
+        return result.stdout + result.stderr
+
+    return RuleRtlValidation(
+        formula, rtl, harness.root, run, os.environ.get("YOSYS", "yosys")
+    )
+
+
+def _prove(harness, case, width):
+    harness.receipt["state_audit"] = case.prepare()
+    case.prove()
+    witness = case.witness()
+    maximum = (1 << width) - 1
+    assert witness[1, "dut_r0"] == witness[1, "ref_r0"] == maximum
+    assert witness[1, "related"] == 1
+    harness.receipt["verdict"] = "proved"
+
+
+def _checked_simulation(harness, case):
+    assert shutil.which("verilator"), "checked physical RTL requires Verilator"
+    for tool in ("verilator", "verilator_bin", "clang++", "g++", "make"):
+        if shutil.which(tool):
+            path = Path(shutil.which(tool)).resolve()
+            harness.receipt["tools"][tool] = {
+                "path": str(path),
+                "sha256": _sha256(path),
+            }
+    harness.run("verilator-version", ["verilator", "--version"])
+    bench = harness.root / "checked_tb.sv"
+    shutil.copyfile(FIXTURE / "checked_tb.sv", bench)
+    adapter = harness.root / "observed_counter.sv"
+    adapter.write_text(
         "module observed_counter(input wire clk, rst, inc_request, dec_request,\n"
         "output wire [2:0] count);\n"
-        + manifest["root_rtl_name"]
-        + " raw_dut("
-        + ", ".join(bindings)
-        + ");\nendmodule\n"
+        "observed_dut dut(.clk(clk),.rst(rst),.i0(inc_request),"
+        ".i1(dec_request),.o0(count));\nendmodule\n"
     )
-    return [
-        generated / row["path"] for row in manifest["files"] if row["role"] == "rtl"
-    ]
+    binary = harness.root / "verilated"
+    harness.run(
+        "checked-rtl-build",
+        [
+            "verilator",
+            "--binary",
+            "--timing",
+            "-Wno-fatal",
+            "--top-module",
+            "checked_tb",
+            "--Mdir",
+            str(binary),
+            *map(str, case.rtl_files),
+            str(harness.root / "observed_dut.sv"),
+            str(adapter),
+            str(bench),
+        ],
+    )
+    result = harness.run("checked-rtl-simulation", [str(binary / "Vchecked_tb")])
+    transcript = result.stdout + result.stderr
+    assert "PYC_FORMAL_CHECKED_RTL_PASS" in transcript
+    assert "PYCIRCUIT_PHYSICAL_FAULT" not in transcript
 
 
-def _audit_state(path):
-    design = json.loads(path.read_text())
-    assert set(design["modules"]) == {"equivalence"}
-    top = design["modules"]["equivalence"]
-    assert top.get("memories", {}) == {}
-    for obj in [top, *top["netnames"].values(), *top["cells"].values()]:
-        assert "init" not in obj.get("attributes", {}), "initial constraint survived"
-    allowed = {
-        "$dff",
-        "$mux",
-        "$add",
-        "$sub",
-        "$lt",
-        "$gt",
-        "$eq",
-        "$eqx",
-        "$and",
-        "$or",
-        "$logic_and",
-        "$logic_not",
-        "$not",
-        "$reduce_bool",
-    }
-    assert {cell["type"] for cell in top["cells"].values()} <= allowed
-    banks = [cell for cell in top["cells"].values() if cell["type"] == "$dff"]
-    assert len(banks) == 2
-    state = []
-    for bank in banks:
-        assert int(bank["parameters"]["WIDTH"], 2) == 3
-        assert int(bank["parameters"]["CLK_POLARITY"], 2) == 1
-        assert bank["connections"]["CLK"] == top["ports"]["clk"]["bits"]
-        state.extend(bank["connections"]["Q"])
-    expected = top["ports"]["dut_count"]["bits"] + top["ports"]["ref_count"]["bits"]
-    assert len(set(state)) == 6 and sorted(state) == sorted(expected)
-    return {"positive_edge_banks": 2, "state_bits": 6, "clock": "clk", "init": []}
-
-
-def _sat_values(transcript):
-    values = {}
-    for line in transcript.splitlines():
-        match = re.fullmatch(
-            r"\s*([12])\s+\\(dut_count|ref_count|matched|inc_request|dec_request)"
-            r"\s+(\d+)\s+\S+\s+[01]+\s*",
-            line,
-        )
-        if match:
-            frame, name, value = match.groups()
-            values[int(frame), name] = int(value)
-    return values
-
-
-def test_fixed_counter_artifact_refines_independent_reference(tmp_path):
-    yosys_tool = os.environ.get("YOSYS", "yosys")
-    for tool in (yosys_tool, "verilator"):
-        assert shutil.which(tool), f"formal counter artifact test requires {tool}"
-    commands = []
-    receipt = {
-        "scope": "known-two-state fixed-width3 capacity5 state-only physical RTL",
-        "status": "incomplete",
-        "commands": commands,
-    }
-
-    def record(label, arguments, result):
-        (tmp_path / f"{label}.log").write_text(result.stdout + result.stderr)
-        commands.append({"label": label, "argv": arguments, "exit": result.returncode})
-        (tmp_path / "commands.json").write_text(json.dumps(commands, indent=2) + "\n")
-        return _ok(result)
-
-    def run(label, arguments, timeout=120):
-        return record(label, arguments, _run(arguments, timeout=timeout, cwd=tmp_path))
-
-    def cli(label, *arguments):
-        return record(
-            label,
-            [sys.executable, "-m", "pycircuit.cli", *arguments],
-            _cli(*arguments),
-        )
-
-    def yosys(label, script):
-        path = tmp_path / f"{label}.ys"
-        path.write_text(script + "\n")
-        return run(label, [yosys_tool, "-s", path.name])
-
-    def yosys_path(path):
-        # YoWASP reserves absolute /tmp for its own temporary directory.
-        return json.dumps(str(path.relative_to(tmp_path)))
-
+@pytest.fixture(scope="module")
+def baseline(tmp_path_factory):
+    harness = _harness(tmp_path_factory.mktemp("automatic-original"))
     try:
-        tools = {
-            name: Path(os.environ[variable]).resolve()
-            for name, variable in (
-                ("source_compiler", "PYCIRCUIT_SOURCE_COMPILER"),
-                ("linker", "PYCIRCUIT_LINKER"),
-                ("emitter", "PYCIRCUIT_EMITTER"),
-            )
-        }
-        tools.update(
-            {
-                "yosys": Path(shutil.which(yosys_tool)).resolve(),
-                "verilator": Path(shutil.which("verilator")).resolve(),
-            }
+        body = harness.compile(ORIGINAL, "GuardedCounter")
+        model, formula = _serialize(harness, body)
+        harness.check(
+            model,
+            _obligations(3, ["inc_request", "dec_request"], "count", "original")
+            + """
+namespace ExportAcceptance
+theorem mutation_baseline_literals :
+    execute ⟨true, false⟩ 4 = 5 ∧ execute ⟨true, false⟩ 0 = 1 ∧
+    execute RuleSemantics.Counter.both 0 = 0 := by
+  decide
+#print axioms mutation_baseline_literals
+end ExportAcceptance
+""",
         )
-        tools["python"] = Path(sys.executable).resolve()
-        for name in ("verilator_bin", "clang++", "g++", "make"):
-            if shutil.which(name):
-                tools[name] = Path(shutil.which(name)).resolve()
-        receipt["tools"] = {
-            name: {"path": str(path), "sha256": _sha256(path)}
-            for name, path in tools.items()
+        rtl = _emit(harness, cpp=True)
+        case = _validation(harness, formula, rtl)
+        _prove(harness, case, 3)
+        _checked_simulation(harness, case)
+        paths = {
+            "source": harness.root / "source" / ORIGINAL.name,
+            "model": model,
+            "formula": formula,
+            "reference": case.reference_path,
         }
-        toolchain = Path(os.environ["PYC_TOOLCHAIN_ROOT"]).resolve()
-        receipt["toolchain_root"] = str(toolchain)
-        metadata = toolchain / "share/pycircuit/toolchain-metadata.json"
-        receipt["toolchain_metadata"] = {
-            "path": str(metadata),
-            "sha256": _sha256(metadata),
-            "content": json.loads(metadata.read_text()),
-        }
-        if "yowasp" in tools["yosys"].name:
-            distribution = importlib.metadata.distribution("yowasp-yosys")
-            wasm = [
-                Path(distribution.locate_file(path))
-                for path in distribution.files
-                if str(path).endswith(".wasm")
-            ]
-            assert wasm, "yowasp executable must bind its actual WASM implementation"
-            receipt["yosys_wasm"] = {str(path): _sha256(path) for path in wasm}
-            receipt["yowasp_versions"] = {
-                name: importlib.metadata.version(name)
-                for name in ("yowasp-yosys", "yowasp-runtime", "wasmtime")
-            }
-        run("yosys-version", [yosys_tool, "-V"])
-        run("verilator-version", ["verilator", "--version"])
-        receipt["revision"] = run(
-            "revision", ["git", "-C", str(ROOT), "rev-parse", "HEAD"]
-        ).strip()
-        receipt["inputs"] = {
-            str(path.relative_to(ROOT)): _sha256(path)
-            for path in [
-                Path(__file__),
-                *sorted(FIXTURE.glob("*")),
-                *sorted((ROOT / "formal/lean").rglob("*.lean")),
-                ROOT / "formal/lean/lean-toolchain",
-            ]
-            if path.is_file()
-        }
-        for name in ("counter_reference.sv", "checked_tb.sv"):
-            shutil.copyfile(FIXTURE / name, tmp_path / name)
-        source_text = (FIXTURE / "guarded_counter.py").read_text()
-        forward = "ac.schedule(increment, decrement)"
-        assert source_text.count(forward) == 1
-        normalized = {}
-        for name, text in (
-            ("positive", source_text),
-            (
-                "reversed",
-                source_text.replace(forward, "ac.schedule(decrement, increment)"),
-            ),
-        ):
-            directory = tmp_path / name
-            source = directory / "source"
-            source.mkdir(parents=True)
-            (source / "guarded_counter.py").write_text(text)
-            unit = directory / "unit"
-            record(
-                name + "-compile",
-                [
-                    sys.executable,
-                    "-m",
-                    "pycircuit.cli",
-                    "compile",
-                    "-c",
-                    str(source / "guarded_counter.py"),
-                    "--source-root",
-                    str(source),
-                    "--package-prefix",
-                    "checks",
-                    "-o",
-                    str(unit),
-                ],
-                _compile(source, "guarded_counter.py", unit),
-            )
-            final = directory / "final.ac"
-            cli(
-                name + "-link",
-                "link",
-                str(unit),
-                "--top",
-                "checks.guarded_counter.GuardedCounter",
-                "-o",
-                str(final),
-            )
-            rtl = directory / "rtl"
-            cli(
-                name + "-emit-rtl",
-                "emit",
-                str(final),
-                "--target",
-                "verilog",
-                "--rtl-mode",
-                "physical",
-                "-o",
-                str(rtl),
-            )
-            if name == "positive":
-                cli(
-                    name + "-emit-cpp",
-                    "emit",
-                    str(final),
-                    "--target",
-                    "cpp",
-                    "-o",
-                    str(directory / "cpp"),
-                )
-            wrapper = directory / "observed_counter.sv"
-            closure = _wrapper(rtl, wrapper)
-            miter = directory / "equivalence.sv"
-            miter.write_text(
-                "module equivalence(input wire clk, rst, inc_request, dec_request,\n"
-                "output wire [2:0] dut_count, ref_count, output wire matched);\n"
-                "observed_counter dut(clk, rst, inc_request, dec_request, dut_count);\n"
-                "counter_reference ref_model(clk, rst, inc_request, dec_request, ref_count);\n"
-                "assign matched = (dut_count == ref_count);\nendmodule\n"
-            )
-            il, netlist = directory / "normalized.il", directory / "normalized.json"
-            quoted = " ".join(
-                yosys_path(path)
-                for path in [
-                    *closure,
-                    wrapper,
-                    tmp_path / "counter_reference.sv",
-                    miter,
-                ]
-            )
-            yosys(
-                name + "-normalize",
-                f"read_verilog -sv -D SYNTHESIS {quoted}\n"
-                "hierarchy -check -top equivalence\nproc -noopt\nflatten -noscopeinfo\n"
-                "setattr -unset init\nsetattr -mod -unset init\n"
-                "opt_clean\ndffunmap\nopt_clean\n"
-                f"write_rtlil {yosys_path(il)}\nwrite_json {yosys_path(netlist)}",
-            )
-            receipt[name + "_state_audit"] = _audit_state(netlist)
-            normalized[name] = il
-            if name == "positive":
-                binary = directory / "verilated"
-                run(
-                    "checked-rtl-build",
-                    [
-                        "verilator",
-                        "--binary",
-                        "--timing",
-                        "-Wno-fatal",
-                        "--top-module",
-                        "checked_tb",
-                        "--Mdir",
-                        str(binary),
-                        *map(str, closure),
-                        str(wrapper),
-                        str(tmp_path / "checked_tb.sv"),
-                    ],
-                    timeout=180,
-                )
-                simulation = run(
-                    "checked-rtl-simulation", [str(binary / "Vchecked_tb")]
-                )
-                assert "PYC_FORMAL_CHECKED_RTL_PASS" in simulation
-                assert "PYCIRCUIT_PHYSICAL_FAULT" not in simulation
-        show = " ".join("-show " + signal for signal in SIGNALS)
-        positive = f"read_rtlil {yosys_path(normalized['positive'])}\n"
-        proof = yosys(
-            "positive-step-sat",
-            positive + "sat -seq 2 -set rst 0 -set-at 1 matched 1 "
-            f"-prove matched 1 -prove-skip 1 -verify {show}",
-        )
-        assert "SAT proof finished - no model found: SUCCESS!" in proof
-        witness = yosys(
-            "unconstrained-initial-seven",
-            positive
-            + f"sat -seq 1 -set rst 0 -set dut_count 7 -set ref_count 7 {show}",
-        )
-        values = _sat_values(witness)
-        assert values[1, "dut_count"] == values[1, "ref_count"] == 7
-        assert values[1, "matched"] == 1
-        mutant = yosys(
-            "reversed-schedule-counterexample",
-            f"read_rtlil {yosys_path(normalized['reversed'])}\n"
-            "sat -seq 2 -set rst 0 -set-at 1 dut_count 0 -set-at 1 ref_count 0 "
-            "-set-at 1 inc_request 1 -set-at 1 dec_request 1 "
-            f"-prove matched 1 -prove-skip 1 {show}",
-        )
-        assert "SAT proof finished - model found: FAIL!" in mutant
-        values = _sat_values(mutant)
-        assert values[1, "dut_count"] == values[1, "ref_count"] == 0
-        assert values[1, "inc_request"] == values[1, "dec_request"] == 1
-        assert values[2, "dut_count"] == 1 and values[2, "ref_count"] == 0
-        assert values[2, "matched"] == 0
-        receipt["mutant_counterexample"] = {
-            "initial": 0,
-            "increment": 1,
-            "decrement": 1,
-            "dut_next": 1,
-            "reference_next": 0,
-        }
-        receipt["status"] = "passed"
+        frozen = {name: _sha256(path) for name, path in paths.items()}
+        harness.receipt["frozen_reference"] = frozen
+        harness.receipt["status"] = "passed"
+        yield formula, paths, frozen
     finally:
-        receipt["artifacts"] = {
-            str(path.relative_to(tmp_path)): _sha256(path)
-            for path in sorted(tmp_path.rglob("*"))
-            if path.is_file() and path.name != "receipt.json"
-        }
-        (tmp_path / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+        harness.finish()
+
+
+@pytest.fixture
+def artifact(tmp_path):
+    harness = _harness(tmp_path)
+    try:
+        yield harness
+    finally:
+        harness.finish()
+
+
+def test_original_automatic_model_proves_and_checked_rtl_runs(baseline):
+    _, paths, frozen = baseline
+    assert {name: _sha256(path) for name, path in paths.items()} == frozen
+
+
+def test_renamed_automatic_model_proves(artifact):
+    body = artifact.compile(FIXTURES / "renamed_counter.py", "RenamedCounter")
+    _, formula = _serialize(artifact, body)
+    case = _validation(artifact, formula, _emit(artifact))
+    _prove(artifact, case, 4)
+    artifact.receipt["status"] = "passed"
+
+
+@pytest.mark.parametrize(
+    "name,before,after,current,requests,dut_next,reference_next",
+    [
+        ("guard", "count < 5", "count < 4", 4, [1, 0], 4, 5),
+        ("arithmetic", "count = count + 1", "count = count + 2", 0, [1, 0], 2, 1),
+        (
+            "order",
+            "ac.schedule(increment, decrement)",
+            "ac.schedule(decrement, increment)",
+            0,
+            [1, 1],
+            1,
+            0,
+        ),
+    ],
+)
+def test_mutated_dut_has_semantic_counterexample(
+    artifact, baseline, name, before, after, current, requests, dut_next, reference_next
+):
+    formula, paths, frozen = baseline
+    assert {key: _sha256(path) for key, path in paths.items()} == frozen
+    source = paths["source"].read_text()
+    assert source.count(before) == 1
+    mutated = artifact.root / "mutation"
+    mutated.mkdir()
+    fixture = mutated / ORIGINAL.name
+    fixture.write_text(source.replace(before, after))
+    assert _sha256(fixture) != frozen["source"]
+    artifact.compile(fixture, "GuardedCounter")
+    case = _validation(artifact, formula, _emit(artifact))
+    artifact.receipt["state_audit"] = case.prepare()
+    assert _sha256(case.reference_path) == frozen["reference"]
+    values = case.counterexample([current], requests)
+    assert values[2, "dut_r0"] == values[2, "dut_o0"] == dut_next
+    assert values[2, "ref_r0"] == values[2, "ref_o0"] == reference_next
+    assert values[2, "matched"] == 0
+    assert {key: _sha256(path) for key, path in paths.items()} == frozen
+    artifact.receipt["fixed_reference"] = frozen
+    artifact.receipt["counterexample"] = {
+        "mutation": name,
+        "current": current,
+        "inputs": requests,
+        "dut_next": dut_next,
+        "reference_next": reference_next,
+    }
+    artifact.receipt["verdict"] = "counterexample"
+    artifact.receipt["status"] = "passed"
+
+
+def test_hidden_register_is_rejected_before_proof(artifact):
+    body = artifact.compile(FIXTURES / "hidden_register.py", "HiddenRegister")
+    _, formula = _serialize(artifact, body)
+    data = json.loads(formula.read_text())
+    assert len(data["registers"]) == 2
+    assert {output["register"] for output in data["outputs"]} == {0}
+    case = _validation(artifact, formula, _emit(artifact))
+    with pytest.raises(ValidationProfileError, match="observ|cover"):
+        case.prepare()
+    artifact.receipt["verdict"] = "unsupported-profile"
+    artifact.receipt["status"] = "passed"

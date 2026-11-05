@@ -2,6 +2,8 @@ import RuleSemantics.Acceptance
 import RuleSemantics.BitVecAcceptance
 import RuleSemantics.CounterReferenceAcceptance
 import RuleSemantics.SyntaxAcceptance
+import RuleSemantics.SymbolicAcceptance
+import RuleSemantics.SymbolicSerialize
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -82,3 +84,14 @@ import RuleSemantics.SyntaxAcceptance
 #print axioms RuleSemantics.SyntaxAcceptance.late_require_rolls_back_both_registers
 #print axioms RuleSemantics.SyntaxAcceptance.separate_roots_retain_preceding_writes
 #print axioms RuleSemantics.SyntaxAcceptance.counter_ordering
+#print axioms RuleSemantics.Symbolic.cache_eq
+#print axioms RuleSemantics.Symbolic.cacheBank_eq
+#print axioms RuleSemantics.Symbolic.eval_writeBank
+#print axioms RuleSemantics.Symbolic.expression_correct
+#print axioms RuleSemantics.Symbolic.command_correct
+#print axioms RuleSemantics.Symbolic.rule_correct
+#print axioms RuleSemantics.Symbolic.schedule_correct
+#print axioms RuleSemantics.Symbolic.nextState_correct
+#print axioms RuleSemantics.SymbolicAcceptance.heterogeneous_forwarding
+#print axioms RuleSemantics.SymbolicAcceptance.late_require_rolls_back
+#print axioms RuleSemantics.SymbolicAcceptance.separate_root_rejection_holds_predecessor

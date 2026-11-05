@@ -99,7 +99,10 @@ capacity-nine variant checks that names, widths and constants are extracted.
 A separately compiled reversed schedule must retain its different behavior.
 One stale-snapshot case checks rejection without partial publication.
 
-Existing actual RTL equivalence/checked simulation remains a separate test.
+The [automatic artifact validation](VALIDATION.md) executes this exported model
+through a proved symbolic lowerer and serializes its transition to generate a
+reference for RTL from the same compiled unit. Checked RTL simulation remains
+an independent observation check.
 This export is a known-two-state, reset-inactive model of state transitions.
 It does not prove reset, X/Z, fault behavior, physical timing or events.
 The Python-to-typed-IR path and the native exporter remain trusted components:
