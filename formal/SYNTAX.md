@@ -10,7 +10,8 @@ A finite signature declares register widths and input types. Registers contain
 fixed-width unsigned BitVec values; inputs may be Boolean or BitVec values.
 Expressions are indexed by their value type. Constructors represent literals,
 register reads, input reads, same-width modular addition/subtraction, unsigned
-less-than, equality, Boolean conjunction and negation. Expressions contain no
+less-than, equality, Boolean conjunction and negation, typed conditionals,
+Boolean-to-Bits(1) conversion and high/low concatenation. Expressions contain no
 arbitrary Lean functions that could hide a program's transition semantics.
 Evaluation is pure and total. Mixed-width arithmetic and ill-typed writes are
 excluded by the syntax's type indices.

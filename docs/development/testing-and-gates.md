@@ -27,6 +27,8 @@ Use two entry points over the existing CTest, lit, pytest and example verifier:
 ```bash
 bash tools/run_api_tests.sh --tier gate
 bash tools/run_examples.sh --tier gate
+# Opt in to Lean contracts/library and actual RTL validation after API gate:
+bash tools/run_api_tests.sh --tier gate --formal
 # Full registered coverage, including the gate subset:
 bash tools/run_api_tests.sh --tier nightly
 bash tools/run_examples.sh --tier nightly
@@ -91,6 +93,28 @@ Each executed entry point records its selected CTest names and count under
 A failed or empty run cannot publish a pass; `--list` publishes no pass summary.
 Nightly and release run each category once with `--tier nightly`. A focused gate
 result must not be reported as a full nightly result.
+
+### Optional Rule formal validation
+
+`tools/run_api_tests.sh --tier gate --formal` runs the ordinary API gate, builds
+the pinned Lean project, audits principal theorem axioms, and runs the exporter,
+artifact and source-library pytest modules. `--list --formal` lists that extra
+scope without claiming execution. The default API gate does not imply this
+optional formal coverage.
+
+Set `PYC_LAKE` if `lake` is not on PATH; `PYC_LEAN` may select an adapter invoking
+the actual Lean checker for pytest. The formal profile also requires Yosys
+(`YOSYS` may select it), Verilator, Icarus and the installed CompilerDev toolchain.
+Missing tools fail the run. Lean/pytest logs, formal test selection and JUnit
+results are retained with the existing API gate evidence. Generated artifacts
+use `PYC_FORMAL_WORK_DIR` or the dedicated `formal-artifacts` directory beneath
+the native build; pytest clears that directory. Keep its path free of spaces
+for Verilator's make build. See `formal/LIBRARY.md` for exact semantics and limits.
+
+With `--formal`, a failed API stage still allows the requested formal checks to
+run. `stage-status.txt` records the individual exit statuses; any failed stage
+keeps the overall command unsuccessful and prevents a pass summary. Without
+`--formal`, the API entry retains its fail-fast behavior.
 
 ## Oracle ownership and scheduled coverage
 

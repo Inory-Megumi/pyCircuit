@@ -29,8 +29,9 @@ rejects export rather than truncating or substituting a model.
 Output imports `RuleSemantics.Syntax` and defines deterministic data in namespace
 `PycircuitExport`: `signature`, `initialState`, individual Rule definitions and
 the ordered `rules` list. Register/input names and indices accompany the model.
-Public output names map to register indices; this initial profile admits only
-direct state observations, including verified identity wiring. Names are quoted
+`definitionName` and `registerKeys` bind the selected definition and verified
+source owner occurrences. `outputExpressions : List (Output signature)` contains
+typed packed observations over committed state and inputs. Names are quoted
 data, never interpolated as Lean identifiers or used to choose semantics.
 
 The output contains closed syntax data, not emitted counter-specific evaluators
@@ -59,10 +60,13 @@ silently assigned sequential forwarding semantics.
 The initial expression profile admits known Bits constants, module data inputs,
 whole-register candidate reads, same-width add/sub, and verified identity
 extract/resize. Predicate contexts additionally admit unsigned comparisons,
-equality, and one-bit conjunction/negation. Bits(1) inputs remain Bits(1), with
+equality, one-bit conjunction/disjunction/negation, and typed conditional
+selection. Bits(1) inputs remain Bits(1), with
 predicate interpretation explicitly represented by equality to one. Comparison
-results used as Bits payloads are rejected while the syntax lacks Bool-to-Bits
-conversion. Unsupported operations are rejected even if a narrower use might
+results used as Bits payloads explicitly convert through `Expr.bit`. Constructed
+Struct outputs concatenate fields in declared most-significant-first order.
+Inputs and registers remain Bits; general record accesses and source branches
+are outside this export profile. Unsupported operations are rejected even if a narrower use might
 otherwise ignore them.
 
 Bodies contain ordered whole-register writes on proven-true authored paths.
@@ -84,6 +88,9 @@ not the forwarded state at a later root's entry. Initially only module data
 inputs and known literals, optionally through verified identity wiring, may be
 captured. Root-local current-state reads must use the analysis's explicit read
 bindings; a raw module state result is not a substitute for such a binding.
+Only the separate public-output traversal may read module state directly; those
+expressions observe committed state, not a Rule's current candidate. This does
+not relax the capture or stale-SSA restrictions inside Rules.
 
 For example, `saved = count; count = count + 1; count = saved + 1` must not become
 two dynamic register increments. A stale saved read is rejected until the

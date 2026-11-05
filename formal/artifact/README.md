@@ -19,11 +19,13 @@ The existing pytest suite at `tests/system/test_formal_counter_artifact.py`
 binds public ports using `ports.json` and loads the full RTL inventory from
 `generated.json`. The test adapter only binds ports. Yosys lowers and flattens
 the original emitted RTL, removes initialization attributes, and audits that
-all state consists of the expected disjoint positive-edge DFF banks. Public
-outputs must cover every model register; hidden state is rejected before SAT.
+all state consists of the expected disjoint positive-edge DFF banks. Source-owner
+identities and actual emitted storage paths identify hidden registers too;
+an incomplete state map is rejected before SAT.
 
 With reset held low, SAT assumes equal arbitrary register states in frame one
-and proves equal next states and all public outputs in frame two. An all-ones
+and checks public outputs immediately, then proves equal next states and all
+public outputs in frame two. An all-ones
 state witness checks that initialization did not restrict the relation.
 The original case includes all eight encoded current states, even unreachable
 counts six and seven. The renamed case likewise includes all sixteen states.

@@ -54,6 +54,10 @@ inductive Expr (signature : Signature) : ValueType → Type where
   | eq (left right : Expr signature type) : Expr signature .bool
   | and (left right : Expr signature .bool) : Expr signature .bool
   | not (value : Expr signature .bool) : Expr signature .bool
+  | ite (condition : Expr signature .bool) (yes no : Expr signature type) : Expr signature type
+  | bit (value : Expr signature .bool) : Expr signature (.bits 1)
+  | concat (high : Expr signature (.bits m)) (low : Expr signature (.bits n)) :
+      Expr signature (.bits (m + n))
 
 def valueEqual (type : ValueType) : type.denote → type.denote → Bool :=
   match type with
@@ -73,6 +77,14 @@ def evalExpr (expression : Expr signature type) (input : Inputs signature)
   | .eq left right => valueEqual _ (evalExpr left input state) (evalExpr right input state)
   | .and left right => evalExpr left input state && evalExpr right input state
   | .not value => !(evalExpr value input state)
+  | .ite condition yes no =>
+    if evalExpr condition input state then evalExpr yes input state else evalExpr no input state
+  | .bit value => BitVec.ofBool (evalExpr value input state)
+  | .concat high low => (evalExpr high input state).append (evalExpr low input state)
+
+structure Output (signature : Signature) where
+  width : Nat
+  expression : Expr signature (.bits width)
 
 inductive Command (signature : Signature) where
   | skip

@@ -1097,6 +1097,18 @@ public:
     };
     auto payloadType = local("payload_t"), value = local("value");
     auto probe = local("check_payload"), payloadX = local("payload_x_check"), packedX = local("packed_x_check");
+    if (presentation && !collection) {
+      // Connect the verified source occurrence to the identifiers actually
+      // emitted below. This is metadata only; it adds no functional ports.
+      auto packedWidth = context.analysis.getPackedWidth(*payload, bindings, occurrence);
+      if (failed(packedWidth)) return failure();
+      std::string identity;
+      llvm::raw_string_ostream identityStream(identity);
+      if (auto key = occurrence->getAttr("occurrence")) key.print(identityStream);
+      presentation->recordStorage(llvm::json::Object{
+          {"owner", identity}, {"name", owner.str()}, {"kind", kind.str()},
+          {"width", *packedWidth}, {"path", llvm::json::Array{scope, value}}});
+    }
     if (collection)
       out << "  for (genvar " << lane << "=0; " << lane << " < (" << count
           << "); ++" << lane << ") begin : " << scope << "\n";

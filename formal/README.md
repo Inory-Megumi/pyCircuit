@@ -15,6 +15,8 @@ the native compiler's published source artifact within a deliberately bounded
 profile. It preserves the existing capture/compile/link/emit route.
 The [symbolic validation](VALIDATION.md) proves lowering from Rule syntax to
 typed transition terms and compares a serialized model with same-unit RTL.
+The [contract and source-library stage](LIBRARY.md) extends that route to
+internal state, computed observations, Rule contracts and reusable buffers.
 
 ## Reproduce
 
@@ -45,6 +47,9 @@ kernel-checked `decide`; arithmetic obligations use Lean's proof-producing
 from an admitted proof such as `sorryAx`. The trusted foundation includes Lean's
 kernel and the installed official toolchain; this experiment does not verify
 the theorem prover itself.
+Current contract commutation and counter-library proofs additionally use Lean's
+standard `Classical.choice`; it is reported explicitly alongside `propext` and
+`Quot.sound`. No custom axiom or admitted proof is used.
 
 ## Execution model
 
@@ -94,6 +99,9 @@ hardware realizability, infers resources, or establishes frontend admission.
 | [Symbolic.lean](lean/RuleSemantics/Symbolic.lean) | Typed symbolic terms, finite cached banks, and expression/command/Rule/schedule state correspondence with the syntax interpreter. |
 | [SymbolicSerialize.lean](lean/RuleSemantics/SymbolicSerialize.lean) | Bounded executable lowering and JSON serialization; output encoding remains trusted. |
 | [SymbolicAcceptance.lean](lean/RuleSemantics/SymbolicAcceptance.lean) | Independent literal checks of heterogeneous forwarding, rollback and preservation of earlier roots after symbolic lowering. |
+| [Contracts.lean](lean/RuleSemantics/Contracts.lean) | Pre/postconditions, sequential composition, frame/read-write locality, and sufficient independence for commutation and snapshot merge. |
+| [Library.lean](lean/RuleSemantics/Library.lean) | Register, ordered counter, single-entry FIFO and two-entry FIFO models; abstract list correspondence and capacity/history properties. |
+| [LibraryAcceptance.lean](lean/RuleSemantics/LibraryAcceptance.lean) | Independent frame/commutation checks, an order-sensitive guard dependency, and full FIFO replacement with arbitrary payloads. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does
@@ -203,7 +211,8 @@ serializer and a verification-only SV encoder replaces the handwritten SV
 reference. Yosys compares arbitrary related states across one clock edge.
 The original counter and a renamed four-bit variant exercise this route;
 guard, arithmetic and schedule mutations require concrete semantic mismatches.
-Hidden state is rejected by the current observation profile.
+Hidden state is bound through verified source-owner identities and actual
+emitted storage paths. All stored state remains part of the relation.
 
 This connection covers state and public outputs of each generated artifact's
 known-two-state, reset-deasserted synthesis projection. Model extraction,

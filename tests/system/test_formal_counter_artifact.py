@@ -120,8 +120,8 @@ def _serialize(harness, body):
 def main : IO Unit := do
   match RuleSemantics.SymbolicSerialize.serialize
       PycircuitExport.signature PycircuitExport.rules PycircuitExport.initialState
-      PycircuitExport.inputNames PycircuitExport.registerNames
-      PycircuitExport.outputNames PycircuitExport.outputRegisters with
+      PycircuitExport.definitionName PycircuitExport.inputNames PycircuitExport.registerNames
+      PycircuitExport.registerKeys PycircuitExport.outputNames PycircuitExport.outputExpressions with
   | .ok encoded => IO.print encoded
   | .error reason => throw (IO.userError reason)
 """
@@ -308,14 +308,32 @@ def test_mutated_dut_has_semantic_counterexample(
     artifact.receipt["status"] = "passed"
 
 
-def test_hidden_register_is_rejected_before_proof(artifact):
+def test_hidden_register_automatic_model_proves(artifact):
     body = artifact.compile(FIXTURES / "hidden_register.py", "HiddenRegister")
     _, formula = _serialize(artifact, body)
     data = json.loads(formula.read_text())
     assert len(data["registers"]) == 2
-    assert {output["register"] for output in data["outputs"]} == {0}
     case = _validation(artifact, formula, _emit(artifact))
-    with pytest.raises(ValidationProfileError, match="observ|cover"):
+    _prove(artifact, case, 3)
+    artifact.receipt["status"] = "passed"
+
+
+def test_incomplete_state_map_is_rejected_before_proof(artifact):
+    body = artifact.compile(FIXTURES / "hidden_register.py", "HiddenRegister")
+    _, formula = _serialize(artifact, body)
+    rtl = _emit(artifact)
+    mapping_path = rtl / "rtl-names.json"
+    mapping = json.loads(mapping_path.read_text())
+    definition = next(
+        row
+        for row in mapping["definitions"]
+        if row["definition"] == artifact.receipt["selected_top"]
+    )
+    assert len(definition["storage"]) == 2
+    definition["storage"].pop()
+    mapping_path.write_text(json.dumps(mapping))
+    case = _validation(artifact, formula, rtl)
+    with pytest.raises(ValidationProfileError, match="cover|mapping"):
         case.prepare()
     artifact.receipt["verdict"] = "unsupported-profile"
     artifact.receipt["status"] = "passed"

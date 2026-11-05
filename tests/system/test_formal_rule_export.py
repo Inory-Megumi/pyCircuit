@@ -165,8 +165,13 @@ class ExportRun:
         )
         transcript = checked.stdout + checked.stderr
         assert "sorryAx" not in transcript
-        for dependencies in re.findall(r"depends on axioms: \[([^]]*)\]", transcript):
-            assert set(filter(None, dependencies.split(", "))) <= {
+        for dependencies in re.findall(r"depends on axioms:\s*\[([^]]*)\]", transcript):
+            parsed = {
+                dependency.strip()
+                for dependency in dependencies.split(",")
+                if dependency.strip()
+            }
+            assert parsed <= {
                 "propext",
                 "Quot.sound",
             }
@@ -199,7 +204,8 @@ open RuleSemantics RuleSemantics.Syntax PycircuitExport
 theorem exported_interface :
     signature.nr = 1 ∧ signature.ni = 2 ∧ signature.regWidth 0 = {width} ∧
     inputNames = {json.dumps(input_names)} ∧ registerNames = ["{register_name}"] ∧
-    outputNames = ["result"] ∧ outputRegisters = [0] ∧ initialState 0 = 0 := by
+    outputNames = ["result"] ∧ outputExpressions.length = 1 ∧
+    registerKeys.length = 1 ∧ initialState 0 = 0 := by
   decide
 
 def bindRequests (request : Counter.Requests) : Inputs signature :=
@@ -221,6 +227,11 @@ def execute (request : Counter.Requests) (count : BitVec {width}) : BitVec {widt
   (runSchedule (rules.map interpretRule) (bindRequests request) (state count)).1 0
 
 #print axioms exported_interface
+
+theorem exported_observation (input : Inputs signature) (current : State signature) :
+    (evalExpr (outputExpressions[0]'(by decide)).expression input current).toNat =
+      (current 0).toNat := by rfl
+#print axioms exported_observation
 """
     if mode == "reversed":
         return (

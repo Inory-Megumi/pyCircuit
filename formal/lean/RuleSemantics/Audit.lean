@@ -4,6 +4,8 @@ import RuleSemantics.CounterReferenceAcceptance
 import RuleSemantics.SyntaxAcceptance
 import RuleSemantics.SymbolicAcceptance
 import RuleSemantics.SymbolicSerialize
+import RuleSemantics.Library
+import RuleSemantics.LibraryAcceptance
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -95,3 +97,42 @@ import RuleSemantics.SymbolicSerialize
 #print axioms RuleSemantics.SymbolicAcceptance.heterogeneous_forwarding
 #print axioms RuleSemantics.SymbolicAcceptance.late_require_rolls_back
 #print axioms RuleSemantics.SymbolicAcceptance.separate_root_rejection_holds_predecessor
+#print axioms RuleSemantics.Contracts.rule_contract_of_candidates
+#print axioms RuleSemantics.Contracts.schedule_cons_contract
+#print axioms RuleSemantics.Contracts.invariant_contract_iff
+#print axioms RuleSemantics.Contracts.expression_local
+#print axioms RuleSemantics.Contracts.command_frame
+#print axioms RuleSemantics.Contracts.rule_frame
+#print axioms RuleSemantics.Contracts.rule_local
+#print axioms RuleSemantics.Contracts.commute_of_independent
+#print axioms RuleSemantics.Contracts.snapshot_merge_of_independent
+#print axioms RuleSemantics.Library.Queue.step_bounded
+#print axioms RuleSemantics.Library.Queue.run_bounded
+#print axioms RuleSemantics.Library.Register8.cycle_correct
+#print axioms RuleSemantics.Library.Register8.initial_zero
+#print axioms RuleSemantics.Library.Counter3.cycle_correct
+#print axioms RuleSemantics.Library.Counter3.history_refines
+#print axioms RuleSemantics.Library.Counter3.history_nat_refines
+#print axioms RuleSemantics.Library.Counter3.every_prefix_bounded
+#print axioms RuleSemantics.Library.Counter3.initial_bounded
+#print axioms RuleSemantics.Library.Slot8.initial_empty
+#print axioms RuleSemantics.Library.Slot8.cycle_refines
+#print axioms RuleSemantics.Library.Slot8.observation_correct
+#print axioms RuleSemantics.Library.Slot8.history_refines
+#print axioms RuleSemantics.Library.Slot8.every_prefix_bounded
+#print axioms RuleSemantics.Library.Fifo2x8.initial_valid
+#print axioms RuleSemantics.Library.Fifo2x8.rule_invariant_contract
+#print axioms RuleSemantics.Library.Fifo2x8.rule_locally_preserves
+#print axioms RuleSemantics.Library.Fifo2x8.enqueue_phase_refines
+#print axioms RuleSemantics.Library.Fifo2x8.cycle_refines
+#print axioms RuleSemantics.Library.Fifo2x8.cycle_preserves
+#print axioms RuleSemantics.Library.Fifo2x8.project_length
+#print axioms RuleSemantics.Library.Fifo2x8.observation_correct
+#print axioms RuleSemantics.Library.Fifo2x8.history_refines
+#print axioms RuleSemantics.Library.Fifo2x8.history_preserves
+#print axioms RuleSemantics.Library.Fifo2x8.every_prefix_bounded
+#print axioms RuleSemantics.LibraryAcceptance.distinct_fields_independent
+#print axioms RuleSemantics.LibraryAcceptance.narrow_frame_contract
+#print axioms RuleSemantics.LibraryAcceptance.independent_orders_and_snapshot_agree
+#print axioms RuleSemantics.LibraryAcceptance.guard_dependency_changes_order
+#print axioms RuleSemantics.LibraryAcceptance.fifo_full_replacement

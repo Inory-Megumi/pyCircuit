@@ -813,18 +813,21 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     parts.sourceGroups.push_back(std::move(group));
   }
   std::string wrapper;
-  if (physical) {
-    llvm::raw_string_ostream out(parts.presentationMap);
-    out << llvm::formatv("{0:2}\n", llvm::json::Value(llvm::json::Object{
-        {"kind", "pycircuit.rtl-names"}, {"version", 1},
-        {"definitions", std::move(presentation)}}));
-  }
   {
     llvm::raw_string_ostream out(wrapper);
     if (failed(emitWrapper(context, *root, parts.rootRtlName,
                            context.names(*root).rtl, out)))
       return failure();
     out.flush();
+  }
+  if (physical) {
+    llvm::raw_string_ostream out(parts.presentationMap);
+    out << llvm::formatv("{0:2}\n", llvm::json::Value(llvm::json::Object{
+        {"kind", "pycircuit.rtl-names"}, {"version", 1},
+        {"state_mapping", llvm::json::Object{
+            {"version", 1}, {"definition", root->getSymName().str()},
+            {"root_instance", context.rtlGeneratedName(*root, "dut", "dut")}}},
+        {"definitions", std::move(presentation)}}));
   }
   {
     // Rendering every definition, nominal type and wrapper first discovers

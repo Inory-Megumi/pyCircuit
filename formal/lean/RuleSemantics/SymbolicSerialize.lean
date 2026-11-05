@@ -46,6 +46,14 @@ private def checkExpr (expression : Expr signature type) (depth : Nat) : Build U
     checkExpr left (depth + 1)
     checkExpr right (depth + 1)
   | .not value => checkExpr value (depth + 1)
+  | .bit value => checkExpr value (depth + 1)
+  | .concat high low =>
+    checkExpr high (depth + 1)
+    checkExpr low (depth + 1)
+  | .ite condition yes no =>
+    checkExpr condition (depth + 1)
+    checkExpr yes (depth + 1)
+    checkExpr no (depth + 1)
 
 private def checkCommand (command : Command signature) (depth : Nat) : Build Unit := do
   checkDepth depth
@@ -69,23 +77,27 @@ private def countNames (names : List String) : Build Nat := do
   return count
 
 private def preflight (signature : Signature) (rules : List (RuleDef signature))
-    (inputNames registerNames outputNames : List String)
-    (outputRegisters : List (Fin signature.nr)) : Build Unit := do
+    (definitionName : String) (inputNames registerNames registerKeys outputNames : List String)
+    (outputExpressions : List (Output signature)) : Build Unit := do
   if signature.nr > 64 || signature.ni > 64 then
     throw "hardware formula supports at most 64 registers and 64 inputs"
-  pay (1 + signature.nr)
+  pay (1 + 2 * signature.nr)
+  let _ ← countNames [definitionName]
   for index in List.finRange signature.ni do
     checkType (signature.inputType index)
   for register in List.finRange signature.nr do
     checkType (.bits (signature.regWidth register))
   if (← countNames inputNames) != signature.ni then throw "input name count differs from signature"
   if (← countNames registerNames) != signature.nr then throw "register name count differs from signature"
+  if (← countNames registerKeys) != signature.nr then throw "register owner count differs from signature"
   let outputCount ← countNames outputNames
   let mut registerCount := 0
-  for _ in outputRegisters do
+  for output in outputExpressions do
     pay
+    checkType (.bits output.width)
+    checkExpr output.expression 1
     registerCount := registerCount + 1
-  if outputCount != registerCount then throw "output name/register mapping counts differ"
+  if outputCount != registerCount then throw "output name/expression counts differ"
   for rule in rules do
     pay (1 + signature.nr)
     checkExpr rule.guard 1
@@ -212,12 +224,26 @@ private def emitTerm (term : Term signature type) (depth : Nat) : Build Unit := 
     append ","
     emitTerm no (depth + 1)
     append "]"
+  | .bit value =>
+    startTerm "bit" type
+    append ",\"args\":["
+    emitTerm value (depth + 1)
+    append "]"
+  | .concat high low =>
+    startTerm "concat" type
+    append ",\"args\":["
+    emitTerm high (depth + 1)
+    append ","
+    emitTerm low (depth + 1)
+    append "]"
   append "}"
 
 private def emitModel (signature : Signature) (initialState : State signature)
-    (inputNames registerNames outputNames : List String)
-    (outputRegisters : List (Fin signature.nr)) (bank : Bank signature) : Build Unit := do
-  append "{\"schema\":\"pycircuit-rule-transition-v1\",\"inputs\":["
+    (definitionName : String) (inputNames registerNames registerKeys outputNames : List String)
+    (outputExpressions : List (Output signature)) (bank : Bank signature) : Build Unit := do
+  append "{\"schema\":\"pycircuit-rule-transition-v2\",\"definition\":"
+  quoted definitionName
+  append ",\"inputs\":["
   for index in List.finRange signature.ni do
     if index.val != 0 then append ","
     append "{\"name\":"
@@ -230,6 +256,8 @@ private def emitModel (signature : Signature) (initialState : State signature)
     if register.val != 0 then append ","
     append "{\"name\":"
     quoted (registerNames[register.val]!)
+    append ",\"owner\":"
+    quoted (registerKeys[register.val]!)
     append ",\"width\":"
     number (signature.regWidth register)
     append ",\"initial\":"
@@ -237,13 +265,16 @@ private def emitModel (signature : Signature) (initialState : State signature)
     append "}"
   append "],\"outputs\":["
   let mut first := true
-  for (name, register) in outputNames.zip outputRegisters do
+  let entryBank := cacheBank (fun register => Term.read register)
+  for (name, output) in outputNames.zip outputExpressions do
     if !first then append ","
     first := false
     append "{\"name\":"
     quoted name
-    append ",\"register\":"
-    number register.val
+    append ",\"type\":"
+    emitType (.bits output.width)
+    append ",\"term\":"
+    emitTerm (lowerExpr output.expression entryBank) 1
     append "}"
   append "],\"next\":["
   for register in List.finRange signature.nr do
@@ -253,13 +284,15 @@ private def emitModel (signature : Signature) (initialState : State signature)
 
 /-- Serialize actual closed definitions, returning complete JSON or a diagnostic. -/
 def serialize (signature : Signature) (rules : List (RuleDef signature))
-    (initialState : State signature) (inputNames registerNames outputNames : List String)
-    (outputRegisters : List (Fin signature.nr)) : Except String String := do
-  let (_, checked) ← (preflight signature rules inputNames registerNames outputNames outputRegisters).run {}
+    (initialState : State signature) (definitionName : String)
+    (inputNames registerNames registerKeys outputNames : List String)
+    (outputExpressions : List (Output signature)) : Except String String := do
+  let (_, checked) ← (preflight signature rules definitionName inputNames registerNames registerKeys
+    outputNames outputExpressions).run {}
   -- This let is reached only after complete preflight succeeds.
   let bank := nextState rules
-  let (_, rendered) ← (emitModel signature initialState inputNames registerNames outputNames
-    outputRegisters bank).run checked
+  let (_, rendered) ← (emitModel signature initialState definitionName inputNames registerNames registerKeys
+    outputNames outputExpressions bank).run checked
   return rendered.text
 
 end RuleSemantics.SymbolicSerialize

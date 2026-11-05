@@ -22,6 +22,9 @@ inductive Term (signature : Signature) : ValueType → Type where
   | and (left right : Term signature .bool) : Term signature .bool
   | not (value : Term signature .bool) : Term signature .bool
   | ite (condition : Term signature .bool) (yes no : Term signature type) : Term signature type
+  | bit (value : Term signature .bool) : Term signature (.bits 1)
+  | concat (high : Term signature (.bits m)) (low : Term signature (.bits n)) :
+      Term signature (.bits (m + n))
 
 def evalTerm (term : Term signature type) (input : Inputs signature)
     (entry : State signature) : type.denote :=
@@ -38,6 +41,8 @@ def evalTerm (term : Term signature type) (input : Inputs signature)
   | .not value => !(evalTerm value input entry)
   | .ite condition yes no =>
     if evalTerm condition input entry then evalTerm yes input entry else evalTerm no input entry
+  | .bit value => BitVec.ofBool (evalTerm value input entry)
+  | .concat high low => (evalTerm high input entry).append (evalTerm low input entry)
 
 inductive Cached : {n : Nat} → (Fin n → Type) → Type 1 where
   | nil {α : Fin 0 → Type} : Cached α
@@ -105,6 +110,9 @@ def lowerExpr (expression : Expr signature type) (bank : Bank signature) : Term 
   | .eq left right => .eq (lowerExpr left bank) (lowerExpr right bank)
   | .and left right => .and (lowerExpr left bank) (lowerExpr right bank)
   | .not value => .not (lowerExpr value bank)
+  | .ite condition yes no => .ite (lowerExpr condition bank) (lowerExpr yes bank) (lowerExpr no bank)
+  | .bit value => .bit (lowerExpr value bank)
+  | .concat high low => .concat (lowerExpr high bank) (lowerExpr low bank)
 
 theorem expression_correct (expression : Expr signature type) (bank : Bank signature)
     (input : Inputs signature) (entry : State signature) :

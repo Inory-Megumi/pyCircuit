@@ -36,6 +36,10 @@ public:
     RtlPresentationPlan(HardwareEmitContext &context, ac::ModuleOp module)
         : context(context), module(module) {}
 
+    void recordStorage(llvm::json::Object row) {
+        storage.push_back(std::move(row));
+    }
+
     mlir::Value canonical(mlir::Value value) {
         llvm::SmallVector<mlir::Value> path;
         while (true) {
@@ -287,7 +291,8 @@ public:
         return llvm::json::Object{{"definition", module.getSymName().str()},
             {"rtl_module", context.names(module).rtl}, {"rtl_file", context.names(module).verilog},
             {"values", std::move(values)}, {"source_values", std::move(origins)},
-            {"checks", std::move(checkRows)}, {"initializers", std::move(initializers)}};
+            {"checks", std::move(checkRows)}, {"initializers", std::move(initializers)},
+            {"storage", std::move(storage)}};
     }
 
 private:
@@ -302,6 +307,7 @@ private:
     llvm::SmallVector<mlir::Value> sourceValues;
     llvm::DenseMap<unsigned, Check> checks;
     llvm::DenseMap<mlir::Value, std::string> initializerNames;
+    llvm::json::Array storage;
     bool normalized = false;
     std::string declarations;
     std::map<mlir::Operation *, std::string> statements;

@@ -3,11 +3,18 @@ set -euo pipefail
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 tier=gate
 list_only=0
+formal=0
+formal_python_tests=(
+  tests/system/test_formal_rule_export.py
+  tests/system/test_formal_counter_artifact.py
+  tests/system/test_formal_rule_library.py
+)
 while (($#)); do
   case "$1" in
     --tier) tier="${2:?--tier requires gate or nightly}"; shift 2 ;;
     --list) list_only=1; shift ;;
-    -h|--help) echo "Usage: $0 [--tier gate|nightly] [--list]"; exit 0 ;;
+    --formal) formal=1; shift ;;
+    -h|--help) echo "Usage: $0 [--tier gate|nightly] [--formal] [--list]"; exit 0 ;;
     *) pyc_die "unknown option: $1" ;;
   esac
 done
@@ -70,6 +77,9 @@ if ((list_only)); then
   if [[ "$tier" == nightly ]]; then
     printf "Nightly Python tests: %s\n" "${nightly_python_tests[*]}" >&2
   fi
+  if ((formal)); then
+    printf "Formal checks: lake build, axiom audit, pytest %s\n" "${formal_python_tests[*]}" >&2
+  fi
   exit 0
 fi
 pyc_list_tests api "$tier" "${PYC_BUILD_DIR}" \
@@ -81,9 +91,46 @@ cmake --build "${PYC_BUILD_DIR}" --target check-pycircuit --parallel "${PYC_TEST
 if [[ -f "${PYC_BUILD_DIR}/api-${tier}.xml" ]]; then
   cp "${PYC_BUILD_DIR}/api-${tier}.xml" "${docs_gate_dir}/api-${tier}.xml"
 fi
-((status == 0)) || exit "$status"
-if [[ "$tier" == nightly ]]; then
-  "${PYC_PYTHON_EXECUTABLE:-python3}" -m pytest -q "${nightly_python_tests[@]}" \
-    --junitxml="${docs_gate_dir}/api-package-nightly.xml"
+printf 'native_api=%s\n' "$status" > "${docs_gate_dir}/stage-status.txt"
+if ((status != 0 && !formal)); then
+  exit "$status"
 fi
-pyc_finish_test_run api "$tier" "common-ir-source-runtime"
+if [[ "$tier" == nightly ]]; then
+  nightly_status=0
+  "${PYC_PYTHON_EXECUTABLE:-python3}" -m pytest -q "${nightly_python_tests[@]}" \
+    --junitxml="${docs_gate_dir}/api-package-nightly.xml" || nightly_status=$?
+  printf 'nightly_python=%s\n' "$nightly_status" >> "${docs_gate_dir}/stage-status.txt"
+  if ((nightly_status != 0)); then
+    ((formal)) || exit "$nightly_status"
+    ((status != 0)) || status=$nightly_status
+  fi
+fi
+scope=common-ir-source-runtime
+if ((formal)); then
+  lake="${PYC_LAKE:-lake}"
+  command -v "$lake" >/dev/null || pyc_die "--formal requires lake (or PYC_LAKE)"
+  command -v "${YOSYS:-yosys}" >/dev/null || pyc_die "--formal requires Yosys (or YOSYS)"
+  for tool in verilator iverilog vvp; do
+    command -v "$tool" >/dev/null || pyc_die "--formal requires $tool"
+  done
+  printf '%s\n' "${formal_python_tests[@]}" > "${docs_gate_dir}/formal-selection.txt"
+  formal_status=0
+  (
+    cd "${PYC_ROOT_DIR}/formal/lean" &&
+    "$lake" build &&
+    "$lake" env lean -DwarningAsError=true RuleSemantics/Audit.lean
+  ) 2>&1 | tee "${docs_gate_dir}/formal-lean.log" || formal_status=$?
+  printf 'formal_lean=%s\n' "$formal_status" >> "${docs_gate_dir}/stage-status.txt"
+  if ((formal_status == 0)); then
+    "${PYC_PYTHON_EXECUTABLE:-python3}" -m pytest -q "${formal_python_tests[@]}" \
+      --basetemp="${PYC_FORMAL_WORK_DIR:-${PYC_BUILD_DIR}/formal-artifacts}" \
+      --junitxml="${docs_gate_dir}/formal.xml" 2>&1 | tee "${docs_gate_dir}/formal-pytest.log" || formal_status=$?
+    printf 'formal_pytest=%s\n' "$formal_status" >> "${docs_gate_dir}/stage-status.txt"
+  fi
+  if ((formal_status != 0 && status == 0)); then
+    status=$formal_status
+  fi
+  scope=common-ir-source-runtime-formal-rule-library
+fi
+((status == 0)) || exit "$status"
+pyc_finish_test_run api "$tier" "$scope"

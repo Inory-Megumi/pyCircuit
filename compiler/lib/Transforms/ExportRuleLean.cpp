@@ -107,6 +107,17 @@ private:
     return *resolved;
   }
 
+  FailureOr<uint64_t> outputWidth(Type type, Operation *site) {
+    if (!isa<ac::StructType>(type))
+      return width(type, site);
+    auto resolved = hardware.getPackedWidth(type, bindings, site);
+    if (failed(resolved) || !*resolved) {
+      (void)error(site, "a nonempty finite packed output is required");
+      return failure();
+    }
+    return *resolved;
+  }
+
   FailureOr<StringRef> literal(ac::BitsConstantOp constant) {
     auto value =
         hardware.evaluateStatic(constant.getValue(), bindings, constant);
@@ -165,7 +176,7 @@ private:
         return failure();
     } else if (auto binary = dyn_cast<ac::BitsBinaryOp>(op)) {
       if (binary.getOpcode() != "add" && binary.getOpcode() != "sub" &&
-          binary.getOpcode() != "and")
+          binary.getOpcode() != "and" && binary.getOpcode() != "or")
         return error(op, "unsupported binary operation");
       auto lhs = width(binary.getLhs().getType(), op);
       auto rhs = width(binary.getRhs().getType(), op);
@@ -173,7 +184,8 @@ private:
       if (failed(lhs) || failed(rhs) || failed(result))
         return failure();
       if (*lhs != *rhs || *lhs != *result ||
-          (binary.getOpcode() == "and" && *result != 1))
+          ((binary.getOpcode() == "and" || binary.getOpcode() == "or") &&
+           *result != 1))
         return error(op, "unsupported binary operand widths");
     } else if (auto compare = dyn_cast<ac::BitsCompareOp>(op)) {
       if (compare.getPredicate() != "eq" && compare.getPredicate() != "ult" &&
@@ -188,11 +200,21 @@ private:
     } else if (isa<ac::BitsExtractOp, ac::BitsResizeOp>(op)) {
       if (failed(identity(op->getResult(0))))
         return failure();
+    } else if (isa<ac::BitsSelectOp>(op)) {
+      for (Type type : op->getOperandTypes())
+        if (failed(width(type, op)))
+          return failure();
+    } else if (isa<ac::StructCreateOp>(op)) {
+      if (!op->getNumOperands())
+        return error(op, "empty output records are unsupported");
+      for (Type type : op->getOperandTypes())
+        if (failed(outputWidth(type, op)))
+          return failure();
     } else {
       return error(op, "unsupported operation in selected executable closure");
     }
     for (Type type : op->getResultTypes())
-      if (failed(width(type, op)))
+      if (failed(outputWidth(type, op)))
         return failure();
     return success();
   }
@@ -255,6 +277,10 @@ private:
         registerWidths.push_back(*bits);
         registerNames.push_back(declaration.getInstanceName());
         initialValues.push_back(*value);
+        std::string key;
+        llvm::raw_string_ostream keyStream(key);
+        declaration.getOccurrence().print(keyStream);
+        registerKeys.push_back(std::move(key));
       } else if (isa<ac::SourceTransactionOp, ac::SourceMethodOp, ac::YieldOp>(
                      op)) {
         continue;
@@ -266,16 +292,11 @@ private:
     if (!yield || yield.getValues().size() != module.getOutputNames().size())
       return error(module, "public output observations are required");
     for (Value result : yield.getValues()) {
-      auto original = identity(result);
-      if (failed(original))
+      auto bits = outputWidth(result.getType(), module);
+      if (failed(bits))
         return failure();
-      auto declaration = original->getDefiningOp<ac::SourceStateOp>();
-      auto found = declaration ? registerIndices.find(declaration)
-                               : registerIndices.end();
-      if (found == registerIndices.end())
-        return error(module,
-                     "outputs must directly observe declared registers");
-      outputRegisters.push_back(found->second);
+      outputValues.push_back(result);
+      outputWidths.push_back(*bits);
     }
     return success();
   }
@@ -447,13 +468,15 @@ private:
         return put(")");
       }
       if (auto binary = dyn_cast<ac::BitsBinaryOp>(site);
-          binary && binary.getOpcode() == "and") {
-        if (failed(put("(.and ")) ||
+          binary &&
+          (binary.getOpcode() == "and" || binary.getOpcode() == "or")) {
+        bool disjunction = binary.getOpcode() == "or";
+        if (failed(put(disjunction ? "(.not (.and (.not " : "(.and ")) ||
             failed(emitValue(binary.getLhs(), true, depth + 1)) ||
-            failed(put(" ")) ||
+            failed(put(disjunction ? ") (.not " : " ")) ||
             failed(emitValue(binary.getRhs(), true, depth + 1)))
           return failure();
-        return put(")");
+        return put(disjunction ? ")))" : ")");
       }
       if (auto unary = dyn_cast<ac::BitsUnaryOp>(site);
           unary && unary.getOpcode() == "not") {
@@ -474,10 +497,17 @@ private:
     }
     if (value == clock || value == reset)
       return error(site, "domain input used as data");
-    if (isa<ac::SourceStateOp>(site))
-      return error(site,
-                   "module-body state snapshots cannot become candidate reads");
+    if (isa<ac::SourceStateOp>(site)) {
+      if (!outputContext || !registerIndices.contains(site))
+        return error(
+            site, "module-body state snapshots cannot become candidate reads");
+      if (failed(put("(.reg ")) || failed(number(registerIndices.lookup(site))))
+        return failure();
+      return put(")");
+    }
     if (auto read = dyn_cast<ac::SourceStateReadOp>(site)) {
+      if (outputContext || !active)
+        return error(site, "output cannot observe a Rule-local candidate");
       for (const auto &binding : active->reads) {
         if (binding.operation != read || binding.frame != 0)
           continue;
@@ -502,6 +532,26 @@ private:
         return failure();
       return put("))");
     }
+    if (auto select = dyn_cast<ac::BitsSelectOp>(site)) {
+      if (failed(put("(.ite ")) ||
+          failed(emitValue(select.getCondition(), true, depth + 1)) ||
+          failed(put(" ")) ||
+          failed(emitValue(select.getTrueValue(), false, depth + 1)) ||
+          failed(put(" ")) ||
+          failed(emitValue(select.getFalseValue(), false, depth + 1)))
+        return failure();
+      return put(")");
+    }
+    auto binary = dyn_cast<ac::BitsBinaryOp>(site);
+    if (isa<ac::BitsCompareOp, ac::BitsUnaryOp>(site) ||
+        (binary &&
+         (binary.getOpcode() == "and" || binary.getOpcode() == "or"))) {
+      if (*bits != 1)
+        return error(site, "Boolean payload conversion requires one bit");
+      if (failed(put("(.bit ")) || failed(emitValue(value, true, depth + 1)))
+        return failure();
+      return put(")");
+    }
     if (auto binary = dyn_cast<ac::BitsBinaryOp>(site)) {
       if (binary.getOpcode() != "add" && binary.getOpcode() != "sub")
         return error(site, "predicate result used as a Bits payload");
@@ -513,6 +563,29 @@ private:
       return put(")");
     }
     return error(site, "unsupported payload expression");
+  }
+
+  LogicalResult emitOutput(Value value, unsigned depth = 0) {
+    if (failed(pay(module, depth)))
+      return failure();
+    if (auto record = value.getDefiningOp<ac::StructCreateOp>()) {
+      // StructCreate operands are verified in declaration order; packed RTL
+      // places the first declared field at the most significant end.
+      unsigned count = record->getNumOperands();
+      if (!count)
+        return error(record, "empty output record is unsupported");
+      for (unsigned index = 0; index < count; ++index) {
+        if ((index + 1 < count && failed(put("(.concat "))) ||
+            failed(emitOutput(record->getOperand(index), depth + index + 1)) ||
+            (index + 1 < count && failed(put(" "))))
+          return failure();
+      }
+      for (unsigned index = 1; index < count; ++index)
+        if (failed(put(")")))
+          return failure();
+      return success();
+    }
+    return emitValue(value, false, depth + 1);
   }
 
   LogicalResult names(StringRef name, ArrayRef<StringRef> values) {
@@ -666,14 +739,26 @@ private:
     SmallVector<StringRef> outputNames;
     for (Attribute name : module.getOutputNames())
       outputNames.push_back(cast<StringAttr>(name).getValue());
-    if (failed(names("inputNames", inputNames)) ||
+    SmallVector<StringRef> keys;
+    for (const auto &key : registerKeys)
+      keys.push_back(key);
+    if (failed(put("def definitionName : String := ")) ||
+        failed(quoted(module.getSymName())) || failed(put("\n")) ||
+        failed(names("inputNames", inputNames)) ||
         failed(names("registerNames", registerNames)) ||
+        failed(names("registerKeys", keys)) ||
         failed(names("outputNames", outputNames)) ||
-        failed(put("def outputRegisters : List (Fin signature.nr) := [")))
+        failed(put("def outputExpressions : List (Output signature) := [")))
       return failure();
-    for (auto [index, value] : llvm::enumerate(outputRegisters))
-      if ((index && failed(put(", "))) || failed(number(value)))
+    outputContext = true;
+    for (auto [index, value] : llvm::enumerate(outputValues)) {
+      if ((index && failed(put(", "))) || failed(put("{ width := ")) ||
+          failed(number(outputWidths[index])) ||
+          failed(put(", expression := ")) || failed(emitOutput(value)) ||
+          failed(put(" }")))
         return failure();
+    }
+    outputContext = false;
     if (failed(put("]\n\n")))
       return failure();
     for (auto [index, plan] : llvm::enumerate(plans))
@@ -698,11 +783,14 @@ private:
   llvm::DenseMap<Value, unsigned> inputIndices;
   llvm::DenseMap<Operation *, unsigned> registerIndices;
   llvm::DenseSet<Operation *> usedMethods;
-  SmallVector<uint64_t> inputWidths, registerWidths, outputRegisters;
+  SmallVector<uint64_t> inputWidths, registerWidths, outputWidths;
+  SmallVector<Value> outputValues;
+  SmallVector<std::string> registerKeys;
   SmallVector<StringRef> inputNames, registerNames, initialValues;
   SmallVector<const ac::TransactionStatePlan *> plans;
   const ac::TransactionStatePlan *active = nullptr;
   SmallVector<ac::StateVersionId> current;
+  bool outputContext = false;
 };
 
 class ExportRuleLeanPass

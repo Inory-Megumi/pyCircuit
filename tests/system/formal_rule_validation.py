@@ -92,10 +92,14 @@ class RuleRtlValidation:
         )
         model = json.loads(self.formula_path.read_text())
         _require(
-            set(model) == {"schema", "inputs", "registers", "outputs", "next"}
-            and model["schema"] == "pycircuit-rule-transition-v1",
+            set(model)
+            == {"schema", "definition", "inputs", "registers", "outputs", "next"}
+            and model["schema"] == "pycircuit-rule-transition-v2"
+            and isinstance(model["definition"], str)
+            and bool(model["definition"]),
             "unsupported formula schema",
         )
+        self.definition = model["definition"]
         self.inputs, self.registers, self.outputs = (
             model["inputs"],
             model["registers"],
@@ -127,26 +131,33 @@ class RuleRtlValidation:
             self.input_types.append(_type(row["type"]))
         self.widths, self.initials = [], []
         for row in self.registers:
-            _require(set(row) == {"name", "width", "initial"}, "invalid register row")
+            _require(
+                set(row) == {"name", "owner", "width", "initial"},
+                "invalid register row",
+            )
+            _require(
+                isinstance(row["owner"], str) and bool(row["owner"]),
+                "missing register owner",
+            )
             width = _type({"kind": "bits", "width": row["width"]})[1]
             self.widths.append(width)
             self.initials.append(_decimal(row["initial"], width))
-        self.canonical = {}
-        for index, row in enumerate(self.outputs):
-            _require(
-                set(row) == {"name", "register"}
-                and _natural(row["register"])
-                and row["register"] < len(self.registers),
-                "invalid output register mapping",
-            )
-            self.canonical.setdefault(row["register"], index)
+        self.owner_keys = [row["owner"] for row in self.registers]
         _require(
-            set(self.canonical) == set(range(len(self.registers))),
-            "every register must be observed by a public output; hidden state is unsupported",
+            len(set(self.owner_keys)) == len(self.owner_keys),
+            "duplicate register owner",
         )
+        self.output_widths = []
+        for row in self.outputs:
+            _require(
+                set(row) == {"name", "type", "term"},
+                "invalid output expression row",
+            )
+            type_ = _type(row["type"])
+            _require(type_[0] == "bits", "public output must be packed Bits")
+            self.output_widths.append(type_[1])
         _require(
-            len(self.outputs) <= 64
-            and sum(self.widths[row["register"]] for row in self.outputs) <= 4096,
+            0 < len(self.outputs) <= 64 and sum(self.output_widths) <= 4096,
             "public output expansion exceeds validation profile",
         )
         _require(
@@ -162,6 +173,11 @@ class RuleRtlValidation:
         for (type_, _), width in zip(terms, self.widths, strict=True):
             _require(type_ == ("bits", width), "next-state type differs from register")
         self.next_wires = [wire for _, wire in terms]
+        self.output_wires = []
+        for row, width in zip(self.outputs, self.output_widths, strict=True):
+            type_, wire = self._term(row["term"], 0)
+            _require(type_ == ("bits", width), "public output term type mismatch")
+            self.output_wires.append(wire)
 
     def _term(self, node, depth):
         self._nodes += 1
@@ -213,6 +229,8 @@ class RuleRtlValidation:
                 "and": 2,
                 "not": 1,
                 "ite": 3,
+                "bit": 1,
+                "concat": 2,
             }
             _require(
                 op in arity and set(node) == {"op", "type", "args"},
@@ -224,7 +242,20 @@ class RuleRtlValidation:
             )
             children = [self._term(child, depth + 1) for child in node["args"]]
             types, values = zip(*children, strict=True)
-            if op in ("add", "sub"):
+            if op == "bit":
+                _require(
+                    result_type == ("bits", 1) and types == (("bool", 1),),
+                    "Boolean payload type mismatch",
+                )
+                expression = values[0]
+            elif op == "concat":
+                _require(
+                    all(t[0] == "bits" for t in types)
+                    and result_type == ("bits", sum(t[1] for t in types)),
+                    "concatenation width/type mismatch",
+                )
+                expression = "{" + ", ".join(values) + "}"
+            elif op in ("add", "sub"):
                 _require(
                     result_type[0] == "bits" and all(t == result_type for t in types),
                     "arithmetic type mismatch",
@@ -310,7 +341,7 @@ class RuleRtlValidation:
         for index, row in enumerate(self.outputs):
             actual = by_name[row["name"]]
             _require(
-                actual["width"] == self.widths[row["register"]]
+                actual["width"] == self.output_widths[index]
                 and actual["availability"] is None,
                 "output width/availability mismatch",
             )
@@ -334,8 +365,8 @@ class RuleRtlValidation:
             for i, t in enumerate(self.input_types)
         ]
         ports_text += [
-            "output " + _declaration(self.widths[row["register"]], f"o{i}")
-            for i, row in enumerate(self.outputs)
+            "output " + _declaration(width, f"o{i}")
+            for i, width in enumerate(self.output_widths)
         ]
         self.wrapper_path = self.work_dir / "observed_dut.sv"
         self.wrapper_path.write_text(
@@ -347,6 +378,60 @@ class RuleRtlValidation:
             + ", ".join(bindings)
             + ");\nendmodule\n"
         )
+        self._bind_state()
+
+    def _bind_state(self):
+        mapping = json.loads((self.rtl_dir / "rtl-names.json").read_text())
+        _require(
+            mapping.get("kind") == "pycircuit.rtl-names"
+            and mapping.get("version") == 1,
+            "unsupported RTL state mapping",
+        )
+        entry = mapping.get("state_mapping", {})
+        _require(
+            entry.get("version") == 1 and entry.get("definition") == self.definition,
+            "state mapping definition/version mismatch",
+        )
+        definitions = [
+            row
+            for row in mapping["definitions"]
+            if row["definition"] == self.definition
+        ]
+        _require(len(definitions) == 1, "missing or duplicate state mapping definition")
+        rows = definitions[0].get("storage", [])
+        owners = {row["owner"]: row for row in rows}
+        _require(
+            len(owners) == len(rows) == len(self.registers)
+            and set(owners) == set(self.owner_keys),
+            "state mapping must cover each source owner exactly once",
+        )
+        self.state_paths = []
+        for register, key in zip(self.registers, self.owner_keys, strict=True):
+            row = owners[key]
+            _require(
+                row["name"] == register["name"]
+                and row["width"] == register["width"]
+                and row["kind"] in ("dff", "dffe"),
+                "state mapping name/width/kind mismatch",
+            )
+            _require(
+                isinstance(row["path"], list) and len(row["path"]) == 2,
+                "unsupported state path",
+            )
+            components = [entry["root_instance"], *row["path"]]
+            _require(
+                all(
+                    isinstance(part, str)
+                    and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_$]*", part)
+                    for part in components
+                ),
+                "unsupported state path identifier",
+            )
+            self.state_paths.append("dut.raw_dut." + ".".join(components))
+        _require(
+            len(set(self.state_paths)) == len(self.state_paths),
+            "duplicate physical state path",
+        )
 
     def _reference(self):
         ports = ["input wire clk, rst"]
@@ -355,8 +440,8 @@ class RuleRtlValidation:
             for i, t in enumerate(self.input_types)
         ]
         ports += [
-            "output " + _declaration(self.widths[row["register"]], f"o{i}")
-            for i, row in enumerate(self.outputs)
+            "output " + _declaration(width, f"o{i}")
+            for i, width in enumerate(self.output_widths)
         ]
         lines = ["module rule_reference(" + ", ".join(ports) + ");"]
         lines += [
@@ -365,7 +450,7 @@ class RuleRtlValidation:
         ]
         lines += self._wires
         lines += [
-            f"  assign o{i} = r{row['register']};" for i, row in enumerate(self.outputs)
+            f"  assign o{i} = {wire};" for i, wire in enumerate(self.output_wires)
         ]
         lines += ["  always @(posedge clk) begin"]
         for i, (width, initial, next_wire) in enumerate(
@@ -389,8 +474,8 @@ class RuleRtlValidation:
                 for i, w in enumerate(self.widths)
             ]
             ports += [
-                "output " + _declaration(self.widths[row["register"]], f"{side}_o{i}")
-                for i, row in enumerate(self.outputs)
+                "output " + _declaration(width, f"{side}_o{i}")
+                for i, width in enumerate(self.output_widths)
             ]
         ports += ["output wire related, matched"]
         lines = ["module equivalence(" + ", ".join(ports) + ");"]
@@ -399,10 +484,6 @@ class RuleRtlValidation:
             bindings += [f".i{i}(i{i})" for i in range(len(self.inputs))]
             bindings += [f".o{i}({side}_o{i})" for i in range(len(self.outputs))]
             lines.append(f"  {module} {side}(" + ", ".join(bindings) + ");")
-            lines += [
-                f"  assign {side}_r{r} = {side}_o{o};"
-                for r, o in self.canonical.items()
-            ]
         state_checks = [f"(dut_r{i} == ref_r{i})" for i in range(len(self.registers))]
         output_checks = [f"(dut_o{i} == ref_o{i})" for i in range(len(self.outputs))]
         lines += [
@@ -485,14 +566,25 @@ class RuleRtlValidation:
                 )
                 _require(
                     banks.count(bits) == 1,
-                    "ordered public state bits must equal one DFF Q bank",
+                    "ordered mapped state bits must equal one DFF Q bank",
+                )
+                path = (
+                    self.state_paths[register] if side == "dut" else f"ref.r{register}"
+                )
+                _require(
+                    path in top["netnames"]
+                    and tuple(top["netnames"][path]["bits"]) == bits,
+                    "state observation differs from mapped physical net",
                 )
                 expected_banks.append(bits)
-            for index, row in enumerate(self.outputs):
+            for index, width in enumerate(self.output_widths):
+                output_bits = top["ports"][f"{side}_o{index}"]["bits"]
                 _require(
-                    top["ports"][f"{side}_o{index}"]["bits"]
-                    == top["ports"][f"{side}_r{row['register']}"]["bits"],
-                    "public output alias differs from mapped state",
+                    len(output_bits) == width
+                    and all(
+                        type(bit) is int or bit in ("0", "1") for bit in output_bits
+                    ),
+                    "public output has invalid width or unknown bits",
                 )
         bits = [bit for bank in expected_banks for bit in bank]
         _require(
@@ -519,11 +611,17 @@ class RuleRtlValidation:
             self.miter_path,
         ]
         netlist = self.work_dir / "normalized.json"
+        observations = "cd equivalence\n"
+        for register, path in enumerate(self.state_paths):
+            observations += f"connect -set dut_r{register} \\{path}\n"
+            observations += f"connect -set ref_r{register} \\ref.r{register}\n"
+        observations += "cd ..\n"
         self._yosys(
             "normalize",
             "read_verilog -sv -D SYNTHESIS "
             + " ".join(self._path(path) for path in sources)
             + "\nhierarchy -check -top equivalence\nproc -noopt\nflatten -noscopeinfo\n"
+            + observations
             + "setattr -unset init\nsetattr -mod -unset init\nopt_clean\ndffunmap\nopt_clean\ncheck -assert\n"
             + f"write_rtlil {self._path(self.normalized_path)}\nwrite_json {self._path(netlist)}",
         )
@@ -543,7 +641,7 @@ class RuleRtlValidation:
         result = self._yosys(
             "step-proof",
             self._read()
-            + "sat -seq 2 -set rst 0 -set-at 1 related 1 -prove matched 1 -prove-skip 1 -verify "
+            + "sat -seq 2 -set rst 0 -set-at 1 related 1 -prove matched 1 -verify "
             + self._show(),
         )
         assert "SAT proof finished - no model found: SUCCESS!" in result
