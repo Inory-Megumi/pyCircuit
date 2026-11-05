@@ -65,6 +65,11 @@ struct TransactionForwardingPreparation {
   uint64_t dataCapture, enableCapture;
 };
 
+struct TransactionSharedEntry {
+  ac::StateOwnerId owner;
+  uint64_t capture;
+};
+
 struct TransactionValueRequirement {
   mlir::Operation *site = nullptr;
   ac::InvocationFrameId frame = 0;
@@ -148,6 +153,7 @@ struct TransactionPreparation {
   llvm::SmallVector<TransactionCandidatePreparation> outputs;
   llvm::SmallVector<TransactionForwardingPreparation> forwarding;
   llvm::SmallVector<ac::StateOwnerId> entryOwners;
+  llvm::SmallVector<TransactionSharedEntry, 0> sharedEntries;
   llvm::SmallVector<TransactionValueRequirement, 0> requirements;
   llvm::SmallVector<TransactionPreparedControl, 0> controls;
   llvm::SmallVector<TransactionQueueResource, 0> resources;

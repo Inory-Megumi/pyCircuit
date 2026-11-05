@@ -938,6 +938,11 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
           forward.dataCapture != item.liveIns.size() + 2 * ordinal ||
           forward.enableCapture != forward.dataCapture + 1)
         return site.emitOpError() << "transaction entry capture inventory is inconsistent";
+    for (auto [ordinal, entry] : llvm::enumerate(item.sharedEntries))
+      if (!ownerSet.contains(entry.owner) ||
+          entry.capture != item.liveIns.size() + 2 * item.forwarding.size() +
+                               item.externalPops.size() + ordinal)
+        return site.emitOpError() << "transaction shared entry inventory is inconsistent";
     if (item.clockCapture >= item.liveIns.size() ||
         item.resetCapture >= item.liveIns.size() ||
         fire == std::numeric_limits<uint64_t>::max() ||
@@ -1348,6 +1353,26 @@ SmallVector<unsigned, 4> memoryOperands(const ac::TransactionMemoryAccess &acces
 /// Admission and growth accounting finish on the intact input before cloning.
 /// Routing only summarizes the existing analysis identities; it does not
 /// resolve Methods, evaluate values or construct a second state plan.
+// A shared entry is only a pure, whole scalar fold in its actual owning
+// Module. Keep nominal/partial owners and incoming hierarchy lanes on their
+// existing local route.
+FailureOr<bool> sharedEntryOwner(const ac::TransactionStatePlan &plan,
+                                ac::StateOwnerId index,
+                                SourceCheckBudget &budget) {
+  const auto &owner = plan.owners[index];
+  if (!charge(budget, plan.transaction, 8 + plan.writes.size())) return failure();
+  if (owner.declaration.isDWire() || !isa<ac::BitsType>(owner.payloadType) ||
+      owner.anchor != 0 || !owner.instancePath.empty() ||
+      owner.declaration->getParentOp() != plan.routingModule.operator->() ||
+      !(owner.domain == plan.domain))
+    return false;
+  for (const auto &write : plan.writes)
+    if (write.owner == index &&
+        ((write.selectors && !write.selectors.empty()) || !write.indices.empty()))
+      return false;
+  return true;
+}
+
 class LoweringPreparation : public PreparedTransactionLowering {
 public:
   LoweringPreparation(mlir::ModuleOp package,
@@ -1438,6 +1463,32 @@ public:
         return failure();
     budget.setPhase("prep: prospective queue routes");
     if (failed(queueProspectiveRoutes())) return failure();
+    for (auto &item : transactions) {
+      const auto &plan = *item.plan;
+      // Incoming lanes can override a local Q before transaction execution.
+      if (!routing(plan.routingModule).downward.empty()) continue;
+      for (auto owner : item.entryOwners) {
+        auto eligible = sharedEntryOwner(plan, owner, budget);
+        if (failed(eligible)) return failure();
+        if (!*eligible) continue;
+        bool complete = true;
+        if (!charge(budget, plan.transaction, item.forwarding.size())) return failure();
+        for (const auto &forward : item.forwarding) {
+          if (forward.owner != owner) continue;
+          const auto &prior = transactions[forward.predecessor];
+          const auto &output = prior.outputs[forward.output];
+          auto scalar = sharedEntryOwner(*prior.plan, output.binding.owner, budget);
+          if (failed(scalar)) return failure();
+          complete &= *scalar && prior.plan->routingModule == plan.routingModule &&
+                      prior.plan->domain == plan.domain;
+        }
+        if (!complete) continue;
+        if (!prepayAppend(budget, plan.transaction, item.sharedEntries) ||
+            !charge(budget, plan.transaction, 4)) return failure();
+        item.sharedEntries.push_back({owner, item.liveIns.size() +
+            2 * item.forwarding.size() + item.externalPops.size() + item.sharedEntries.size()});
+      }
+    }
     // Every definition participates, including definitions not selected by the
     // System. Summaries are relative to definitions, never root occurrences.
     budget.setPhase("prep: writer summary");
@@ -2659,15 +2710,46 @@ FailureOr<MaterializedBranchResult> materializeSelection(
 ac::StaticExprAttr bitsLiteralAttribute(Type payload, DictionaryAttr occurrence,
                                         MLIRContext *context, bool one);
 
+bool sameBindings(const ac::HardwareBindings &lhs,
+                  const ac::HardwareBindings &rhs);
+
+struct SharedForwardingPrefix {
+  const ac::TransactionStatePlan *plan;
+  ac::StateOwnerId owner;
+  Value oldQ, previous, data, enable;
+  uint64_t predecessor, output;
+  MaterializedBranchResult selection;
+};
+
+bool sameSharedPrefix(const SharedForwardingPrefix &node,
+                      const ac::TransactionStatePlan &plan,
+                      ac::StateOwnerId owner, Value oldQ, Value previous,
+                      Value data, Value enable, uint64_t predecessor,
+                      uint64_t output) {
+  const auto &first = node.plan->owners[node.owner];
+  const auto &second = plan.owners[owner];
+  return node.plan->routingModule == plan.routingModule &&
+         node.plan->domain == plan.domain &&
+         first.declaration == second.declaration &&
+         first.instancePath == second.instancePath &&
+         first.payloadType == second.payloadType && node.oldQ == oldQ &&
+         node.previous == previous && node.data == data && node.enable == enable &&
+         node.predecessor == predecessor && node.output == output &&
+         sameBindings(node.plan->frames[0].bindings, plan.frames[0].bindings) &&
+         sameBindings(node.plan->instances[0].logicalBindings,
+                      plan.instances[0].logicalBindings);
+}
+
 class RuleMaterializer {
 public:
   RuleMaterializer(const TransactionPreparation &prepared,
                    IRMapping &packageMap, MaterializationRoutes &routes,
                    ArrayRef<MaterializedTransaction> predecessors,
                    const PreparedTransactionLowering &lowering,
+                   SmallVectorImpl<SharedForwardingPrefix> &sharedPrefixes,
                    SourceCheckBudget &budget)
       : prepared(prepared), plan(*prepared.plan), packageMap(packageMap),
-        routes(routes), predecessors(predecessors), lowering(lowering), budget(budget), hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()), frames(plan.frames.size()),
+        routes(routes), predecessors(predecessors), lowering(lowering), sharedPrefixes(sharedPrefixes), budget(budget), hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()), frames(plan.frames.size()),
         versions(plan.versions.size()),
         branchResults(plan.branchResults.size()), stateJoins(plan.joins.size()),
         conditionalWrites(plan.writes.size()),
@@ -2734,6 +2816,56 @@ public:
       auto placeholder = routes.bound(plan, plan.queueOwners[external.owner].valid);
       if (failed(placeholder)) return failure();
       captures.push_back(*placeholder);
+    }
+    // Preserve every predecessor provenance capture. Only its pure replay is
+    // shared, and the explicit entry capture is appended after external pops.
+    if (!product(budget, transaction, plan.owners.size(),
+                 SourceCheckBudget::bytes(sizeof(Value))) ||
+        !product(budget, transaction, prepared.sharedEntries.empty() ? 0 : prepared.forwarding.size(),
+                 SourceCheckBudget::bytes(sizeof(MaterializedBranchResult)))) return failure();
+    SmallVector<Value, 0> sharedValues(plan.owners.size());
+    SmallVector<MaterializedBranchResult, 0> sharedSelections(
+        prepared.sharedEntries.empty() ? 0 : prepared.forwarding.size());
+    for (const auto &entry : prepared.sharedEntries) {
+      auto oldQ = routes.bound(plan, plan.owners[entry.owner].oldQ);
+      if (failed(oldQ)) return failure();
+      Value previous = *oldQ;
+      auto module = cast<ac::ModuleOp>(packageMap.lookup(plan.routingModule.operator->()));
+      OpBuilder moduleBuilder(module.getBody().front().getTerminator());
+      if (!charge(budget, transaction, prepared.forwarding.size())) return failure();
+      for (const auto &forward : prepared.forwarding) {
+        if (forward.owner != entry.owner) continue;
+        Value data = captures[forward.dataCapture], enable = captures[forward.enableCapture];
+        const MaterializedBranchResult *selection = nullptr;
+        for (const auto &node : sharedPrefixes) {
+          if (!charge(budget, transaction, 24 + plan.frames[0].bindings.integers.size() +
+                      plan.frames[0].bindings.types.size() +
+                      plan.instances[0].logicalBindings.integers.size() +
+                      plan.instances[0].logicalBindings.types.size())) return failure();
+          if (sameSharedPrefix(node, plan, entry.owner, *oldQ, previous,
+                               data, enable, forward.predecessor, forward.output)) {
+            selection = &node.selection;
+            break;
+          }
+        }
+        if (!selection) {
+          const auto &prior = *lowering.transactions[forward.predecessor].plan;
+          auto joined = materializeSelection(prior.transaction, prior.frames[0].bindings,
+              enable, data, previous, plan.owners[entry.owner].payloadType,
+              moduleBuilder, budget, &branchTypes);
+          if (failed(joined) || !prepayAppend(budget, transaction, sharedPrefixes)) return failure();
+          sharedPrefixes.push_back({&plan, entry.owner, *oldQ, previous, data, enable,
+                                    forward.predecessor, forward.output, std::move(*joined)});
+          selection = &sharedPrefixes.back().selection;
+        }
+        if (!charge(budget, transaction, SourceCheckBudget::bytes(sizeof(Operation *)))) return failure();
+        sharedSelections[&forward - prepared.forwarding.data()] = *selection;
+        previous = selection->value;
+      }
+      if (entry.capture != captures.size())
+        return transaction.emitOpError() << "shared entry capture layout differs";
+      captures.push_back(previous);
+      sharedValues[entry.owner] = previous;
     }
     Type predicateType = captures[prepared.clockCapture].getType();
     for (auto output : prepared.outputs) {
@@ -2843,6 +2975,11 @@ public:
       entryValues[owner] = *value;
     }
     for (const auto &forward : prepared.forwarding) {
+      if (sharedValues[forward.owner]) {
+        if (!prepayAppend(budget, transaction, forwarded)) return failure();
+        forwarded.push_back(std::move(sharedSelections[&forward - prepared.forwarding.data()]));
+        continue;
+      }
       auto joined = materializeSelection(transaction, plan.frames[0].bindings,
           block->getArgument(forward.enableCapture), block->getArgument(forward.dataCapture),
           entryValues[forward.owner], plan.owners[forward.owner].payloadType, builder, budget, &branchTypes);
@@ -2850,6 +2987,8 @@ public:
       entryValues[forward.owner] = joined->value;
       forwarded.push_back(std::move(*joined));
     }
+    for (const auto &entry : prepared.sharedEntries)
+      entryValues[entry.owner] = block->getArgument(entry.capture);
     for (auto [id, version] : llvm::enumerate(plan.versions))
       if (version.kind == ac::StateVersionKind::OldQ)
         if (failed(ensureVersion(id, predicateType, builder)))
@@ -3552,6 +3691,7 @@ private:
   MaterializationRoutes &routes;
   ArrayRef<MaterializedTransaction> predecessors;
   const PreparedTransactionLowering &lowering;
+  SmallVectorImpl<SharedForwardingPrefix> &sharedPrefixes;
   SmallVector<Value, 0> entryValues;
   SourceCheckBudget &budget;
   BranchTypeAdmissionCache branchTypes;
@@ -3744,6 +3884,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   llvm::DenseMap<Operation *, CandidateMap> nextValues;
   llvm::DenseMap<Operation *, SmallVector<std::pair<Value, Value>>> incoming;
   MaterializationRoutes routes(prepared, mapping);
+  SmallVector<SharedForwardingPrefix, 0> sharedPrefixes;
 
   // Definitions receive the union of demands from every caller occurrence.
   // Source types/names/domain ordinals are preserved as an exact prefix.
@@ -3910,7 +4051,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   records.resize(prepared.transactions.size());
   for (uint64_t transactionIndex : prepared.transactionSchedule) {
     const auto &transaction = prepared.transactions[transactionIndex];
-    RuleMaterializer builder(transaction, mapping, routes, records, prepared, budget);
+    RuleMaterializer builder(transaction, mapping, routes, records, prepared, sharedPrefixes, budget);
     auto rule = builder.run();
     if (failed(rule))
       return failure();
@@ -6156,6 +6297,31 @@ private:
         expectedEntryOwners.push_back(forward.owner);
     if (!llvm::equal(expectedEntryOwners, preparation.entryOwners))
       return reject("original forwarded owner result inventory differs");
+    SmallVector<detail::TransactionSharedEntry, 0> expectedSharedEntries;
+    const auto &definition = prepared.definitions[prepared.definitionIndex.lookup(plan.routingModule.operator->())];
+    for (auto owner : expectedEntryOwners) {
+      auto eligible = sharedEntryOwner(plan, owner, budget);
+      if (failed(eligible)) return failure();
+      if (!*eligible || !definition.downward.empty()) continue;
+      bool complete = true;
+      if (!charge(budget, transaction, expectedForwarding.size())) return failure();
+      for (const auto &forward : expectedForwarding) {
+        if (forward.owner != owner) continue;
+        const auto &prior = prepared.transactions[forward.predecessor];
+        auto scalar = sharedEntryOwner(*prior.plan, prior.outputs[forward.output].binding.owner, budget);
+        if (failed(scalar)) return failure();
+        complete &= *scalar && prior.plan->routingModule == plan.routingModule &&
+                    prior.plan->domain == plan.domain;
+      }
+      if (!complete) continue;
+      if (!prepayAppend(budget, transaction, expectedSharedEntries)) return failure();
+      expectedSharedEntries.push_back({owner, expectedCaptures++});
+    }
+    if (expectedSharedEntries.size() != preparation.sharedEntries.size())
+      return reject("original shared entry inventory differs");
+    for (auto [expected, actual] : llvm::zip(expectedSharedEntries, preparation.sharedEntries))
+      if (expected.owner != actual.owner || expected.capture != actual.capture)
+        return reject("original shared entry owner/capture differs");
     uint64_t expectedTotal = SourceCheckBudget::add(legacyTotal, expectedEntryOwners.size());
     for (const auto &proposal : preparation.queueProposals) {
       if (proposal.rawResult != expectedTotal || proposal.pathResult != expectedTotal + 1 ||
@@ -6240,7 +6406,12 @@ private:
     uint64_t baseCaptures = expectedCaptures;
     uint64_t availabilityPayloadCaptures = preparation.liveIns.size() + 2 * expectedForwarding.size();
     for (auto [ordinal, pair] : llvm::enumerate(record.validityCaptures)) {
-      if (!prepared.valueAvailability || pair.first >= availabilityPayloadCaptures ||
+      if (!charge(budget, transaction, expectedSharedEntries.size())) return failure();
+      bool sharedPayload = llvm::any_of(expectedSharedEntries, [&](const auto &entry) {
+        return entry.capture == pair.first;
+      });
+      if (!prepared.valueAvailability ||
+          (pair.first >= availabilityPayloadCaptures && !sharedPayload) ||
           pair.second != baseCaptures + ordinal ||
           pair.second >= rule->getNumOperands() ||
           rule.getBody().front().getArgument(pair.second).use_empty())
@@ -6381,9 +6552,20 @@ private:
       lexical.try_emplace({ref.anchor, ref.value}, argument);
     }
     SmallVector<Value> visibleEntries(plan.owners.size());
+    if (!product(budget, transaction, plan.owners.size(),
+                 SourceCheckBudget::bytes(sizeof(Value)))) return failure();
+    SmallVector<Value> sharedOldQ(plan.owners.size());
     for (auto [ownerIndex, owner] : llvm::enumerate(plan.owners)) {
       const auto &ref = plan.values[owner.oldQ];
       visibleEntries[ownerIndex] = lexical.lookup({ref.anchor, ref.value});
+    }
+    for (const auto &entry : expectedSharedEntries) {
+      const auto &owner = plan.owners[entry.owner];
+      const auto &ref = plan.values[owner.oldQ];
+      auto oldQ = routed(plan.routingModule, anchorPath(plan, ref.anchor), ref.value);
+      if (failed(oldQ)) return failure();
+      sharedOldQ[entry.owner] = *oldQ;
+      visibleEntries[entry.owner] = *oldQ;
     }
     Operation *last = nullptr;
     for (auto [ordinal, forward] : llvm::enumerate(expectedForwarding)) {
@@ -6397,6 +6579,44 @@ private:
           rule.getBody().front().getArgument(forward.dataCapture).getType() != data.getType() ||
           rule.getBody().front().getArgument(forward.enableCapture).getType() != enable.getType())
         return reject("original predecessor proposal capture is disconnected");
+      if (sharedOldQ[forward.owner]) {
+        // This inventory is derived from the original owners and complete
+        // predecessor sequences. Authenticate each unique select once; each
+        // consumer still proves its full prefix and exact capture below.
+        const auto &selection = record.forwarding[ordinal];
+        const SharedForwardingPrefix *authenticated = nullptr;
+        for (const auto &node : authenticatedSharedPrefixes) {
+          if (!charge(budget, transaction, 24 + plan.frames[0].bindings.integers.size() +
+                      plan.frames[0].bindings.types.size() +
+                      plan.instances[0].logicalBindings.integers.size() +
+                      plan.instances[0].logicalBindings.types.size())) return failure();
+          if (sameSharedPrefix(node, plan, forward.owner, sharedOldQ[forward.owner],
+                  visibleEntries[forward.owner], data, enable, forward.predecessor, forward.output)) {
+            authenticated = &node;
+            break;
+          }
+        }
+        if (authenticated) {
+          if (selection.value != authenticated->selection.value ||
+              !llvm::equal(selection.generated, authenticated->selection.generated))
+            return reject("original shared prefix operation identity differs");
+        } else {
+          auto module = dyn_cast_or_null<ac::ModuleOp>(candidate.packageMap.lookupOrNull(plan.routingModule.operator->()));
+          if (!module) return reject("original shared prefix Module is absent");
+          Operation *previous = visibleEntries[forward.owner].getDefiningOp();
+          if (failed(localBranchProof(prior.plan->transaction,
+                  plan.owners[forward.owner].payloadType, prior.plan->frames[0].bindings,
+                  enable, data, visibleEntries[forward.owner], selection,
+                  &module.getBody().front(), previous)) ||
+              !prepayAppend(budget, transaction, authenticatedSharedPrefixes) ||
+              !charge(budget, transaction, SourceCheckBudget::bytes(sizeof(Operation *))))
+            return failure();
+          authenticatedSharedPrefixes.push_back({&plan, forward.owner, sharedOldQ[forward.owner],
+              visibleEntries[forward.owner], data, enable, forward.predecessor, forward.output, selection});
+        }
+        visibleEntries[forward.owner] = selection.value;
+        continue;
+      }
       if (failed(localBranchProof(transaction, plan.owners[forward.owner].payloadType,
               plan.frames[0].bindings,
               rule.getBody().front().getArgument(forward.enableCapture),
@@ -6404,6 +6624,13 @@ private:
               visibleEntries[forward.owner], record.forwarding[ordinal],
               &rule.getBody().front(), last))) return failure();
       visibleEntries[forward.owner] = record.forwarding[ordinal].value;
+    }
+    for (const auto &entry : expectedSharedEntries) {
+      if (rule->getOperand(entry.capture) != visibleEntries[entry.owner] ||
+          rule.getBody().front().getArgument(entry.capture).getType() !=
+              visibleEntries[entry.owner].getType())
+        return reject("original shared entry capture differs");
+      visibleEntries[entry.owner] = rule.getBody().front().getArgument(entry.capture);
     }
     if (!product(budget, transaction, plan.versions.size(),
                  1 + SourceCheckBudget::bytes(sizeof(MaterializedVersion))) ||
@@ -8685,6 +8912,7 @@ private:
   ac::HardwareAnalysis hardware;
   ac::SourceReceiverProofContext receiverProof;
   BranchTypeAdmissionCache branchTypes;
+  SmallVector<SharedForwardingPrefix, 0> authenticatedSharedPrefixes;
   // Node-stable storage keeps simultaneous ArrayRef results valid when another
   // transaction's independent closure is first queried.
   DenseSet<Operation *> operations, clones;

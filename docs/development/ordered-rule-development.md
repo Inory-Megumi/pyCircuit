@@ -184,6 +184,58 @@ linear-size version publication is future optimization, not a delivered claim.
 Existing un-ordered benchmarks and short ordered examples measure different
 properties; neither establishes HNI-scale ordered compilation capacity.
 
+## Shared forwarding prefixes
+
+The local state-sharing prototype moves repeated, pure forwarding selections
+into the routing Module and captures their results in consumer Rules. It shares
+only an identical ordered prefix for the same state owner, domain, payload type
+and actual predecessor data/enable endpoints. This transformation belongs to
+`ac-route-transactions`; both emitters receive the same verified common graph.
+
+The initial scope is whole Bits state owned locally in the routing Module, with
+no incoming hierarchy lanes. Aggregate, partial and cross-instance state paths
+retain their existing lowering. Rule admission, actual write intents, final
+writeback selections, reset and source checks remain unchanged. Each consumer
+still authenticates its complete allowed predecessor sequence; unordered Rules
+continue reading registered current state.
+
+The shared expression uses the same four-state selects in the same order.
+Replacing the final writeback with the final forwarded value is a separate
+optimization: the usual Boolean factoring identity need not hold for unknown
+enables. This prototype does not make that replacement or assume that one-bit
+controls are known Boolean values.
+
+All predecessor provenance captures remain, and eligible consumers gain an
+explicit shared-entry capture. Consequently, fewer selection operations do not
+establish linear metadata growth, shorter sequential data dependencies, reduced
+mapped area or improved clock frequency. Measurements must distinguish the
+common graph and emitted RTL from synthesis and physical timing results.
+
+The 2026-11-05 comparison uses independently built baseline and candidate
+checkouts based on `1ee62ffacf9d583ee9c7e69be094786a9ee84429`, LLVM/MLIR 22.1.8,
+and identical eight-bit workload source bytes. Both input-only guards and guards
+that read the forwarded state produce these counts in final IR and physical RTL:
+
+| Ordered writers | Baseline selects | Shared-prefix selects | Adders, both versions |
+| --- | ---: | ---: | ---: |
+| 2 | 2 | 2 | 2 |
+| 4 | 9 | 6 | 4 |
+| 8 | 35 | 14 | 8 |
+
+At eight writers, the 28 repeated forwarding selects become seven; the seven
+final writeback selects remain. Source RTL size falls from 8,901 to 6,095 bytes
+for input guards and from 9,647 to 6,780 bytes for state guards. The original 56
+predecessor provenance capture operands remain, with seven shared-entry captures
+added. Published source bodies and interfaces remain byte-identical.
+
+All six workloads in each version pass independent two-state, arbitrary-current-
+state transition checks, including synchronous reset. The proof uses Yosys
+process normalization and SAT without technology mapping; it does not establish
+four-state equivalence or timing. Separate generated System tests cover X/Z
+payload propagation, actual write intent, middle-Rule rejection and reached
+unknown-guard failure. Exact commands, file inventories, hashes and outcomes are
+recorded under `docs/gates/logs/rule-state-share-20261105/`.
+
 ## Next features
 
 A DWire-style value has a default each cycle and no retained state. Increment

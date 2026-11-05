@@ -634,6 +634,83 @@ protected:
     });
   }
 
+  std::unique_ptr<StagedLowering> orderedStage() {
+    return stage([&](mlir::ModuleOp file) {
+      auto owner = module(file);
+      auto run = named<SourceTransactionOp>(owner, "run");
+      auto watch = named<SourceTransactionOp>(owner, "watch");
+      for (auto rule : {run, watch}) {
+        rule->setAttr("ac.registration_entry", builder.getUnitAttr());
+        rule->setAttr("declaration", rule.getOccurrence());
+      }
+      first<SourceStateWriteOp>(watch.getBody())
+          ->setAttr("state", builder.getStringAttr("count"));
+      watch->setAttr("ac.after", builder.getArrayAttr({run.getOccurrence()}));
+      auto finish = mlir::cast<SourceTransactionOp>(watch->clone());
+      finish->setAttr("name", builder.getStringAttr("finish"));
+      finish->setAttr("declaration", occurrence("Owner", 23));
+      finish->setAttr("occurrence", occurrence("Owner", 23));
+      finish->setAttr("ac.after", builder.getArrayAttr({watch.getOccurrence()}));
+      first<SourceStateReadOp>(finish.getBody())
+          ->setAttr("occurrence", occurrence("Owner", 24));
+      first<SourceStateWriteOp>(finish.getBody())
+          ->setAttr("occurrence", occurrence("Owner", 25));
+      owner.getBody().front().getOperations().insert(
+          owner.getBody().front().getTerminator()->getIterator(), finish);
+      auto yes = *owner.getBody().front().getOps<BitsConstantOp>().begin();
+      auto byteConstraint = named<SourceMethodOp>(owner, "bump")
+                                ->getAttrOfType<mlir::ArrayAttr>("ac.result_constraints")[0];
+      // Autonomous registrations are transparent entries into private Method
+      // bodies, exactly as source capture emits them. A marker on an arbitrary
+      // transaction body is intentionally not a supported registration.
+      for (auto rule : {run, watch, finish}) {
+        std::string name = "ordered_" + rule.getName().str();
+        builder.setInsertionPoint(rule);
+        mlir::OperationState methodState(rule.getLoc(), SourceMethodOp::getOperationName());
+        methodState.addOperands(rule.getCaptures());
+        methodState.addAttribute("sym_name", builder.getStringAttr(name));
+        methodState.addAttribute("sym_visibility", builder.getStringAttr("private"));
+        methodState.addAttribute("function_type", mlir::TypeAttr::get(
+            builder.getFunctionType({}, rule.getResultTypes())));
+        methodState.addAttribute("argument_names", builder.getArrayAttr({}));
+        methodState.addAttribute("ac.parameters", builder.getArrayAttr({}));
+        llvm::SmallVector<mlir::Attribute> results(rule.getNumResults(), byteConstraint);
+        methodState.addAttribute("ac.result_constraints", builder.getArrayAttr(results));
+        methodState.addAttribute("ac.return_form", builder.getStringAttr(
+            rule.getNumResults() ? "tuple" : "none"));
+        methodState.addAttribute("ac.guard_location", rule->getAttr("ac.guard_location"));
+        methodState.addAttribute("occurrence", rule.getOccurrence());
+        methodState.addRegion();
+        methodState.addRegion();
+        auto method = mlir::cast<SourceMethodOp>(builder.create(methodState));
+        method.getGuard().takeBody(rule.getGuard());
+        method.getBody().takeBody(rule.getBody());
+        rule->setOperands({rule.getClk(), rule.getRst()});
+        for (auto *region : {&rule.getGuard(), &rule.getBody()}) {
+          auto *block = new mlir::Block();
+          region->push_back(block);
+          builder.setInsertionPointToEnd(block);
+          auto path = builder.clone(*yes.getOperation())->getResult(0);
+          llvm::SmallVector<mlir::Value> yielded{path};
+          if (region == &rule.getBody()) {
+            mlir::OperationState call(rule.getLoc(), SourceMethodCallOp::getOperationName());
+            call.addOperands(path);
+            call.addTypes(rule.getResultTypes());
+            call.addAttribute("callee", mlir::SymbolRefAttr::get(
+                &context, "Owner", {mlir::FlatSymbolRefAttr::get(&context, name)}));
+            call.addAttribute("instance_path", builder.getArrayAttr({}));
+            call.addAttribute("occurrence", rule.getOccurrence());
+            auto *operation = builder.create(call);
+            yielded.assign(operation->getResults().begin(), operation->getResults().end());
+          }
+          mlir::OperationState yield(rule.getLoc(), YieldOp::getOperationName());
+          yield.addOperands(yielded);
+          builder.create(yield);
+        }
+      }
+    });
+  }
+
   mlir::OwningOpRef<mlir::ModuleOp> refine(mlir::ModuleOp routed) {
     HardwareSourceCheckLimits limits;
     limits.maxWorkUnits = workLimit;
@@ -656,6 +733,61 @@ protected:
     });
   }
 };
+
+TEST_F(SampledTransactionLoweringTest,
+       OrderedSharedEntryAuthenticatesEveryConsumerAgainstOriginalSource) {
+  for (bool replaceEntry : {false, true}) {
+    SCOPED_TRACE(replaceEntry);
+    auto staged = orderedStage();
+    ASSERT_TRUE(staged) << diagnostics;
+    ASSERT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+    ASSERT_TRUE(mlir::succeeded(capture(
+        [&] { return verifyRoutedPackage(*staged->candidate.module); })))
+        << diagnostics;
+
+    auto &watch =
+        staged->candidate.transactions[transactionIndex(*staged, "watch")];
+    auto &finish =
+        staged->candidate.transactions[transactionIndex(*staged, "finish")];
+    ASSERT_FALSE(watch.forwarding.empty());
+    ASSERT_GT(finish.forwarding.size(), watch.forwarding.size());
+    // This is an optimization/proof test: both consumers must use the same
+    // exact prefix, not merely coincidentally equivalent private expressions.
+    EXPECT_EQ(watch.forwarding.front().value, finish.forwarding.front().value);
+    auto shared = watch.forwarding.front().value.getDefiningOp<BitsSelectOp>();
+    ASSERT_TRUE(shared);
+    ASSERT_TRUE(mlir::isa<ModuleOp>(shared->getParentOp()));
+    if (replaceEntry) {
+      auto metadata = finish.rule->getAttrOfType<mlir::DictionaryAttr>(
+          "ac.sampled_admission");
+      auto entry = mlir::cast<mlir::DictionaryAttr>(
+          metadata.getAs<mlir::ArrayAttr>("ehr_entries")[0]);
+      auto result = entry.getAs<mlir::IntegerAttr>("result").getInt();
+      auto yielded =
+          finish.rule.getBody().front().getTerminator()->getOperand(result);
+      auto capture = mlir::dyn_cast<mlir::BlockArgument>(yielded);
+      ASSERT_TRUE(capture);
+      ASSERT_EQ(capture.getOwner(), &finish.rule.getBody().front());
+      // Skip watch's proposal by substituting the earlier, valid prefix.
+      finish.rule->setOperand(capture.getArgNumber(), shared.getResult());
+    } else {
+      // The same-typed saved owner is not the count owner's incoming state.
+      shared->setOperand(
+          2, logicalState(module(*staged->candidate.module), "saved").getQ());
+    }
+    EXPECT_TRUE(mlir::failed(verify(*staged))) << diagnostics;
+    expectOriginalUnchanged(*staged);
+
+    // A fresh parsed artifact has no source plan or materializer locator map.
+    auto serialized = print(staged->candidate.module->getOperation());
+    auto restored = mlir::parseSourceString<mlir::ModuleOp>(
+        serialized, mlir::ParserConfig(&context, false));
+    ASSERT_TRUE(restored);
+    EXPECT_TRUE(mlir::failed(
+        capture([&] { return verifyRoutedPackage(*restored); })))
+        << diagnostics;
+  }
+}
 
 TEST_F(SampledTransactionLoweringTest,
        ProductionSeamAcceptsEverySupportedSampledTransactionShape) {

@@ -103,6 +103,36 @@ def test_disabled_first_root_does_not_disable_successor(tmp_path):
     _exercise(tmp_path, body, [3, 6, 12])
 
 
+def test_shared_prefix_preserves_skipped_write_and_rejected_middle_rule(tmp_path):
+    body = """    @ac.method(guard=lambda allow: allow)
+    def require(allow: ac.u1) -> None:
+        pass
+
+    @ac.rule
+    def first() -> None:
+        count = count + 5
+
+    @ac.rule
+    def conditional() -> None:
+        if count < 16:
+            count = count ^ 3
+
+    @ac.rule
+    def rejected() -> None:
+        count = count + 7
+        require(0)
+
+    @ac.rule
+    def last() -> None:
+        count = count * 3
+
+    ac.schedule(first, conditional, rejected, last)
+"""
+    # The rejected +7 never reaches last. After the first cycle, conditional
+    # fires without writing; it must preserve first's accepted value.
+    _exercise(tmp_path, body, [3, 33, 114, 101])
+
+
 def test_forwarding_preserves_unknown_and_high_impedance_data(tmp_path):
     body = """    @ac.rule
     def first() -> None:
@@ -112,10 +142,39 @@ def test_forwarding_preserves_unknown_and_high_impedance_data(tmp_path):
     def second() -> None:
         count = count
 
-    ac.schedule(first, second)
+    @ac.rule
+    def third() -> None:
+        count = count
+
+    @ac.rule
+    def last() -> None:
+        count = count
+
+    ac.schedule(first, second, third, last)
 """
     encoded = {"kind": "bits4", "width": 8, "value": "a8", "known": "fc", "z": "01"}
     _exercise(tmp_path, body, [3, encoded, encoded])
+
+
+def test_shared_prefix_reached_unknown_guard_stops_publication(tmp_path):
+    body = """    @ac.rule
+    def first() -> None:
+        count = count + 1
+
+    @ac.rule
+    def second() -> None:
+        count = count * 2
+
+    @ac.rule(guard=lambda: count == 18 and ac.four_state("x"))
+    def last() -> None:
+        count = count + 5
+
+    ac.schedule(first, second, last)
+"""
+    # The first cycle produces 8. At the next rising edge the forwarded value
+    # is 18 and the reached unknown guard must fail, without publishing that
+    # epoch's observations. The low sample preceding that edge remains valid.
+    _exercise(tmp_path, body, [3], failure_values=[3, 3, 8])
 
 
 @pytest.mark.parametrize(
@@ -194,7 +253,7 @@ def test_omitted_rule_still_runs_and_reads_committed_state(tmp_path):
     _exercise(tmp_path, body, [3, 11, 26], result="count + saved")
 
 
-def _exercise(tmp_path, body, expected, *, result="count"):
+def _exercise(tmp_path, body, expected, *, result="count", failure_values=None):
     source = tmp_path / "source"
     source.mkdir()
     (source / "ordered.py").write_text(
@@ -220,7 +279,7 @@ def Exercise():
     _ok(_compile(source, "ordered.py", unit))
     final = tmp_path / "ordered.ac"
     _ok(_cli("link", str(unit), "--top", "checks.ordered.Exercise", "-o", str(final)))
-    _check_final(final, tmp_path, expected)
+    _check_final(final, tmp_path, expected, failure_values=failure_values)
 
 
 def test_order_survives_header_only_import_and_saved_anchor(tmp_path):
@@ -291,7 +350,7 @@ def Exercise():
     _check_final(final, tmp_path, [6, 18, 42])
 
 
-def _check_final(final, tmp_path, expected):
+def _check_final(final, tmp_path, expected, *, failure_values=None):
     original = final.read_bytes()
     transcripts = []
     for target in ("cpp", "verilog"):
@@ -316,5 +375,22 @@ def _check_final(final, tmp_path, expected):
             ]
             assert values == [value for value in expected for _ in range(2)]
             transcripts.append([row for row in rows if row["kind"] != "result"])
+            if failure_values is not None:
+                failure_cycles = (len(failure_values) + 1) // 2
+                arguments = (
+                    ["--cycles", str(failure_cycles), "--workers", str(workers)]
+                    if target == "cpp"
+                    else [f"+cycles={failure_cycles}"]
+                )
+                failed = _run([str(binary), *arguments], timeout=30)
+                assert failed.returncode != 0, failed.stdout + failed.stderr
+                failed_rows = _records(failed.stdout)
+                failed_logs = [row for row in failed_rows if row["kind"] == "log"]
+                assert [
+                    int(row["values"][0]["value"]) for row in failed_logs
+                ] == failure_values
+                assert [int(row["evaluation_epoch"]) for row in failed_logs] == list(
+                    range(len(failure_values))
+                )
     assert transcripts[0] == transcripts[1] == transcripts[2]
     assert final.read_bytes() == original

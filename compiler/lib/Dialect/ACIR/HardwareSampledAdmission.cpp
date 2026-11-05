@@ -4160,6 +4160,14 @@ private:
           }
           if (!sameEndpoint(*selected, *oldQ))
             return writer.rule->emitOpError() << "EHR entry fallback differs from old Q";
+          // Only the direct capture yielded by this Rule's private witness
+          // may carry a shared entry. The complete ordered fold and physical
+          // old-Q identity above, rather than its type, authorize this use.
+          if (auto argument = dyn_cast<BlockArgument>(visible.selected);
+              argument && argument.getOwner() == &writer.rule->getRegion(0).front())
+            if (failed(allowUse(entry.scope, writer.rule, argument.getArgNumber(),
+                                *state, PrivateRoute::Data)))
+              return failure();
         }
       }
     }
