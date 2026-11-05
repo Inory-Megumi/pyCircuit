@@ -1,4 +1,5 @@
 import RuleSemantics.Acceptance
+import RuleSemantics.BitVecAcceptance
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -25,3 +26,25 @@ import RuleSemantics.Acceptance
 #print axioms RuleSemantics.Acceptance.later_condition_sees_candidate
 #print axioms RuleSemantics.Acceptance.varied_history_has_expected_count_and_events
 #print axioms RuleSemantics.Acceptance.zero_capacity_history_has_no_effects
+#print axioms RuleSemantics.Refinement.runRule_refines
+#print axioms RuleSemantics.Refinement.schedule_refines
+#print axioms RuleSemantics.Refinement.history_refines
+#print axioms RuleSemantics.BitVecCounter.increment_guard_agrees
+#print axioms RuleSemantics.BitVecCounter.decrement_guard_agrees
+#print axioms RuleSemantics.BitVecCounter.increment_value_agrees
+#print axioms RuleSemantics.BitVecCounter.decrement_value_agrees
+#print axioms RuleSemantics.BitVecCounter.increment_refines
+#print axioms RuleSemantics.BitVecCounter.decrement_refines
+#print axioms RuleSemantics.BitVecCounter.rule_refines
+#print axioms RuleSemantics.BitVecCounter.schedule_refines
+#print axioms RuleSemantics.BitVecCounter.history_refines
+#print axioms RuleSemantics.BitVecCounter.every_prefix_refines
+#print axioms RuleSemantics.BitVecCounter.schedule_bounded
+#print axioms RuleSemantics.BitVecCounter.history_bounded
+#print axioms RuleSemantics.BitVecCounter.every_prefix_bounded
+#print axioms RuleSemantics.BitVecAcceptance.last_increment_then_full_rejection
+#print axioms RuleSemantics.BitVecAcceptance.zero_does_not_underflow
+#print axioms RuleSemantics.BitVecAcceptance.order_sensitive_cycle
+#print axioms RuleSemantics.BitVecAcceptance.changing_inputs_history
+#print axioms RuleSemantics.BitVecAcceptance.zero_capacity_boundaries
+#print axioms RuleSemantics.BitVecAcceptance.unrepresentable_capacity_differs_from_nat

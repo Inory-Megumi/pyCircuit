@@ -1,10 +1,12 @@
 # Rule semantics exploration
 
-This is the first mechanically checked specification experiment for the
-`explore` branch, based on pyCircuit commit
-`27f4ae6b435d24738db6a5224428aef75b6663f7`. It asks whether local Rule safety
-obligations compose into safety of ordered schedules and finite execution
-histories. The mathematical model is separate from the product compiler.
+This proof project explores Rule composition and refinement on the `explore`
+branch, with pyCircuit source baseline
+`27f4ae6b435d24738db6a5224428aef75b6663f7`. The initial proof checkpoint is
+`8533455424d7a23d55cce284cd030dc899a19873`. Local Rule safety obligations compose
+into safety of ordered schedules and finite execution histories. A separately
+defined BitVec counter now refines the natural-number specification under an
+explicit capacity constraint. These models are separate from the product compiler.
 
 ## Reproduce
 
@@ -72,6 +74,9 @@ or establish which action functions the pyCircuit frontend accepts.
 | [Safety.lean](lean/RuleSemantics/Safety.lean) | Local preservation obligations imply preservation by every finite schedule, every admitted finite input/schedule history, and every history prefix. |
 | [Counter.lean](lean/RuleSemantics/Counter.lean) | Guarded increment/decrement establish those local obligations for unrestricted natural-number state, and therefore preserve `count ≤ capacity` for arbitrary capacities, bounded initial states, schedules and histories. |
 | [Acceptance.lean](lean/RuleSemantics/Acceptance.lean) | Independently derived composite-state, event rollback, candidate-visibility and changing-input history examples. |
+| [Refinement.lean](lean/RuleSemantics/Refinement.lean) | Exact candidate correspondence lifts to Rule execution, operation-family schedules and varying-input histories, preserving projected state and ordered events. |
+| [BitVecCounter.lean](lean/RuleSemantics/BitVecCounter.lean) | Unsigned guards and modular BitVec updates refine the Nat counter for arbitrary widths and representable capacities; Nat safety transfers to every finite history prefix. |
+| [BitVecAcceptance.lean](lean/RuleSemantics/BitVecAcceptance.lean) | Independent finite-width boundary, event-history and out-of-range-capacity examples. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does
@@ -101,6 +106,59 @@ check internal consistency. They do not prove that the existing compiler
 implements that boundary. Similarly, passing this project establishes no RTL
 equivalence, PPA result, productivity improvement, or complete-language theorem.
 
+## Finite-width refinement
+
+`BitVecCounter` uses `BitVec width` state, unsigned BitVec comparisons against
+encoded bounds, and modular BitVec addition/subtraction. Its transitions do
+not invoke the Nat counter. Both implementations use the same request,
+operation and abstract event types.
+
+The state projection is `count.toNat`. For every input and every BitVec state,
+the local refinement proofs establish equality of complete candidates:
+ordinary rejection agrees, and accepted values, projected state and events
+agree. The parameter condition is:
+
+```text
+capacity < 2 ^ width
+```
+
+The increment guard implies that adding one stays at or below capacity and
+strictly below the modulus. The decrement guard implies that subtracting one
+does not underflow. Thus the actual modular updates agree with the Nat updates
+on every accepted branch. Representability of one is proved only in those
+branches; it is not assumed for zero-width values.
+
+Instantiating the generic refinement lemmas gives, for every finite history:
+
+```text
+projectResult BitVec.toNat
+  (BitVecCounter.executeHistory width capacity history count)
+  = Counter.executeHistory capacity history count.toNat
+```
+
+This equality includes the complete ordered event list and needs no initial
+capacity-bound hypothesis. Transferring the safety theorem additionally
+requires `count.toNat ≤ capacity`. Under that initial condition, every history
+prefix remains bounded. At capacity zero, this condition restricts the initial
+state to zero; an out-of-bound nonzero state can still decrement.
+
+Widths and capacities are universally quantified, including maximum capacity
+`2 ^ width - 1`. Width zero is a mathematical BitVec boundary case: only capacity
+zero satisfies the parameter condition. It does not establish admission of
+zero-width pyCircuit source types, which require positive widths.
+
+The capacity condition cannot simply be dropped. At width two, encoding capacity
+four truncates it to zero: an increment request from zero is rejected by the
+BitVec model, while the Nat model accepts it and emits an increment event. The
+independent acceptance file proves this concrete difference, as well as the
+last admissible increment, full/empty rejection, order-sensitive behavior and
+a changing-input history.
+
+This is a proof about two independently authored Lean models. It does not yet
+connect either model to a captured pyCircuit program or generated RTL. In
+particular, the guarded bounded counter has different boundary behavior from
+the existing DWire example's deliberately wrapping counter.
+
 ## Connection to pyCircuit
 
 The intended source of the ordered-root behavior is the current
@@ -114,14 +172,15 @@ the current language reference. The
 the current export and source mappings. Historical proposal status is not
 treated as implementation evidence.
 
-This first model excludes DWire, Queue and memory resources, unordered roots,
+These models exclude DWire, Queue and memory resources, unordered roots,
 cross-module ownership, reset, X/Z, physical clock history, assertion faults,
-observation publication, bit-vector wraparound, source admission, and compiler
-lowering. No product language, compiler or runtime semantics are changed.
+observation publication, source admission, and compiler lowering. BitVec modular
+arithmetic is modeled; the guarded refinement proves that accepted updates do
+not wrap under its stated parameter condition. No product language, compiler
+or runtime semantics are changed.
 
-The next concrete proof target is a finite-width counter implementation related
-to this natural-number specification by an explicit state relation. After
-establishing that connection, module contracts and a selected actual lowering
-can be treated as separate refinement obligations. Installing LLVM/MLIR,
+The next connection is between a captured pyCircuit program or a selected
+actual lowering and these proved models. Module contracts and compiler
+refinement remain separate proof obligations. Installing LLVM/MLIR,
 Verilog simulators and an RTL formal flow belongs to that compiler-connected
 stage; they are not prerequisites for the proofs in this directory.
