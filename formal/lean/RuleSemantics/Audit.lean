@@ -1,5 +1,6 @@
 import RuleSemantics.Acceptance
 import RuleSemantics.BitVecAcceptance
+import RuleSemantics.CounterReferenceAcceptance
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -48,3 +49,12 @@ import RuleSemantics.BitVecAcceptance
 #print axioms RuleSemantics.BitVecAcceptance.changing_inputs_history
 #print axioms RuleSemantics.BitVecAcceptance.zero_capacity_boundaries
 #print axioms RuleSemantics.BitVecAcceptance.unrepresentable_capacity_differs_from_nat
+#print axioms RuleSemantics.CounterReference.step_refines
+#print axioms RuleSemantics.CounterReference.run_refines
+#print axioms RuleSemantics.CounterReference.run_nat_refines
+#print axioms RuleSemantics.CounterReference.run_bounded
+#print axioms RuleSemantics.CounterReference.every_prefix_bounded
+#print axioms RuleSemantics.CounterReferenceAcceptance.all_states_and_requests_agree
+#print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_all_states
+#print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_at_empty
+#print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_at_capacity

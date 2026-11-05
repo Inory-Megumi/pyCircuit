@@ -6,7 +6,8 @@ branch, with pyCircuit source baseline
 `8533455424d7a23d55cce284cd030dc899a19873`. Local Rule safety obligations compose
 into safety of ordered schedules and finite execution histories. A separately
 defined BitVec counter now refines the natural-number specification under an
-explicit capacity constraint. These models are separate from the product compiler.
+explicit capacity constraint. A fixed counter artifact experiment connects these
+models to actual compiler output through a separately checked RTL reference.
 
 ## Reproduce
 
@@ -77,6 +78,8 @@ or establish which action functions the pyCircuit frontend accepts.
 | [Refinement.lean](lean/RuleSemantics/Refinement.lean) | Exact candidate correspondence lifts to Rule execution, operation-family schedules and varying-input histories, preserving projected state and ordered events. |
 | [BitVecCounter.lean](lean/RuleSemantics/BitVecCounter.lean) | Unsigned guards and modular BitVec updates refine the Nat counter for arbitrary widths and representable capacities; Nat safety transfers to every finite history prefix. |
 | [BitVecAcceptance.lean](lean/RuleSemantics/BitVecAcceptance.lean) | Independent finite-width boundary, event-history and out-of-range-capacity examples. |
+| [CounterReference.lean](lean/RuleSemantics/CounterReference.lean) | A separate three-bit combinational reference refines the fixed increment/decrement schedule and its Nat state for arbitrary finite request histories. |
+| [CounterReferenceAcceptance.lean](lean/RuleSemantics/CounterReferenceAcceptance.lean) | All eight encoded states and four request combinations, plus independent boundary and order checks. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does
@@ -103,8 +106,8 @@ current language rejects.
 
 The rollback lemmas follow the chosen semantics; they specify the boundary and
 check internal consistency. They do not prove that the existing compiler
-implements that boundary. Similarly, passing this project establishes no RTL
-equivalence, PPA result, productivity improvement, or complete-language theorem.
+implements that boundary. The Lean build alone establishes no RTL equivalence,
+PPA result, productivity improvement, or complete-language theorem.
 
 ## Finite-width refinement
 
@@ -154,9 +157,9 @@ independent acceptance file proves this concrete difference, as well as the
 last admissible increment, full/empty rejection, order-sensitive behavior and
 a changing-input history.
 
-This is a proof about two independently authored Lean models. It does not yet
-connect either model to a captured pyCircuit program or generated RTL. In
-particular, the guarded bounded counter has different boundary behavior from
+This is a proof about two independently authored Lean models. Connecting either
+model to a captured pyCircuit program or generated RTL requires additional
+evidence, described below. The guarded bounded counter has different behavior from
 the existing DWire example's deliberately wrapping counter.
 
 ## Connection to pyCircuit
@@ -172,15 +175,26 @@ the current language reference. The
 the current export and source mappings. Historical proposal status is not
 treated as implementation evidence.
 
-These models exclude DWire, Queue and memory resources, unordered roots,
+The Lean models exclude DWire, Queue and memory resources, unordered roots,
 cross-module ownership, reset, X/Z, physical clock history, assertion faults,
 observation publication, source admission, and compiler lowering. BitVec modular
 arithmetic is modeled; the guarded refinement proves that accepted updates do
 not wrap under its stated parameter condition. No product language, compiler
 or runtime semantics are changed.
 
-The next connection is between a captured pyCircuit program or a selected
-actual lowering and these proved models. Module contracts and compiler
-refinement remain separate proof obligations. Installing LLVM/MLIR,
-Verilog simulators and an RTL formal flow belongs to that compiler-connected
-stage; they are not prerequisites for the proofs in this directory.
+The [counter artifact experiment](artifact/README.md) uses a real pyCircuit
+source with three-bit state, capacity five, and increment-then-decrement order.
+It compiles and links that source, emits physical RTL and C++ from the same
+final IR, and checks the RTL state transition against an independent SV
+reference using Yosys. `CounterReference` proves the corresponding BitVec
+reference expression refines the Rule model and inherits Nat safety. Independent
+normal checked RTL simulation and a separately compiled reversed-schedule
+counterexample test the observation boundary and sensitivity to ordering.
+
+This connection is deliberately state-only and specific to one generated
+artifact's known-two-state, reset-deasserted synthesis projection. The SV-to-Lean
+expression correspondence and Yosys frontend/lowering/SAT remain trusted; no
+RTL certificate is checked by Lean. Module contracts, general compiler
+refinement, and the excluded behaviors remain separate proof obligations.
+LLVM/MLIR, Yosys and Verilator are prerequisites for the artifact tests, not for
+the standalone Lean proofs.
