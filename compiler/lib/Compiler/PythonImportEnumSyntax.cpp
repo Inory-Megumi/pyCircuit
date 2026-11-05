@@ -35,6 +35,8 @@ MarkerKind classifyImportedMarker(StringRef module, StringRef remoteName) {
       .Case("module", MarkerKind::Module)
       .Case("system", MarkerKind::System)
       .Case("rule", MarkerKind::Rule)
+      .Case("schedule", MarkerKind::Schedule)
+      .Case("dwire", MarkerKind::DWire)
       .Case("method", MarkerKind::Method)
       .Case("struct", MarkerKind::Struct)
       .Case("bits", MarkerKind::Bits)
@@ -97,7 +99,7 @@ readCallableSyntax(const AstNode &declaration, LexicalBindings bindings,
   auto formals = declaration.child("args");
   if (!localRule && !formals.array("defaults").empty())
     return emitError() << "only autonomous local Rules accept hardware default bindings";
-  CapturedCallableSyntax result{marker, {}, {}};
+  CapturedCallableSyntax result{marker, {}};
   if (decorator.kind() != "Call")
     return result;
   if (!decorator.array("args").empty() || decorator.array("keywords").empty())
@@ -108,7 +110,7 @@ readCallableSyntax(const AstNode &declaration, LexicalBindings bindings,
     if (name == "guard" && !result.guard)
       result.guard = keyword.child("value");
     else if (name == "after")
-      return emitError() << "source after is retired; independent Rules read current state";
+      return emitError() << "Rule order is declared with schedule(first, second), not after=";
     else
       return emitError() << "duplicate or unsupported Rule/Method decorator option";
   }

@@ -144,7 +144,8 @@ FailureOr<SourceUnitStructure> verifyStructure(mlir::ModuleOp unit, bool body,
         {"receiver_kind", isa<SourceMethodCallOp>(operation)},
         {"ancestor_depth", isa<SourceMethodCallOp>(operation)},
         {"ac.callable_after", false},
-        {"ac.after", false}}) {
+        {"ac.dwire", isa<SourceStateOp>(operation)},
+        {"ac.after", isa<SourceTransactionOp>(operation)}}) {
       if (operation->hasAttr(name) && !allowed) {
         operation->emitOpError() << name << " is invalid on this source operation";
         return WalkResult::interrupt();

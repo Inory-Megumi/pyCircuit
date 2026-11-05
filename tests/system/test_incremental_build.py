@@ -280,7 +280,7 @@ def test_generated_scale_graphs_have_public_source_unit_counts_and_real_noops(
 
     for axis, size in (
         ("shared", 1),
-        ("shared", 4),
+        ("shared", 64),
         ("distinct", 1),
         ("distinct", 4),
     ):

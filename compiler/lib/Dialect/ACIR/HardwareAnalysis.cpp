@@ -1146,6 +1146,9 @@ LogicalResult HardwareAnalysis::verifyResolvedOperation(
         return op->emitOpError()
                << "bound bit operands and result must have equal widths";
   }
+  if (isa<DWireOp>(op) && (inputs[0] != 1 || inputs[1] != 1 || inputs[2] != 1 ||
+                          inputs[3] != outputs[0] || inputs[4] != outputs[0]))
+    return op->emitOpError() << "bound DWire controls and payload widths differ";
   if (isa<BitsCompareOp>(op) && (inputs[0] != inputs[1] || outputs[0] != 1))
     return op->emitOpError()
            << "bound comparison requires equal operands and width-one result";

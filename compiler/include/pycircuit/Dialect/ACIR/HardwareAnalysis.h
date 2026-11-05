@@ -370,6 +370,7 @@ private:
 };
 
 /// Verify common hardware shape, binding, dependency and execution contracts.
+unsigned requiredHardwareContractVersion(mlir::ModuleOp package);
 mlir::LogicalResult verifyHardwarePackage(mlir::ModuleOp package);
 /// Verify the versioned routed graph without requiring physical state refinement
 /// or an implementation for a declared ordinary external combinational module.

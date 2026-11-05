@@ -6,6 +6,16 @@
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 using namespace mlir;
 namespace acir::ac {
+unsigned requiredHardwareContractVersion(mlir::ModuleOp package) {
+  bool wire = false;
+  package.walk([&](Operation *op) {
+    if (isa<DWireOp>(op) || (isa<SourceStateOp>(op) && op->hasAttr("ac.dwire"))) wire = true;
+  });
+  if (wire) return 4;
+  return llvm::any_of(package.getOps<SystemOp>(), [](SystemOp system) {
+    return system->hasAttr("ac.entry_boundary");
+  }) ? 3 : 2;
+}
 namespace {
 LogicalResult primitiveSchema(const HardwareAnalysis &analysis,
                               ModuleImportOp op) {
@@ -169,15 +179,24 @@ LogicalResult detail::verifyHardwarePackageStage(
                       : "executable hardware verification requires final hardware; routed packages require state refinement");
   if ((routed || boundary || package->hasAttr("ac.routed_contract")) &&
       (!marker || !marker.getType().isSignlessInteger(64) ||
-       marker.getValue() != (boundary ? 3 : 2)))
+       marker.getValue() != requiredHardwareContractVersion(package)))
     return package.emitOpError()
            << "unsupported or missing ac.routed_contract; regenerate the routed artifact";
   auto closed = package.walk([&](Operation *operation) {
+    if (operation->hasAttr("ac.dwire") && !isa<SourceStateOp>(operation)) {
+      operation->emitOpError() << "ac.dwire marker belongs only to logical wire declarations";
+      return WalkResult::interrupt();
+    }
     // A reference denotes a source allocation, never a runtime payload or an
     // inert annotation on a closed hardware graph. Routing must consume both
     // bindings and callable contracts before either standalone boundary.
+    if (operation->hasAttr("ac.after") &&
+        !(isa<RuleOp>(operation) && operation->hasAttr("ac.sampled_admission"))) {
+      operation->emitOpError() << "after requires an authenticated sampled Rule";
+      return WalkResult::interrupt();
+    }
     for (StringRef name : {"ac.reference_parameters", "ac.reference_bindings",
-                           "ac.reference", "ac.callable_after", "ac.after"}) {
+                           "ac.reference", "ac.callable_after"}) {
       if (operation->hasAttr(name)) {
         operation->emitOpError()
             << "unresolved source reference or callable order cannot cross "

@@ -16,6 +16,8 @@ enum class MarkerKind {
   Module,
   System,
   Rule,
+  Schedule,
+  DWire,
   Method,
   Struct,
   Bits,
@@ -60,7 +62,6 @@ bool hasSourceDecorator(const AstNode &declaration, MarkerKind marker,
 struct CapturedCallableSyntax {
   MarkerKind marker;
   AstNode guard;
-  AstNode after;
 };
 
 /// Decode only the bound Rule/Method decorator and its guard lambda signature.

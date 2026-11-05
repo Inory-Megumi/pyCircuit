@@ -522,6 +522,8 @@ public:
     } else if (isa<ac::BitsSelectOp>(op))
       expression =
           "(" + operands[0] + " ? " + operands[1] + " : " + operands[2] + ")";
+    else if (isa<ac::DWireOp>(op))
+      expression = "(" + operands[2] + " ? " + operands[3] + " : " + operands[4] + ")";
     else if (isa<ac::BitsConcatOp>(op)) {
       expression = "{";
       for (auto [i, item] : llvm::enumerate(operands))

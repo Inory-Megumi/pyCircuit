@@ -559,10 +559,10 @@ TEST_F(HardwareWriteDomainsTest,
 }
 
 TEST_F(HardwareWriteDomainsTest,
-       HierarchicalOrderedParentRejectsRetiredAfterBeforeRouting) {
+       HierarchicalOrderedParentRejectsTupleAfterBeforeRouting) {
   auto file = hierarchyFixture(true);
   EXPECT_FALSE(file);
-  EXPECT_NE(diagnostics.find("source after is retired"), std::string::npos)
+  EXPECT_NE(diagnostics.find("schedule(first, second)"), std::string::npos)
       << diagnostics;
 }
 

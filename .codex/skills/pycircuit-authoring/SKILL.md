@@ -18,6 +18,12 @@ language reference and execution evidence determine supported features.
 - Declare persistent variables in their owning Module. Inside Rules, write the
   algorithm in statement order using meaningful names such as `total`, `saved`,
   `incoming` and `previous`. Rule locals are temporary computed values.
+- In this local fork, declare same-cycle wires as `value: bits[N] = dwire()`.
+  This single no-argument API handles flags and wider Bits, retains no history,
+  and drives zero when the one writer root does not write successfully. Methods
+  retain their caller's atomic boundary. Do not introduce a separate data-wire
+  API or user-authored defaults. Readers are independent roots; use an
+  unconditional nonblocking counter updater when events must affect state.
 - Do not expose `clk`, reset, register `q`/`d`, DFF/DFFE binding, proposal wires or
   commit controls in ordinary author-facing sources, including benchmark ports.
   ACIR analysis/lowering chooses storage and generates its control connections.
@@ -31,8 +37,11 @@ language reference and execution evidence determine supported features.
   calls retain the outer transaction; they do not create another commit or cycle.
   Callable component operations use Methods, independently of parameter count.
 - Statements inside a Rule see earlier assignments. A saved local is a snapshot.
-  Independent autonomous Rules always observe committed current values. `after`
-  is retired; declaration order cannot expose another Rule's candidate updates.
+  Unordered autonomous Rules observe committed current values. In this local
+  fork, use one `schedule(first, second, third)` declaration after the named
+  local Rules and before the Module return for same-cycle state forwarding.
+  Every Rule retains its own atomic commit; omitted Rules remain independent.
+  Do not use `@rule(after=...)` or infer order from declaration position.
 
 ## Keep interfaces small
 

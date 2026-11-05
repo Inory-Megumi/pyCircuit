@@ -218,7 +218,18 @@ Callable-only external interfaces without an unambiguous published contract need
 explicit annotations. A source-global Rule receives its explicit arguments; it
 does not capture unrelated locals or state from a calling Module.
 
-Module variables own storage. Rule parameters, local annotations, saved values
+Ordinary Module variables own storage. This fork also accepts an annotated
+`value: ac.bits[N] = ac.dwire()` declaration for a same-cycle combinational wire.
+The same API handles flags and wider data, takes no arguments and retains no
+history. A successful writer drives its value; otherwise the compiler drives
+zero. Each wire has one atomic writer root, including its called Methods.
+Readers remain independent roots; a blocked reader cannot roll back a writer.
+Use an unconditional, nonblocking updater, as in
+`examples/dwire_counter`. Read/write feedback in
+one root, multiple writer roots and combinational cycles reject. See the
+[DWire contract](dwire-development.md).
+
+Rule parameters, local annotations, saved values
 and returned payloads are SSA values. Passing an actual writable owner name to a
 Rule binds proposals to that owner; forwarding such a formal through another
 call preserves the same actual owner. Direct assignments within the callee see
@@ -305,12 +316,18 @@ Authors do not add `valid` fields solely to represent this availability. Authore
 protocol `valid`/`ready` signals retain their own interface meaning.
 
 Within one callback, assignments and Method/template calls share sequential
-candidates; saved values remain snapshots. Independent callbacks always start
-from the same committed current state. Declaration order supplies no visibility
-or priority. `after`, native `ac.after` and `ac.callable_after` contracts are retired
-and rejected, including imported summaries and saved artifacts. To preserve one
-sequential state transition, place its steps in one Rule and use local Methods
-or helpers. Unproved conflicting writers and combinational cycles reject.
+candidates; saved values remain snapshots. Unordered callbacks start from the
+same committed current state. Declaration order supplies no visibility or
+priority. This fork adds `schedule(first, second, third)` in the Module body,
+after the named local Rules and before the return. Later Rules see successful
+earlier state updates; every Rule retains an independent commit decision.
+One list per Module may select a subset of its local Rules; omitted Rules retain
+their independent current-state semantics. No explicit Rule activation calls
+are needed. `@rule(after=...)` and Method/cross-instance scheduling are rejected.
+Internally, authenticated `ac.after` registration edges and schema-4 summaries
+carry the list order through compile/link/reload. The old callable ordering
+contract remains rejected. Unproved conflicting writers and combinational
+cycles still reject. See [ordered Rule development](ordered-rule-development.md).
 
 Whole-owner updates through declared child or reference interfaces may share
 one state owner when the compiler proves their grants mutually exclusive from

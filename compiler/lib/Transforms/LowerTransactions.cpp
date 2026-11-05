@@ -822,7 +822,7 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
       return prepared.original->emitError() << "transaction schedule contains an invalid registration";
     rank[index] = ordinal;
   }
-  for (const auto &item : prepared.transactions) {
+  for (auto [itemIndex, item] : llvm::enumerate(prepared.transactions)) {
     if (!item.plan)
       return prepared.original->emitError()
              << "transaction lowering requires an intact prepared state plan";
@@ -835,6 +835,7 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
     auto checks = item.expectedAdmission.getAs<ArrayAttr>("body_checks");
     auto observations = item.expectedAdmission.getAs<ArrayAttr>("observations");
     auto guards = item.expectedAdmission.getAs<ArrayAttr>("controls");
+    auto entries = item.expectedAdmission.getAs<ArrayAttr>("ehr_entries");
     auto requirements = item.expectedAdmission.getAs<ArrayAttr>("requirements");
     if (item.sourceControls.size() != plan.controls.size() ||
         (item.requirements.empty() ? bool(requirements)
@@ -858,9 +859,9 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
           requirement.point.prefix > plan.controls.size() ||
           (requirement.point.path.branch && *requirement.point.path.branch >= plan.branches.size()))
         return site.emitOpError() << "transaction required-use bounds are inconsistent";
-    if (item.expectedAdmission.size() != (6 + !item.requirements.empty() +
+    if (item.expectedAdmission.size() != (6 + !item.entryOwners.empty() + !item.requirements.empty() +
             !item.resources.empty() + !item.queueProposals.empty() + !item.memoryProposals.empty() + !item.writeDomains.empty()) ||
-        item.expectedAdmission.get("ehr_entries") ||
+        (item.entryOwners.empty() ? bool(entries) : (!entries || entries.size() != item.entryOwners.size())) ||
         !guards || !checks ||
         !observations || guards.size() != item.controls.size() ||
         checks.size() != plan.bodyChecks.size() ||
@@ -885,6 +886,7 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
         next, SourceCheckBudget::multiply(
                   2, SourceCheckBudget::add(item.controls.size(),
                                             plan.bodyChecks.size())));
+    total = SourceCheckBudget::add(total, item.entryOwners.size());
     for (const auto &proposal : item.queueProposals) {
       if (proposal.access >= plan.queueAccesses.size() ||
           proposal.rawResult != total || proposal.pathResult != total + 1 ||
@@ -925,6 +927,17 @@ verifyPreparedEffectInventory(const PreparedTransactionLowering &prepared,
         return site.emitOpError() << "write domain result layout is inconsistent";
       total = SourceCheckBudget::add(total, 1);
     }
+    llvm::DenseSet<ac::StateOwnerId> ownerSet;
+    for (auto owner : item.entryOwners)
+      if (owner >= plan.owners.size() || !ownerSet.insert(owner).second)
+        return site.emitOpError() << "transaction entry owner inventory is inconsistent";
+    for (auto [ordinal, forward] : llvm::enumerate(item.forwarding))
+      if (forward.owner >= plan.owners.size() || forward.predecessor >= prepared.transactions.size() ||
+          rank[forward.predecessor] >= rank[itemIndex] ||
+          forward.output >= prepared.transactions[forward.predecessor].outputs.size() ||
+          forward.dataCapture != item.liveIns.size() + 2 * ordinal ||
+          forward.enableCapture != forward.dataCapture + 1)
+        return site.emitOpError() << "transaction entry capture inventory is inconsistent";
     if (item.clockCapture >= item.liveIns.size() ||
         item.resetCapture >= item.liveIns.size() ||
         fire == std::numeric_limits<uint64_t>::max() ||
@@ -1411,8 +1424,8 @@ public:
     budget.setPhase("prep: live-ins/outputs");
     for (auto &prepared : transactions)
       if (failed(liveIns(prepared)) || failed(outputs(prepared))) return failure();
-    budget.setPhase("prep: independent registrations");
-    if (failed(scheduleTransactions())) return failure();
+    budget.setPhase("prep: ordered inputs");
+    if (failed(orderedInputs())) return failure();
     budget.setPhase("prep: write domains");
     for (auto &prepared : transactions)
       if (failed(writeDomains(prepared))) return failure();
@@ -1707,7 +1720,7 @@ private:
         *total > SmallVector<Type>().max_size())
       return transaction.emitOpError()
              << "transaction result layout exceeds host capacity";
-    prepared.totalResults = *total;
+    prepared.totalResults = SourceCheckBudget::add(*total, prepared.entryOwners.size());
     for (auto &proposal : prepared.queueProposals) {
       proposal.rawResult = prepared.totalResults++;
       proposal.pathResult = prepared.totalResults++;
@@ -1854,6 +1867,29 @@ private:
     if (!requirements.empty()) {
       NamedAttrList admission(prepared.expectedAdmission);
       admission.append("requirements", b.getArrayAttr(requirements));
+      prepared.expectedAdmission = admission.getDictionary(b.getContext());
+    }
+    if (!prepared.entryOwners.empty()) {
+      SmallVector<Attribute> entries;
+      for (auto [ordinal, ownerIndex] : llvm::enumerate(prepared.entryOwners)) {
+        const auto &state = plan.owners[ownerIndex];
+        SmallVector<Attribute> predecessors;
+        for (const auto &forward : prepared.forwarding) {
+          if (forward.owner != ownerIndex) continue;
+          predecessors.push_back(b.getDictionaryAttr({
+              b.getNamedAttr("registration", routedOccurrence(*transactions[forward.predecessor].plan)),
+              b.getNamedAttr("data_capture", b.getI64IntegerAttr(forward.dataCapture)),
+              b.getNamedAttr("enable_capture", b.getI64IntegerAttr(forward.enableCapture))}));
+        }
+        auto oldQ = llvm::find(prepared.liveIns, state.oldQ) - prepared.liveIns.begin();
+        entries.push_back(b.getDictionaryAttr({
+            b.getNamedAttr("state", stateID(anchorPath(plan, state.anchor), state.declaration)),
+            b.getNamedAttr("old_q_capture", b.getI64IntegerAttr(oldQ)),
+            b.getNamedAttr("predecessors", b.getArrayAttr(predecessors)),
+            b.getNamedAttr("result", b.getI64IntegerAttr(*total + ordinal))}));
+      }
+      NamedAttrList admission(prepared.expectedAdmission);
+      admission.append("ehr_entries", b.getArrayAttr(entries));
       prepared.expectedAdmission = admission.getDictionary(b.getContext());
     }
     if (failed(queueAdmissionMetadata(prepared)) || failed(memoryAdmissionMetadata(prepared))) return failure();
@@ -2109,12 +2145,46 @@ private:
     return success();
   }
 
-  LogicalResult scheduleTransactions() {
-    for (uint64_t index = 0; index < transactions.size(); ++index) {
+  LogicalResult orderedInputs() {
+    llvm::DenseSet<uint64_t> visited;
+    std::function<LogicalResult(uint64_t)> schedule = [&](uint64_t index) {
       if (!charge(budget, transactions[index].plan->transaction)) return failure();
+      if (!visited.insert(index).second) return success();
+      for (auto predecessor : transactions[index].plan->predecessorIndices) {
+        if (predecessor >= transactions.size() || failed(schedule(predecessor))) return failure();
+      }
       transactionSchedule.push_back(index);
+      return success();
+    };
+    for (uint64_t index = 0; index < transactions.size(); ++index)
+      if (failed(schedule(index))) return failure();
+    for (auto &prepared : transactions) {
+      const auto &plan = *prepared.plan;
+      for (auto [ownerIndex, owner] : llvm::enumerate(plan.owners)) {
+        if (owner.declaration.isDWire()) continue;
+        auto ownerKey = key(anchorPath(plan, owner.anchor), owner.declaration->getResult(0));
+        for (uint64_t index : plan.predecessorIndices) {
+          const auto &prior = transactions[index];
+          for (auto [ordinal, output] : llvm::enumerate(prior.outputs)) {
+            const auto &priorOwner = prior.plan->owners[output.binding.owner];
+            if (ownerKey != key(anchorPath(*prior.plan, priorOwner.anchor),
+                                priorOwner.declaration->getResult(0))) continue;
+            if (!prepayAppend(budget, plan.transaction, prepared.forwarding)) return failure();
+            uint64_t capture = prepared.liveIns.size() + 2 * prepared.forwarding.size();
+            prepared.forwarding.push_back({ownerIndex, index, ordinal, capture, capture + 1});
+          }
+        }
+        if (!prepared.forwarding.empty() && prepared.forwarding.back().owner == ownerIndex)
+          prepared.entryOwners.push_back(ownerIndex);
+      }
     }
     return success();
+  }
+
+  bool ordered(const ac::TransactionStatePlan *first,
+               const ac::TransactionStatePlan *second) {
+    return first && second && first->routingModule == second->routingModule &&
+           llvm::is_contained(second->predecessorIndices, first->ordinal);
   }
 
   struct Writer {
@@ -2139,6 +2209,7 @@ private:
     summaryStatus[module] = 1;
     auto &summary = summaries[module];
     std::unique_ptr<SourceWriteGrantProof> grant;
+    SmallVector<std::pair<RoutingKey, unsigned>, 0> groupModes;
     auto add = [&](Writer writer) -> LogicalResult {
       if (!charge(budget, module, 8 + writer.ownerPath.size() + writer.transactionPath.size()))
         return failure();
@@ -2148,7 +2219,30 @@ private:
         if (ownerKey != key(prior.ownerPath, prior.state)) continue;
         if (prior.plan == writer.plan &&
             prior.transactionPath == writer.transactionPath) return success();
-        {
+        if (auto state = writer.state.getDefiningOp<ac::SourceStateOp>(); state && state.isDWire())
+          return module.emitOpError() << "DWire requires one atomic writer";
+        bool sameScope = prior.transactionPath == writer.transactionPath;
+        bool pairOrdered = sameScope &&
+            (ordered(prior.plan, writer.plan) ||
+             ordered(writer.plan, prior.plan));
+        // Partial selector domains cross scopes are admitted only through the
+        // same independent grant proof as whole-owner writers. A different
+        // field is disjoint; same-field/index pairs must prove mutually
+        // exclusive enables below. Cross-scope after composition has no
+        // accepted visibility contract and fails at this earlier owner.
+        if (!sameScope &&
+            ((prior.plan && !prior.plan->predecessors.empty()) ||
+             (writer.plan && !writer.plan->predecessors.empty())))
+          return module.emitOpError()
+                 << "cross-scope writers cannot participate in after composition";
+        auto mode = llvm::find_if(groupModes, [&](const auto &entry) { return entry.first == ownerKey; });
+        unsigned expectedMode = pairOrdered ? 1 : 2;
+        if (mode == groupModes.end()) {
+          if (!prepayAppend(budget, module, groupModes)) return failure();
+          groupModes.push_back({ownerKey, expectedMode});
+        } else if (mode->second != expectedMode)
+          return module.emitOpError() << "mixed ordered and unordered owner writer groups require an explicit supported composition contract";
+        if (!pairOrdered) {
           if (!prior.plan || !writer.plan) return failure();
           if (!grant) {
             if (!charge(budget, module, 1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof)))) return failure();
@@ -2166,7 +2260,7 @@ private:
                   << "source write grant proof could not resolve scoped SSA: " << grant->failureReason();
               if (!*disjoint) {
                 auto diagnostic = module.emitOpError()
-                    << "multiple outer writers require proved disjoint write domains or mutually exclusive controls";
+                    << "multiple outer writers require a declared transaction order or proved disjoint write domains";
                 diagnostic.attachNote(prior.transaction->getLoc())
                     << "previous rule registration is here";
                 diagnostic.attachNote(writer.transaction.getLoc())
@@ -2569,9 +2663,11 @@ class RuleMaterializer {
 public:
   RuleMaterializer(const TransactionPreparation &prepared,
                    IRMapping &packageMap, MaterializationRoutes &routes,
+                   ArrayRef<MaterializedTransaction> predecessors,
+                   const PreparedTransactionLowering &lowering,
                    SourceCheckBudget &budget)
       : prepared(prepared), plan(*prepared.plan), packageMap(packageMap),
-        routes(routes), budget(budget), hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()), frames(plan.frames.size()),
+        routes(routes), predecessors(predecessors), lowering(lowering), budget(budget), hardware(plan.transaction->getParentOfType<mlir::ModuleOp>()), frames(plan.frames.size()),
         versions(plan.versions.size()),
         branchResults(plan.branchResults.size()), stateJoins(plan.joins.size()),
         conditionalWrites(plan.writes.size()),
@@ -2624,6 +2720,13 @@ public:
         return failure();
       captures.push_back(*capture);
     }
+    for (const auto &forward : prepared.forwarding) {
+      auto rule = predecessors[forward.predecessor].rule;
+      const auto &output = lowering.transactions[forward.predecessor].outputs[forward.output];
+      if (!rule) return transaction.emitOpError() << "ordered predecessor is not materialized";
+      captures.push_back(rule->getResult(output.dataResult));
+      captures.push_back(rule->getResult(output.enableResult));
+    }
     // Existing typed endpoints are detached placeholders only. Queue routing
     // replaces every external operand with its independently checked union
     // before candidate verification or publication.
@@ -2651,6 +2754,8 @@ public:
       types.push_back(plan.values[check.condition].value.getType());
       types.push_back(predicateType);
     }
+    for (auto owner : prepared.entryOwners)
+      types.push_back(plan.owners[owner].payloadType);
     for (const auto &proposal : prepared.queueProposals) {
       types.push_back(predicateType); types.push_back(predicateType);
       if (proposal.dataResult)
@@ -2673,6 +2778,12 @@ public:
     attributes.erase("ac.guard_location");
     attributes.erase("ac.registration_entry");
     attributes.erase("ac.after");
+    if (!plan.predecessorIndices.empty()) {
+      SmallVector<Attribute> after;
+      for (auto index : plan.predecessorIndices)
+        after.push_back(routedOccurrence(*lowering.transactions[index].plan));
+      attributes.set("ac.after", ArrayAttr::get(transaction.getContext(), after));
+    }
     if (!plan.registrationPath.empty()) {
       attributes.set("occurrence", routedOccurrence(plan));
       attributes.set("ac.lexical_registration", transaction.getOccurrence());
@@ -2725,6 +2836,20 @@ public:
     savedObservations.resize(plan.observations.size());
     OpBuilder builder(rule.getContext());
     builder.setInsertionPointToEnd(block);
+    entryValues.resize(plan.owners.size());
+    for (auto [owner, declaration] : llvm::enumerate(plan.owners)) {
+      auto value = bound(declaration.oldQ);
+      if (failed(value)) return failure();
+      entryValues[owner] = *value;
+    }
+    for (const auto &forward : prepared.forwarding) {
+      auto joined = materializeSelection(transaction, plan.frames[0].bindings,
+          block->getArgument(forward.enableCapture), block->getArgument(forward.dataCapture),
+          entryValues[forward.owner], plan.owners[forward.owner].payloadType, builder, budget, &branchTypes);
+      if (failed(joined)) return failure();
+      entryValues[forward.owner] = joined->value;
+      forwarded.push_back(std::move(*joined));
+    }
     for (auto [id, version] : llvm::enumerate(plan.versions))
       if (version.kind == ac::StateVersionKind::OldQ)
         if (failed(ensureVersion(id, predicateType, builder)))
@@ -2795,6 +2920,8 @@ public:
       results.push_back(check.first);
       results.push_back(*path);
     }
+    for (auto owner : prepared.entryOwners)
+      results.push_back(entryValues[owner]);
     for (const auto &proposal : prepared.queueProposals) {
       auto path = queueProposalPath(proposal, builder);
       if (failed(path)) return failure();
@@ -2878,6 +3005,7 @@ public:
     record.branchResults = std::move(branchResults);
     record.stateJoins = std::move(stateJoins);
     record.conditionalWrites = std::move(conditionalWrites);
+    record.forwarding = std::move(forwarded);
     record.frames = std::move(frames);
     record.requirements = std::move(requirements);
     record.resources = std::move(resources);
@@ -2935,7 +3063,7 @@ private:
         intentLiteral(intentType, false, plan.transaction->getLoc(), builder);
     if (failed(value) || failed(intent))
       return failure();
-    versions[id] = {*value, *intent};
+    versions[id] = {entryValues[version.owner] ? entryValues[version.owner] : *value, *intent};
     return success();
   }
 
@@ -3422,13 +3550,16 @@ private:
   IRMapping &packageMap;
   using LexicalKey = std::pair<ac::LexicalInstanceId, Value>;
   MaterializationRoutes &routes;
+  ArrayRef<MaterializedTransaction> predecessors;
+  const PreparedTransactionLowering &lowering;
+  SmallVector<Value, 0> entryValues;
   SourceCheckBudget &budget;
   BranchTypeAdmissionCache branchTypes;
   ac::HardwareAnalysis hardware;
   llvm::DenseMap<LexicalKey, Value> lexical;
   SmallVector<IRMapping, 0> frames;
   SmallVector<MaterializedVersion, 0> versions;
-  SmallVector<MaterializedBranchResult, 0> branchResults, stateJoins,
+  SmallVector<MaterializedBranchResult, 0> branchResults, stateJoins, forwarded,
       conditionalWrites;
   Value prefix;
   SmallVector<Value, 0> prefixes;
@@ -3608,7 +3739,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   Builder attributes(staged.getContext());
   // No source envelope or input object is changed before the complete proof.
   staged->setAttr("ac.stage", attributes.getStringAttr("routed"));
-  staged->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(llvm::any_of(staged.getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 3 : 2));
+  staged->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(ac::requiredHardwareContractVersion(staged)));
   using CandidateMap = llvm::DenseMap<RoutingKey, std::pair<Value, Value>>;
   llvm::DenseMap<Operation *, CandidateMap> nextValues;
   llvm::DenseMap<Operation *, SmallVector<std::pair<Value, Value>>> incoming;
@@ -3757,10 +3888,11 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         }
         continue;
       }
-      auto oldQ = routes.value(definition.module, route.path, route.value);
+      auto state = route.value.getDefiningOp<ac::SourceStateOp>();
+      auto oldQ = routes.value(definition.module, route.path,
+                              state.isDWire() ? state.getInitial() : route.value);
       if (failed(oldQ) || !prepayAppend(budget, definition.module, incomingCommits)) return failure();
       auto [data, enable] = incoming[definition.module][ordinal];
-      auto state = route.value.getDefiningOp<ac::SourceStateOp>();
       auto closed = materializeDomainCommit(state, state.getOccurrence(), route.type,
           bindings, *oldQ, data, enable, {}, hardware, builder, budget);
       if (failed(closed)) return failure();
@@ -3778,7 +3910,7 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
   records.resize(prepared.transactions.size());
   for (uint64_t transactionIndex : prepared.transactionSchedule) {
     const auto &transaction = prepared.transactions[transactionIndex];
-    RuleMaterializer builder(transaction, mapping, routes, budget);
+    RuleMaterializer builder(transaction, mapping, routes, records, prepared, budget);
     auto rule = builder.run();
     if (failed(rule))
       return failure();
@@ -3888,7 +4020,8 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         if (prior != candidates.end()) previous = prior->second.first;
         else {
           auto oldQ = routes.value(transaction.plan->routingModule, path,
-                                   declaration.getQ());
+                                   declaration.isDWire() ? declaration.getInitial()
+                                                         : declaration.getQ());
           if (failed(oldQ)) return failure();
           previous = *oldQ;
         }
@@ -3928,9 +4061,22 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
         candidates[key] = {commit.data.value, commit.enable};
         continue;
       }
-      if (prior != candidates.end())
-        return original.emitOpError() << "independent writer group bypassed disjoint domain composition";
-      candidates.try_emplace(key, std::make_pair(data, enable));
+      if (prior == candidates.end()) {
+        candidates.try_emplace(key, std::make_pair(data, enable));
+      } else {
+        OpBuilder commitBuilder(materializedRule);
+        commitBuilder.setInsertionPointAfter(materializedRule);
+        auto selected = materializeSelection(original, transaction.plan->frames[0].bindings,
+            enable, data, prior->second.first, owner.payloadType, commitBuilder, budget);
+        if (failed(selected) || !charge(budget, original, 32)) return failure();
+        OperationState either(original.getLoc(), ac::BitsBinaryOp::getOperationName());
+        either.addOperands({prior->second.second, enable});
+        either.addTypes(enable.getType());
+        either.addAttribute("opcode", commitBuilder.getStringAttr("or"));
+        Value combined = commitBuilder.create(either)->getResult(0);
+        materialized.commits[ordinal] = {std::move(*selected), combined};
+        prior->second = {materialized.commits[ordinal].data.value, combined};
+      }
     }
   }
   // All Rules exist before ordinary transaction results disappear. Captures
@@ -3962,7 +4108,8 @@ LogicalResult materialize(PreparedTransactionLowering &prepared,
     // Disabled proposals retain the owner's typed old-Q. This has no
     // candidate write intent and needs no invented nominal zero value.
     if (path.empty())
-      return {mapping.lookup(state),
+      return {mapping.lookup(state.getDefiningOp<ac::SourceStateOp>().isDWire()
+                                 ? state.getDefiningOp<ac::SourceStateOp>().getInitial() : state),
               bitsLiteral(eType, occurrence, location, false, builder)};
     if (isa<ac::BitsType>(dType))
       return {bitsLiteral(dType, occurrence, location, false, builder),
@@ -4396,7 +4543,7 @@ public:
                          StringAttr::get(staged.getContext(), "routed"));
     expectedEnvelope.set("ac.routed_contract",
                          IntegerAttr::get(IntegerType::get(staged.getContext(), 64),
-                             llvm::any_of(prepared.original->getRegion(0).getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 3 : 2));
+                             ac::requiredHardwareContractVersion(cast<mlir::ModuleOp>(prepared.original))));
     if (staged->getAttrs() != expectedEnvelope.getAttrs() ||
         staged->getPropertiesAsAttribute() !=
             prepared.original->getPropertiesAsAttribute())
@@ -4662,6 +4809,34 @@ private:
            << "transaction original-source proof failed: " << message;
   }
 
+  std::unique_ptr<ac::SourceTransactionStateAnalysis> originalOrderAnalysis;
+  bool verifiedUnordered = false;
+
+  FailureOr<ArrayRef<uint64_t>> originalPredecessors(
+      const ac::TransactionStatePlan &plan) {
+    if (verifiedUnordered) return ArrayRef<uint64_t>();
+    // Reconstruct all actual occurrence bindings and call closure afresh. No
+    // prepared plan, scheduling vector or serialized routing hint is input.
+    if (!originalOrderAnalysis) {
+      originalOrderAnalysis = std::make_unique<ac::SourceTransactionStateAnalysis>(prepared.original);
+      if (!originalOrderAnalysis->isValid() ||
+          !charge(budget, plan.transaction, originalOrderAnalysis->getAnalysisWork())) return failure();
+    }
+    const auto sourcePlans = originalOrderAnalysis->getPlans();
+    if (plan.ordinal >= sourcePlans.size())
+      return reject("original transaction occurrence is missing");
+    const auto *source = &sourcePlans[plan.ordinal];
+    if (source->transaction != plan.transaction ||
+        source->routingModule != plan.routingModule ||
+        source->registrationPath != plan.registrationPath ||
+        source->ordinal != plan.ordinal ||
+        source->lexicalModule != plan.lexicalModule ||
+        source->lexicalAnchor != plan.lexicalAnchor ||
+        !llvm::equal(source->predecessors, plan.predecessors))
+      return reject("original transaction occurrence routing differs");
+    return ArrayRef<uint64_t>(source->predecessorIndices);
+  }
+
   FailureOr<uint64_t> originalTransactionIndex(uint64_t index) {
     if (index >= prepared.transactions.size() ||
         prepared.transactions[index].plan->ordinal != index)
@@ -4670,19 +4845,42 @@ private:
   }
 
   LogicalResult orderProof() {
-    SmallVector<const ac::TransactionStatePlan *, 0> occurrences;
-    for (auto [index, preparation] : llvm::enumerate(prepared.transactions)) {
-      if (!prepayAppend(budget, prepared.original, occurrences)) return failure();
-      occurrences.push_back(preparation.plan);
-      if (index >= prepared.transactionSchedule.size() ||
-          prepared.transactionSchedule[index] != index)
-        return reject("original registration inventory differs from prepared schedule");
+    bool ordered = llvm::any_of(prepared.transactions, [](const auto &item) {
+      return item.plan->transaction->hasAttr("ac.after");
+    });
+    if (!ordered) {
+      SmallVector<const ac::TransactionStatePlan *, 0> occurrences;
+      for (auto [index, item] : llvm::enumerate(prepared.transactions)) {
+        if (!prepayAppend(budget, prepared.original, occurrences)) return failure();
+        occurrences.push_back(item.plan);
+        if (!item.plan->predecessors.empty() || !item.plan->predecessorIndices.empty() ||
+            index >= prepared.transactionSchedule.size() || prepared.transactionSchedule[index] != index)
+          return reject("unordered registration inventory differs from prepared schedule");
+      }
+      if (occurrences.size() != prepared.transactionSchedule.size()) return failure();
+      auto work = ac::SourceTransactionStateAnalysis::verifyOccurrences(prepared.original, occurrences);
+      if (failed(work) || !charge(budget, prepared.original, *work)) return failure();
+      verifiedUnordered = true;
+      return success();
     }
-    if (occurrences.size() != prepared.transactionSchedule.size())
-      return reject("original registration inventory differs from prepared schedule");
-    auto work = ac::SourceTransactionStateAnalysis::verifyOccurrences(
-        prepared.original, occurrences);
-    if (failed(work) || !charge(budget, prepared.original, *work)) return failure();
+    SmallVector<uint64_t> order;
+    llvm::DenseSet<uint64_t> seen;
+    for (auto [index, preparation] : llvm::enumerate(prepared.transactions)) {
+      auto ancestors = originalPredecessors(*preparation.plan);
+      if (failed(ancestors) || !llvm::equal(*ancestors, preparation.plan->predecessorIndices))
+        return reject("original predecessor closure differs from prepared plan");
+      for (auto transaction : *ancestors) {
+        auto id = originalTransactionIndex(transaction);
+        if (failed(id)) return failure();
+        if (seen.insert(*id).second) order.push_back(*id);
+      }
+      if (seen.insert(index).second) order.push_back(index);
+    }
+    if (originalOrderAnalysis &&
+        originalOrderAnalysis->getPlans().size() != prepared.transactions.size())
+      return reject("original transaction occurrence inventory differs");
+    if (!llvm::equal(order, prepared.transactionSchedule))
+      return reject("original dependency traversal differs from prepared schedule");
     return success();
   }
 
@@ -5148,11 +5346,19 @@ private:
       prefix.push_back(path[depth]);
       lexical = child;
     }
+    bool scopedOrdered = false, scopedUnordered = false;
     std::unique_ptr<SourceWriteGrantProof> scopedGrant;
     for (size_t i = 0; i < scoped.size(); ++i)
       for (size_t j = 0; j < i; ++j) {
         const auto &first = scoped[i], &second = scoped[j];
         const auto &a = *first.transaction->plan, &b = *second.transaction->plan;
+        auto ap = originalPredecessors(a), bp = originalPredecessors(b);
+        if (failed(ap) || failed(bp)) return failure();
+        bool sameScope = first.scope == second.scope;
+        bool pairOrdered = sameScope &&
+            (llvm::is_contained(*ap, b.ordinal) || llvm::is_contained(*bp, a.ordinal));
+        scopedOrdered |= pairOrdered; scopedUnordered |= !pairOrdered;
+        if (pairOrdered) continue;
         if (!scopedGrant) {
           if (!charge(budget, originalModule, 1 + SourceCheckBudget::bytes(sizeof(SourceWriteGrantProof)))) return failure();
           scopedGrant = std::make_unique<SourceWriteGrantProof>(originalModule, hardware, budget);
@@ -5169,7 +5375,23 @@ private:
           }
         }
       }
-    bool multipleWriters = matching.size() > 1;
+    if (scopedOrdered && scopedUnordered)
+      return reject("original mixed scoped ordered/unordered writer group is unsupported");
+    bool unordered = false, ordered = false;
+    // The scoped proof above includes every local matching writer at depth
+    // zero with an empty prefix. Reuse that proof, retaining the separate local
+    // ordering classification needed to validate the actual commit below.
+    for (size_t i = 0; i < matching.size(); ++i)
+      for (size_t j = 0; j < i; ++j) {
+        if (!charge(budget, originalModule, 4)) return failure();
+        auto [ai, ao] = matching[i]; auto [bi, bo] = matching[j];
+        const auto &a = *prepared.transactions[ai].plan, &b = *prepared.transactions[bi].plan;
+        auto ap = originalPredecessors(a), bp = originalPredecessors(b);
+        if (failed(ap) || failed(bp)) return failure();
+        bool pairOrdered = llvm::is_contained(*ap, b.ordinal) || llvm::is_contained(*bp, a.ordinal);
+        ordered |= pairOrdered; unordered |= !pairOrdered;
+      }
+    if (ordered && unordered) return reject("original mixed ordered/unordered writer group is unsupported");
     Value expectedData, expectedEnable;
     auto incoming = definition.downwardIndex.find(key);
     if (incoming != definition.downwardIndex.end()) {
@@ -5184,11 +5406,12 @@ private:
       unsigned input = definition.sourceInputs + 2 * incoming->second;
       Value rawData = module.getBody().front().getArgument(input);
       expectedEnable = module.getBody().front().getArgument(input + 1);
-      auto oldQ = routed(originalModule, path, state);
+      auto declaration = state.getDefiningOp<ac::SourceStateOp>();
+      auto oldQ = routed(originalModule, path,
+                        declaration.isDWire() ? declaration.getInitial() : state);
       if (failed(oldQ)) return failure();
       ac::HardwareBindings bindings;
       bindings.owner = originalModule;
-      auto declaration = state.getDefiningOp<ac::SourceStateOp>();
       Operation *last = nullptr;
       if (failed(domainCommitProof(declaration, declaration.getOccurrence(), dataType,
           bindings, rawData, expectedEnable, {}, closed->data, *oldQ,
@@ -5208,10 +5431,16 @@ private:
       bool crossScopeDomains = !path.empty() && llvm::any_of(
           transaction.writeDomains,
           [&](const auto &domain) { return domain.candidate == ordinal; });
-      if (multipleWriters || incoming != definition.downwardIndex.end() ||
+      if (unordered || incoming != definition.downwardIndex.end() ||
           (!expectedData && crossScopeDomains)) {
         Value base = expectedData;
-        if (!base) { auto oldQ = routed(originalModule, path, state); if (failed(oldQ)) return failure(); base = *oldQ; }
+        if (!base) {
+          auto declaration = state.getDefiningOp<ac::SourceStateOp>();
+          auto oldQ = routed(originalModule, path,
+                            declaration.isDWire() ? declaration.getInitial() : state);
+          if (failed(oldQ)) return failure();
+          base = *oldQ;
+        }
         Operation *last = rule;
         if (failed(domainCommitProof(transaction, ordinal, record, base, &module.getBody().front(), last))) return failure();
         if (!expectedEnable) {
@@ -5242,15 +5471,27 @@ private:
         expectedData = commit.data.value;
         continue;
       }
-      if (commit.domainMerge || !commit.enableGenerated.empty() ||
-          commit.data.value || commit.enable || !commit.data.generated.empty())
-        return reject("original sole candidate has an invented commit chain");
-      expectedData = currentData;
-      expectedEnable = currentEnable;
+      if (commit.domainMerge || !commit.enableGenerated.empty()) return reject("original ordered owner has an invented domain merge");
+      if (!expectedData) {
+        if (commit.data.value || commit.enable || !commit.data.generated.empty())
+          return reject("original first candidate has an invented commit chain");
+        expectedData = currentData; expectedEnable = currentEnable; continue;
+      }
+      Operation *last = nullptr;
+      if (failed(localBranchProof(plan.transaction, owner.payloadType, plan.frames[0].bindings,
+            currentEnable, currentData, expectedData, commit.data, &module.getBody().front(), last))) return failure();
+      Builder b(originalModule.getContext());
+      if (!commit.enable || !values.contains(commit.enable) ||
+          failed(generatedProof(commit.enable.getDefiningOp(), ac::BitsBinaryOp::getOperationName(),
+              {expectedEnable, currentEnable}, {currentEnable.getType()},
+              b.getDictionaryAttr({b.getNamedAttr("opcode", b.getStringAttr("or"))}),
+              plan.transaction->getLoc(), &module.getBody().front())))
+        return reject("original ordered commit enable differs");
+      expectedData = commit.data.value; expectedEnable = commit.enable;
     }
     if (expectedData) {
       if (data != expectedData)
-        return reject("original final candidate data differs");
+        return reject("original ordered final candidate data differs");
       if (!enable) {
         // A plain DFF has no physical enable pin. Recompute the composed
         // commit enable independently and require an exact constant-one truth,
@@ -5260,11 +5501,12 @@ private:
         return success();
       }
       if (*enable != expectedEnable)
-        return reject("original final candidate routing enable differs");
+        return reject("original ordered final candidate routing enable differs");
       return success();
     }
     if (path.empty()) {
-      if (data != candidate.packageMap.lookupOrNull(state))
+      auto declaration = state.getDefiningOp<ac::SourceStateOp>();
+      if (data != candidate.packageMap.lookupOrNull(declaration.isDWire() ? declaration.getInitial() : state))
         return reject("original unwritten state hold data differs");
     } else if (isa<ac::BitsType>(dataType)) {
       if (failed(literalProof(data, dataType, occurrence, location, false,
@@ -5858,7 +6100,37 @@ private:
           ArrayAttr::get(transaction.getContext(), expectedPath))
         return reject("original lexical occurrence path differs");
     }
-    uint64_t expectedCaptures = preparation.liveIns.size();
+    SmallVector<detail::TransactionForwardingPreparation> expectedForwarding;
+    auto ancestors = originalPredecessors(plan);
+    if (failed(ancestors)) return failure();
+    for (auto [ownerIndex, owner] : llvm::enumerate(plan.owners)) {
+      if (owner.declaration.isDWire()) continue;
+      auto key = routingKey(anchorPath(plan, owner.anchor), owner.declaration->getResult(0));
+      for (auto predecessor : *ancestors) {
+        auto index = originalTransactionIndex(predecessor);
+        if (failed(index)) return failure();
+        const auto &prior = prepared.transactions[*index];
+        if (!(prior.plan->domain == plan.domain))
+          return reject("original predecessor clock/reset identity differs");
+        for (auto [ordinal, output] : llvm::enumerate(prior.outputs)) {
+          const auto &state = prior.plan->owners[output.binding.owner];
+          if (key != routingKey(anchorPath(*prior.plan, state.anchor), state.declaration->getResult(0)))
+            continue;
+          if (!prepayAppend(budget, transaction, expectedForwarding)) return failure();
+          uint64_t capture = preparation.liveIns.size() + 2 * expectedForwarding.size();
+          expectedForwarding.push_back({ownerIndex, *index, ordinal, capture, capture + 1});
+        }
+      }
+    }
+    if (expectedForwarding.size() != preparation.forwarding.size() ||
+        expectedForwarding.size() != record.forwarding.size())
+      return reject("original forwarding capture inventory differs");
+    for (auto [expected, actual] : llvm::zip(expectedForwarding, preparation.forwarding))
+      if (expected.owner != actual.owner || expected.predecessor != actual.predecessor ||
+          expected.output != actual.output || expected.dataCapture != actual.dataCapture ||
+          expected.enableCapture != actual.enableCapture)
+        return reject("original forwarding predecessor/owner/capture differs");
+    uint64_t expectedCaptures = preparation.liveIns.size() + 2 * expectedForwarding.size();
     auto expectedExternalPops = originalQueueExternalPops(preparation, expectedCaptures);
     if (failed(expectedExternalPops)) return failure();
     expectedCaptures += expectedExternalPops->size();
@@ -5878,7 +6150,13 @@ private:
         cursor, SourceCheckBudget::multiply(
                     2, SourceCheckBudget::add(preparation.controls.size(),
                                               plan.bodyChecks.size())));
-    uint64_t expectedTotal = legacyTotal;
+    SmallVector<ac::StateOwnerId> expectedEntryOwners;
+    for (const auto &forward : expectedForwarding)
+      if (expectedEntryOwners.empty() || expectedEntryOwners.back() != forward.owner)
+        expectedEntryOwners.push_back(forward.owner);
+    if (!llvm::equal(expectedEntryOwners, preparation.entryOwners))
+      return reject("original forwarded owner result inventory differs");
+    uint64_t expectedTotal = SourceCheckBudget::add(legacyTotal, expectedEntryOwners.size());
     for (const auto &proposal : preparation.queueProposals) {
       if (proposal.rawResult != expectedTotal || proposal.pathResult != expectedTotal + 1 ||
           (proposal.dataResult && *proposal.dataResult != expectedTotal + 2))
@@ -5922,8 +6200,37 @@ private:
           : preparation.expectedAdmission.get("write_domains") !=
                 Builder(transaction.getContext()).getArrayAttr(expectedDomains)))
       return reject("original write domain metadata differs");
-    if (preparation.expectedAdmission.get("ehr_entries"))
-      return reject("retired EHR entry forwarding metadata");
+    if (expectedEntryOwners.empty()) {
+      if (preparation.expectedAdmission.get("ehr_entries"))
+        return reject("original unordered transaction has invented entry metadata");
+    } else {
+      Builder b(transaction.getContext());
+      SmallVector<Attribute> entries;
+      for (auto [ordinal, ownerIndex] : llvm::enumerate(expectedEntryOwners)) {
+        const auto &owner = plan.owners[ownerIndex];
+        SmallVector<Attribute> ancestors;
+        for (const auto &forward : expectedForwarding) {
+          if (forward.owner != ownerIndex) continue;
+          ancestors.push_back(b.getDictionaryAttr({
+              b.getNamedAttr("registration", routedOccurrence(*prepared.transactions[forward.predecessor].plan)),
+              b.getNamedAttr("data_capture", b.getI64IntegerAttr(forward.dataCapture)),
+              b.getNamedAttr("enable_capture", b.getI64IntegerAttr(forward.enableCapture))}));
+        }
+        auto path = anchorPath(plan, owner.anchor);
+        auto identity = b.getDictionaryAttr({
+            b.getNamedAttr("owner", b.getDictionaryAttr({b.getNamedAttr("instance_path", routePath(transaction.getContext(), path))})),
+            b.getNamedAttr("declaration", owner.occurrence),
+            b.getNamedAttr("element", b.getArrayAttr({}))});
+        auto oldQ = llvm::find(preparation.liveIns, owner.oldQ) - preparation.liveIns.begin();
+        entries.push_back(b.getDictionaryAttr({
+            b.getNamedAttr("state", identity),
+            b.getNamedAttr("old_q_capture", b.getI64IntegerAttr(oldQ)),
+            b.getNamedAttr("predecessors", b.getArrayAttr(ancestors)),
+            b.getNamedAttr("result", b.getI64IntegerAttr(legacyTotal + ordinal))}));
+      }
+      if (preparation.expectedAdmission.get("ehr_entries") != b.getArrayAttr(entries))
+        return reject("original entry owner/predecessor/result metadata differs");
+    }
     auto expectedClock = llvm::find(preparation.liveIns, plan.clockValue) -
                          preparation.liveIns.begin();
     auto expectedReset = llvm::find(preparation.liveIns, plan.resetValue) -
@@ -5931,7 +6238,7 @@ private:
     Builder captureAttributes(transaction.getContext());
     SmallVector<Attribute> captureRows;
     uint64_t baseCaptures = expectedCaptures;
-    uint64_t availabilityPayloadCaptures = preparation.liveIns.size();
+    uint64_t availabilityPayloadCaptures = preparation.liveIns.size() + 2 * expectedForwarding.size();
     for (auto [ordinal, pair] : llvm::enumerate(record.validityCaptures)) {
       if (!prepared.valueAvailability || pair.first >= availabilityPayloadCaptures ||
           pair.second != baseCaptures + ordinal ||
@@ -5953,7 +6260,7 @@ private:
         preparation.checkBase != cursor ||
         preparation.totalResults != expectedTotal ||
         preparation.expectedAdmission.size() !=
-            (6 + !preparation.requirements.empty() +
+            (6 + !expectedEntryOwners.empty() + !preparation.requirements.empty() +
              !preparation.resources.empty() + !preparation.queueProposals.empty() + !preparation.memoryProposals.empty() +
              !expectedDomains.empty()) ||
         preparation.expectedAdmission.getAs<IntegerAttr>("clock_capture") !=
@@ -6009,6 +6316,12 @@ private:
     expected.erase("ac.guard_location");
     expected.erase("ac.registration_entry");
     expected.erase("ac.after");
+    if (!plan.predecessorIndices.empty()) {
+      SmallVector<Attribute> after;
+      for (auto index : plan.predecessorIndices)
+        after.push_back(routedOccurrence(*prepared.transactions[index].plan));
+      expected.set("ac.after", ArrayAttr::get(transaction.getContext(), after));
+    }
     if (!plan.registrationPath.empty()) {
       expected.set("occurrence", routedOccurrence(plan));
       expected.set("ac.lexical_registration", transaction.getOccurrence());
@@ -6073,6 +6386,25 @@ private:
       visibleEntries[ownerIndex] = lexical.lookup({ref.anchor, ref.value});
     }
     Operation *last = nullptr;
+    for (auto [ordinal, forward] : llvm::enumerate(expectedForwarding)) {
+      const auto &prior = prepared.transactions[forward.predecessor];
+      const auto &output = prior.outputs[forward.output];
+      auto producer = candidate.transactions[forward.predecessor].rule;
+      Value data = producer->getResult(output.dataResult);
+      Value enable = producer->getResult(output.enableResult);
+      if (rule->getOperand(forward.dataCapture) != data ||
+          rule->getOperand(forward.enableCapture) != enable ||
+          rule.getBody().front().getArgument(forward.dataCapture).getType() != data.getType() ||
+          rule.getBody().front().getArgument(forward.enableCapture).getType() != enable.getType())
+        return reject("original predecessor proposal capture is disconnected");
+      if (failed(localBranchProof(transaction, plan.owners[forward.owner].payloadType,
+              plan.frames[0].bindings,
+              rule.getBody().front().getArgument(forward.enableCapture),
+              rule.getBody().front().getArgument(forward.dataCapture),
+              visibleEntries[forward.owner], record.forwarding[ordinal],
+              &rule.getBody().front(), last))) return failure();
+      visibleEntries[forward.owner] = record.forwarding[ordinal].value;
+    }
     if (!product(budget, transaction, plan.versions.size(),
                  1 + SourceCheckBudget::bytes(sizeof(MaterializedVersion))) ||
         !product(
@@ -6301,7 +6633,10 @@ private:
       if (owner.instancePath != plan.instances[anchor].occurrencePath ||
           owner.occurrence != declaration.getOccurrence() ||
           owner.domain != plan.domain ||
-          failed(replay.identify(owner.oldQ, declaration.getQ(), anchor,
+          failed(replay.identify(owner.oldQ,
+                                 declaration.isDWire() && llvm::any_of(plan.writes,
+                                     [&](const auto &write) { return write.owner == id; })
+                                     ? declaration.getInitial() : declaration.getQ(), anchor,
                                  plan.rootFrame)))
         return reject("original owner old-Q/occurrence/domain differs");
       auto clock = replay.find(declaration.getClk(), anchor, plan.rootFrame);
@@ -7600,6 +7935,9 @@ private:
       return failure();
     if (yield->getNumOperands() != rule->getNumResults())
       return reject("original Rule yield arity differs");
+    for (auto [ordinal, owner] : llvm::enumerate(expectedEntryOwners))
+      if (yield->getOperand(legacyTotal + ordinal) != visibleEntries[owner])
+        return reject("original entry visibility result differs from proven chain");
     for (const auto &domain : preparation.writeDomains)
       if (domain.write >= record.selectedWrites.size() ||
           yield->getOperand(domain.result) != record.selectedWrites[domain.write].mask ||
@@ -8430,6 +8768,20 @@ FailureOr<OwningOpRef<mlir::ModuleOp>> materializeHardwareState(
              module.getBody().front().getOps<ac::SourceStateOp>())) {
       auto update = logicalUpdate(state, budget);
       if (failed(update)) return failure();
+      if (state.isDWire()) {
+        OpBuilder builder(state);
+        OperationState wire(state.getLoc(), ac::DWireOp::getOperationName());
+        wire.addTypes(state.getQ().getType());
+        wire.addOperands({state.getClk(), state.getRst(), update->getIntent(),
+                          update->getCandidate(), state.getInitial()});
+        wire.addAttribute("instance_name", state.getInstanceNameAttr());
+        wire.addAttribute("occurrence", state.getOccurrence());
+        auto *physical = builder.create(wire);
+        state.getQ().replaceAllUsesWith(physical->getResult(0));
+        update->erase();
+        state.erase();
+        continue;
+      }
       bool dff = unconditionalScalarState(state, *update, analysis, budget);
       auto primitive = dff ? primitives->dff : primitives->dffe;
       if (!primitive)
@@ -8523,7 +8875,7 @@ public:
       OwningOpRef<mlir::ModuleOp> staged = cast<mlir::ModuleOp>(input->clone());
       Builder attributes(input.getContext());
       (*staged)->setAttr("ac.stage", attributes.getStringAttr("routed"));
-      (*staged)->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(llvm::any_of(staged->getOps<ac::SystemOp>(), [](ac::SystemOp system) { return system->hasAttr("ac.entry_boundary"); }) ? 3 : 2));
+      (*staged)->setAttr("ac.routed_contract", attributes.getI64IntegerAttr(ac::requiredHardwareContractVersion(*staged)));
       if (failed(ac::verifyRoutedPackage(*staged, graphLimits))) {
         signalPassFailure();
         return;

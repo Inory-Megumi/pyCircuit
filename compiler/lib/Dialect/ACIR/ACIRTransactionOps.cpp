@@ -383,6 +383,18 @@ LogicalResult staticInitializer(const HardwareAnalysis &analysis, Value initial,
   return success();
 }
 
+LogicalResult wireIdleValue(const HardwareAnalysis &analysis, Value initial,
+                            const HardwareBindings &bindings, Operation *site) {
+  auto constant = initial.getDefiningOp<BitsConstantOp>();
+  if (!constant)
+    return site->emitOpError() << "dwire requires its compiler-owned zero idle value";
+  auto evaluated = analysis.evaluateStatic(constant.getValue(), bindings, site);
+  auto integer = succeeded(evaluated) ? dyn_cast<MathIntAttr>(*evaluated) : MathIntAttr();
+  if (!integer || !llvm::APSInt(integer.getCanonicalValue()).isZero())
+    return site->emitOpError() << "dwire requires its compiler-owned zero idle value";
+  return success();
+}
+
 } // namespace
 
 LogicalResult detail::verifyClosedStateInitializer(
@@ -802,6 +814,9 @@ FailureOr<Type> detail::resolveSourceBranchResultType(
 }
 
 LogicalResult SourceStateOp::verify() {
+  if ((*this)->hasAttr("ac.dwire") &&
+      (!isa<UnitAttr>((*this)->getAttr("ac.dwire")) || !isa<BitsType>(getQ().getType())))
+    return emitOpError() << "dwire requires a unit marker and scalar Bits payload";
   auto package = (*this)->getParentOfType<mlir::ModuleOp>();
   auto stage = package ? package->getAttrOfType<StringAttr>("ac.stage")
                        : StringAttr();
@@ -858,7 +873,29 @@ LogicalResult SourceStateOp::verify() {
       return emitOpError()
              << "routed logical state requires exactly one same-block update";
   }
-  return staticInitializer(analysis, getInitial(), bindings, *this);
+  if (failed(staticInitializer(analysis, getInitial(), bindings, *this)))
+    return failure();
+  return isDWire() ? wireIdleValue(analysis, getInitial(), bindings, *this) : success();
+}
+
+LogicalResult DWireOp::verify() {
+  auto package = (*this)->getParentOfType<mlir::ModuleOp>();
+  auto stage = package ? package->getAttrOfType<StringAttr>("ac.stage") : StringAttr();
+  if (!stage || stage.getValue() != "final" ||
+      failed(namedDeclaration(*this, getInstanceNameAttr())))
+    return emitOpError() << "dwire requires final Module graph placement";
+  HardwareAnalysis analysis(package);
+  auto bindings = scope(*this);
+  if (!areEquivalentHardwareTypes(getInitial().getType(), getQ().getType()) ||
+      !areEquivalentHardwareTypes(getData().getType(), getQ().getType()))
+    return emitOpError() << "dwire data, default and result types must match";
+  if (failed(predicate(analysis, getClk(), bindings, *this, "wire clock")) ||
+      failed(predicate(analysis, getRst(), bindings, *this, "wire reset")) ||
+      failed(predicate(analysis, getEnable(), bindings, *this, "wire enable")))
+    return failure();
+  if (failed(staticInitializer(analysis, getInitial(), bindings, *this)))
+    return failure();
+  return wireIdleValue(analysis, getInitial(), bindings, *this);
 }
 
 void StateUpdateOp::getEffects(
@@ -878,7 +915,8 @@ LogicalResult StateUpdateOp::verify() {
                       : IntegerAttr();
   if (!owner || !package || !stage || stage.getValue() != "routed" ||
       package->hasAttr("ac.unit_kind") || !contract ||
-      !contract.getType().isSignlessInteger(64) || (contract.getValue() != 2 && contract.getValue() != 3))
+      !contract.getType().isSignlessInteger(64) ||
+      (contract.getValue() != 2 && contract.getValue() != 3 && contract.getValue() != 4))
     return emitOpError()
            << "requires direct module graph placement in a versioned routed "
               "package";
@@ -1259,8 +1297,32 @@ LogicalResult SourceTransactionOp::verify() {
                                              other.getOccurrence()) == 0)
       return emitOpError() << "transaction registration occurrence must be unique";
   }
-  if ((*this)->hasAttr("ac.after") || (*this)->hasAttr("ac.callable_after"))
-    return emitOpError() << "source after ordering is retired; independent Rules read current state";
+  if (Attribute raw = (*this)->getAttr("ac.after")) {
+    auto after = dyn_cast<ArrayAttr>(raw);
+    if ((*this)->hasAttr("ac.callable_after") || !after || after.size() != 1 ||
+        !(*this)->hasAttr("ac.registration_entry") || getDeclaration() != getOccurrence())
+      return emitOpError() << "ac.after requires one predecessor of an autonomous Rule";
+    llvm::DenseSet<Attribute> seen;
+    for (Attribute entry : after) {
+      auto predecessor = dyn_cast<DictionaryAttr>(entry);
+      if (failed(moduleOccurrence(*this, predecessor, "transaction predecessor")) ||
+          !seen.insert(entry).second)
+        return emitOpError() << "ac.after requires distinct local registrations";
+      unsigned matches = 0;
+      for (auto candidate : owner.getBody().front().getOps<SourceTransactionOp>())
+        if (detail::compareClosedSourceStructure(predecessor,
+                                                 candidate.getOccurrence()) == 0) {
+          if (candidate == *this || !candidate->hasAttr("ac.registration_entry") ||
+              candidate.getDeclaration() != candidate.getOccurrence())
+            return emitOpError() << "ac.after requires another autonomous Rule";
+          ++matches;
+        }
+      if (matches != 1)
+        return emitOpError() << "ac.after requires exactly one local outer registration";
+    }
+  }
+  if ((*this)->hasAttr("ac.callable_after"))
+    return emitOpError() << "callable-level ordering is unsupported";
   HardwareAnalysis analysis((*this)->getParentOfType<mlir::ModuleOp>());
   auto bindings = scope(*this);
   if (failed(predicate(analysis, getClk(), bindings, *this,

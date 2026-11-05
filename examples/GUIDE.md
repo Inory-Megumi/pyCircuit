@@ -10,6 +10,7 @@ outside the current example catalog.
 | Example | What to learn |
 | --- | --- |
 | [hello_counter](hello_counter/README.md) | A small System, persistent state and a nested Rule. |
+| [dwire_counter](dwire_counter/README.md) | Local candidate: independent increment/decrement requests using one same-cycle `dwire()` API. |
 | [multi_outputs](multi_outputs/README.md) | Direct Module calls; Struct connections and independent tuple results. |
 | [sibling_calls](sibling_calls/README.md) | Existing Module references and independent callbacks reading committed state. |
 | [sibling_atomic](sibling_atomic/README.md) | A late sibling guard holds the whole transaction while the reader continues. |
@@ -38,8 +39,9 @@ Each static Module call creates a distinct child instance. Bind the result once
 and reuse it to fan out existing outputs. Pass fields that travel together as one
 named Struct connection; return a tuple only for independent destinations.
 One value remains a scalar, without a one-field Struct or singleton tuple.
-Module-scope annotated declarations are persistent state, while Rule locals and
-ordinary Module expressions remain combinational values.
+Module-scope annotated declarations are persistent state, except the local
+candidate's explicit `dwire()` declaration. Rule locals and ordinary Module
+expressions remain combinational values.
 
 ## Design references
 

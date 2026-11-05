@@ -734,6 +734,30 @@ public:
       return failure();
     for (auto [owner, version] : llvm::enumerate(candidates))
       plan.finalVersions.push_back({owner, version});
+    if (!budget.charge(transaction, plan.owners.size())) return failure();
+    if (llvm::any_of(plan.owners, [](const auto &owner) { return owner.declaration.isDWire(); })) {
+      if (!budget.chargeStorage<uint8_t>(transaction, plan.owners.size()) ||
+          !budget.charge(transaction, plan.owners.size() + plan.reads.size() + plan.writes.size()))
+        return failure();
+      SmallVector<uint8_t, 0> accesses(plan.owners.size(), 0);
+      for (const auto &read : plan.reads) {
+        if (read.owner >= accesses.size()) return failure();
+        accesses[read.owner] |= 1;
+      }
+      for (const auto &write : plan.writes) {
+        if (write.owner >= accesses.size()) return failure();
+        accesses[write.owner] |= 2;
+      }
+      for (auto [id, state] : llvm::enumerate(plan.owners)) {
+        if (!state.declaration.isDWire() || !(accesses[id] & 2)) continue;
+        if (accesses[id] & 1)
+          return transaction.emitOpError() << "DWire read and write must belong to separate atomic Rules";
+        auto initial = useValue(state.declaration.getInitial(), state.anchor, plan.rootFrame, transaction);
+        if (failed(initial)) return failure();
+        state.oldQ = *initial;
+        plan.versions[q0Versions[id]].value = *initial;
+      }
+    }
     budget.setPhase("transaction plan validation");
     if (failed(verifyPlan())) return failure();
     return std::move(plan);
@@ -3549,7 +3573,12 @@ void runTransactionStateAnalysis(
       for (auto module : closures[root]) liftedDefinitions.insert(module);
     }
   }
-  if (expected && liftedRoots.empty()) {
+  bool hasOrder = false;
+  for (auto transaction : inventory.transactions) {
+    if (!budget.charge(transaction)) return;
+    hasOrder |= transaction->hasAttr("ac.after");
+  }
+  if (expected && liftedRoots.empty() && !hasOrder) {
     // Without an affected root, the existing builder creates exactly one plan
     // per lexical registration, in the preflight inventory order. Revalidate
     // the entire inventory here; caller-supplied routing hints never select
@@ -3566,7 +3595,8 @@ void runTransactionStateAnalysis(
       if (!candidate || candidate->transaction != transaction ||
           candidate->lexicalModule != lexical || candidate->routingModule != lexical ||
           !candidate->registrationPath || !candidate->registrationPath.empty() ||
-          candidate->lexicalAnchor != 0 || candidate->ordinal != index) {
+          candidate->lexicalAnchor != 0 || candidate->ordinal != index ||
+          !candidate->predecessors.empty() || !candidate->predecessorIndices.empty()) {
         boundedError(transaction) << "transaction occurrence routing differs";
         return;
       }
@@ -3761,6 +3791,101 @@ void runTransactionStateAnalysis(
     rebased.push_back(std::move(plan));
   }
   completed = std::move(rebased);
+  if (hasOrder) {
+    if (!budget.chargeStorage<SmallVector<uint64_t, 0>>(package, completed.size()) ||
+        !budget.chargeStorage<unsigned>(package, completed.size())) return;
+    SmallVector<SmallVector<uint64_t, 0>, 0> direct(completed.size());
+    for (auto [current, plan] : llvm::enumerate(completed)) {
+      auto transaction = plan.transaction;
+      auto add = [&](uint64_t predecessor) -> LogicalResult {
+        auto &entries = direct[current];
+        if (!budget.charge(transaction, entries.size() + 1)) return failure();
+        if (llvm::is_contained(entries, predecessor)) return success();
+        if (!budget.chargeStorage<uint64_t>(transaction, 1) ||
+            !budget.reserve(transaction, entries, 1)) return failure();
+        entries.push_back(predecessor);
+        return success();
+      };
+      if (auto after = transaction->getAttrOfType<ArrayAttr>("ac.after"))
+        for (Attribute identity : after) {
+          std::optional<uint64_t> predecessor;
+          for (auto [index, prior] : llvm::enumerate(completed)) {
+            if (!budget.charge(transaction)) return;
+            if (prior.routingModule != plan.routingModule ||
+                prior.registrationPath != plan.registrationPath ||
+                prior.lexicalModule != plan.lexicalModule) continue;
+            if (detail::compareClosedSourceStructure(prior.transaction.getOccurrence(), identity) == 0) {
+              if (predecessor) { transaction.emitOpError() << "after registration is ambiguous"; return; }
+              predecessor = index;
+            }
+          }
+          if (!predecessor || *predecessor == current) {
+            transaction.emitOpError() << "after target requires another local registration";
+            return;
+          }
+          if (failed(add(*predecessor))) return;
+        }
+    }
+    budget.setPhase("transaction order closure");
+    SmallVector<unsigned, 0> colors(completed.size(), 0);
+    SmallVector<uint64_t, 0> transactionStack;
+    std::function<LogicalResult(uint64_t, unsigned)> visit =
+        [&](uint64_t index, unsigned depth) -> LogicalResult {
+      auto &plan = completed[index];
+      auto transaction = plan.transaction;
+      if (depth > maxDepth || !budget.charge(transaction)) return failure();
+      if (colors[index] == 1) {
+        auto diagnostic = transaction.emitOpError() << "transaction after dependency graph is cyclic";
+        for (auto participant : transactionStack) {
+          const auto &member = completed[participant];
+          if (!budget.charge(transaction)) return failure();
+          diagnostic.attachNote(member.transaction->getLoc())
+              << "outer registration occurrence=" << member.transaction->getAttr("occurrence")
+              << " at actual lexical instance path " << member.registrationPath;
+          for (const auto &frame : member.frames) {
+            if (!budget.charge(transaction)) return failure();
+            if (!frame.method) continue;
+            auto method = frame.method;
+            diagnostic.attachNote(method.getLoc())
+                << "invoked declaration @" << method.getSymName()
+                << " occurrence=" << method.getOccurrence()
+                << " on actual receiver path " << member.instances[frame.anchor].occurrencePath;
+            if (frame.call)
+              diagnostic.attachNote(frame.call->getLoc()) << "invocation participating in this outer transaction";
+          }
+        }
+        return failure();
+      }
+      if (colors[index] == 2) return success();
+      colors[index] = 1;
+      if (!budget.reserve(transaction, transactionStack, 1)) return failure();
+      transactionStack.push_back(index);
+      llvm::DenseSet<uint64_t> seen;
+      for (auto predecessor : direct[index]) {
+        if (failed(visit(predecessor, depth + 1))) return failure();
+        const auto &prior = completed[predecessor];
+        if (!(prior.domain == plan.domain))
+          return transaction.emitOpError() << "after predecessor belongs to another clock/reset domain";
+        auto append = [&](uint64_t ancestor) {
+          if (!seen.insert(ancestor).second) return true;
+          if (!budget.chargeStorage<SourceTransactionOp>(transaction, 1) ||
+              !budget.reserve(transaction, plan.predecessors, 1) ||
+              !budget.reserve(transaction, plan.predecessorIndices, 1)) return false;
+          plan.predecessors.push_back(completed[ancestor].transaction);
+          plan.predecessorIndices.push_back(ancestor);
+          return true;
+        };
+        for (auto ancestor : prior.predecessorIndices)
+          if (!append(ancestor)) return failure();
+        if (!append(predecessor)) return failure();
+      }
+      transactionStack.pop_back();
+      colors[index] = 2;
+      return success();
+    };
+    for (uint64_t index = 0; index < completed.size(); ++index)
+      if (failed(visit(index, 0))) return;
+  }
   if (expected) {
     budget.setPhase("lifted transaction occurrence verification");
     if (expected->size() != completed.size()) {
@@ -3775,7 +3900,9 @@ void runTransactionStateAnalysis(
           candidate->registrationPath != source.registrationPath ||
           candidate->ordinal != source.ordinal ||
           candidate->lexicalModule != source.lexicalModule ||
-          candidate->lexicalAnchor != source.lexicalAnchor) {
+          candidate->lexicalAnchor != source.lexicalAnchor ||
+          candidate->predecessors != source.predecessors ||
+          candidate->predecessorIndices != source.predecessorIndices) {
         boundedError(source.transaction) << "transaction occurrence routing differs";
         return;
       }

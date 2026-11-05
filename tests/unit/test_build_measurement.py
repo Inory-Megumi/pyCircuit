@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import sys
@@ -87,3 +88,36 @@ def test_phase_measurements_report_nonnegative_numeric_values(
         for key in ("bytes_before", "bytes_after"):
             if change[key] is not None:
                 _assert_nonnegative_number(change[key])
+
+
+def test_failed_phase_preserves_diagnostics_and_measurements(tmp_path: Path) -> None:
+    tool = _measurement_tool()
+    result = tool._run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stderr.write('link failed'); sys.exit(3)",
+        ],
+        cwd=tmp_path,
+        env=os.environ.copy(),
+    )
+    with pytest.raises(RuntimeError, match="link failed"):
+        tool._phase("compile_link", result, [], [], tmp_path)
+    assert (tmp_path / "compile_link.stderr.txt").read_text() == "link failed"
+    receipt = json.loads((tmp_path / "compile_link.measurement.json").read_text())
+    assert receipt["exit_status"] == 3
+    assert receipt["timed_out"] is False
+    _assert_nonnegative_number(receipt["wall_seconds"])
+    assert receipt["rss"]["unit"] == "KiB"
+
+
+def test_prefixed_cpp_compiler_is_counted_as_module_compilation() -> None:
+    tool = _measurement_tool()
+    commands = tool._executed_commands(
+        "[1/2] /deps/bin/x86_64-conda-linux-gnu-c++ -O3 "
+        "-o CMakeFiles/pycircuit_modules.dir/sources/leaf.cpp.o "
+        "-c /generated/sources/leaf.cpp"
+    )
+    assert len(commands) == 1
+    assert commands[0]["kind"] == "cpp_module_target_compile"
+    assert commands[0]["source"] == "/generated/sources/leaf.cpp"

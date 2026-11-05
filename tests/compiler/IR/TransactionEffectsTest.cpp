@@ -1133,7 +1133,7 @@ TEST_F(TransactionEffectsTest,
 }
 
 TEST_F(TransactionEffectsTest,
-       RetiredAfterAttributesRejectAtEveryNativeCallableEntry) {
+       UnsupportedOrderAttributesRejectAtNativeCallableEntries) {
   for (llvm::StringRef operation : {"ac.method", "ac.transaction"}) {
     for (llvm::StringRef field : {"ac.after", "ac.callable_after"}) {
       for (unsigned shape = 0; shape != 3; ++shape) {
@@ -1148,7 +1148,9 @@ TEST_F(TransactionEffectsTest,
         target->setAttr(field, shape == 0 ? mlir::Attribute(builder.getArrayAttr({}))
                               : shape == 1 ? mlir::Attribute(builder.getArrayAttr({occurrence}))
                                            : mlir::Attribute(builder.getUnitAttr()));
-        reject(*file, "after ordering is retired");
+        reject(*file, operation == "ac.method" ? "after ordering is retired"
+                      : field == "ac.after" ? "ac.after requires one predecessor"
+                                            : "callable-level ordering is unsupported");
       }
     }
   }

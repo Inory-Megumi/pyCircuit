@@ -156,6 +156,8 @@ FailureOr<unsigned> requiredTransactionSchema(Operation *module, Attribute value
     for (NamedAttribute field : row) {
       if (!budget.charge()) return failure();
       StringRef name = field.getName().getValue();
+      if (name == "after" && row.get("registration")) needed = std::max(needed, 4u);
+      if (name == "dwire" && row.get("state")) needed = std::max(needed, 5u);
       if (name == "reference_bindings" || name == "reference")
         needed = std::max(needed, 2u);
       auto child = requiredTransactionSchema(module, field.getValue(), budget, depth + 1);
@@ -229,6 +231,11 @@ public:
                          {"domain", *domain}});
         if (!row)
           return failure();
+        if (state.isDWire()) {
+          NamedAttrList fields(row);
+          fields.append("dwire", builder.getUnitAttr());
+          row = fields.getDictionary(builder.getContext());
+        }
         if (Attribute constraint = state->getAttr("ac.payload_constraint")) {
           NamedAttrList fields(row);
           fields.append("payload_constraint", constraint);
@@ -939,7 +946,8 @@ private:
     return rows ? FailureOr<ArrayAttr>(rows) : FailureOr<ArrayAttr>(failure());
   }
   FailureOr<DictionaryAttr> callable(Operation *operation) {
-    if (operation->hasAttr("ac.after") || operation->hasAttr("ac.callable_after"))
+    if (operation->hasAttr("ac.callable_after") ||
+        (operation->hasAttr("ac.after") && !isa<SourceTransactionOp>(operation)))
       return operation->emitOpError() << "source after ordering is retired; independent Rules read current state";
     std::optional<SourceRegistrationEntryView> entry;
     if (auto transaction = dyn_cast<SourceTransactionOp>(operation)) {
@@ -1000,6 +1008,8 @@ private:
       row.append("registration", transaction.getOccurrence());
       if (entry)
         row.append("registration_entry", entry->call.getCalleeAttr());
+      if (auto after = transaction->getAttrOfType<ArrayAttr>("ac.after");
+          after && !after.empty()) row.append("after", after);
       row.append("domain", *domain);
       auto resultTypes = types(transaction.getResultTypes());
       if (!resultTypes)
@@ -1057,8 +1067,12 @@ public:
     if ((*newSemantics && !schema) ||
         (summary.get("schema") &&
          (!schema || !schema.getType().isSignlessInteger(64) ||
-          schema.getInt() != (*newSemantics == 3 ? 3 : 2))))
-      return error(*newSemantics == 3
+          schema.getInt() != (*newSemantics ? *newSemantics : 2))))
+      return error(*newSemantics == 5
+          ? "defaulted wires require schema = 5 : i64"
+          : *newSemantics == 4
+          ? "ordered autonomous Rules require schema = 4 : i64"
+          : *newSemantics == 3
           ? "relative receiver calls require schema = 3 : i64"
           : "reference semantics require schema = 2 : i64");
     auto owners = summary.getAs<ArrayAttr>("owners");
@@ -1081,6 +1095,11 @@ public:
       if (kind.getValue() == "state") {
         NamedAttrList core(row);
         core.erase("payload_constraint");
+        core.erase("dwire");
+        if (Attribute wire = row.get("dwire"))
+          if (auto payload = row.getAs<TypeAttr>("type");
+              !isa<UnitAttr>(wire) || !payload || !isa<BitsType>(payload.getValue()))
+            return error("dwire requires scalar Bits and a unit marker");
         if (failed(exact(core.getDictionary(declaration->getContext()),
                          {"kind", "name", "state", "type", "domain"})))
           return failure();
@@ -1270,12 +1289,15 @@ public:
       if (failed(callable(cast<DictionaryAttr>(raw), true)))
         return failure();
     DictionaryAttr previousRegistration;
+    llvm::DenseMap<Attribute, DictionaryAttr> registrations;
+    bool ordered = *newSemantics >= 4;
+    if (ordered && !budget.storage(autonomous.size(),
+          4 * (sizeof(Attribute) * 3 + sizeof(unsigned)))) return failure();
     for (Attribute raw : autonomous) {
       auto row = dyn_cast<DictionaryAttr>(raw);
       NamedAttrList core;
       if (row) core.assign(row.getValue());
-      if (row && row.get("after"))
-        return error("after ordering is retired; independent Rules read current state");
+      core.erase("after");
       core.erase("registration_entry");
       if (failed(exact(core.getDictionary(declaration->getContext()),
                        {"name", "declaration", "registration", "domain",
@@ -1292,11 +1314,46 @@ public:
         return error(
             "autonomous registrations must be unique and canonically ordered");
       previousRegistration = registration;
+      if (ordered) registrations.try_emplace(registration, row);
+      if (Attribute rawAfter = row.get("after")) {
+        auto after = dyn_cast<ArrayAttr>(rawAfter);
+        if (!after || after.size() != 1 || row.get("registration") != row.get("declaration") ||
+            !row.get("registration_entry"))
+          return error("after requires one predecessor of an autonomous Rule");
+        llvm::DenseSet<Attribute> seen;
+        for (Attribute predecessor : after)
+          if (failed(occurrence(dyn_cast<DictionaryAttr>(predecessor))) ||
+              !seen.insert(predecessor).second || predecessor == registration)
+            return error("after requires distinct other local registrations");
+      }
       if (failed(callable(row, false)))
         return failure();
       if (failed(registrationEntry(row)))
         return failure();
     }
+    llvm::DenseMap<Attribute, unsigned> colors;
+    std::function<LogicalResult(Attribute, unsigned)> visit =
+        [&](Attribute registration, unsigned depth) -> LogicalResult {
+      if (depth > 128 || !budget.charge()) return error("after graph depth exceeded");
+      if (colors.lookup(registration) == 1) return error("after graph is cyclic");
+      if (colors.lookup(registration) == 2) return success();
+      colors[registration] = 1;
+      auto row = registrations.lookup(registration);
+      if (!row) return error("after target is not a local outer registration");
+      if (auto after = row.getAs<ArrayAttr>("after"))
+        for (Attribute predecessor : after) {
+          auto target = registrations.lookup(predecessor);
+          if (!target || target.get("domain") != row.get("domain") ||
+              target.get("declaration") != target.get("registration") ||
+              !target.get("registration_entry"))
+            return error("after target must have the same local domain");
+          if (failed(visit(predecessor, depth + 1))) return failure();
+        }
+      colors[registration] = 2;
+      return success();
+    };
+    for (auto row : registrations)
+      if (failed(visit(row.first, 0))) return failure();
     return success(budget.ok());
   }
 

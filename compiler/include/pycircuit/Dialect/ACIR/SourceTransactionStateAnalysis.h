@@ -476,6 +476,12 @@ struct TransactionStatePlan {
   LexicalInstanceId lexicalAnchor = 0;
   uint64_t ordinal = 0;
   TransactionDomain domain;
+  /// Lexical source registrations in dependency order, retained for source API
+  /// clients. predecessorIndices supplies full allocated occurrence identity.
+  llvm::SmallVector<SourceTransactionOp, 0> predecessors;
+  /// Occurrence-aware identities; ordinals index getPlans(), including repeated
+  /// instantiations of the same lexical registration.
+  llvm::SmallVector<uint64_t, 0> predecessorIndices;
   InvocationFrameId rootFrame = 0;
   GuardBoundaryId guard = 0;
   llvm::SmallVector<TransactionLexicalInstance, 0> instances;

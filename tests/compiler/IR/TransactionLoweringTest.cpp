@@ -2310,7 +2310,7 @@ TEST_F(TransactionLoweringTest,
 }
 
 TEST_F(TransactionLoweringTest,
-       RetiredDiamondAfterRejectsWithoutPublishingHardware) {
+       UnsupportedDiamondAfterRejectsWithoutPublishingHardware) {
   auto file = parse();
   ASSERT_TRUE(file);
   auto a = addEmptyTransaction(*file, "after_a", 100);
@@ -2326,7 +2326,7 @@ TEST_F(TransactionLoweringTest,
   auto before = identities(*file);
   auto text = print(file->getOperation());
   EXPECT_TRUE(mlir::failed(capture([&] { return mlir::verify(*file); })));
-  EXPECT_NE(diagnostics.find("after ordering is retired"), std::string::npos)
+  EXPECT_NE(diagnostics.find("ac.after requires one predecessor"), std::string::npos)
       << diagnostics;
   unchanged(*file, before);
   EXPECT_EQ(text, print(file->getOperation()));
@@ -2335,7 +2335,7 @@ TEST_F(TransactionLoweringTest,
     return std::make_unique<SourceTransactionStateAnalysis>(file->getOperation());
   });
   ASSERT_FALSE(analysis->isValid());
-  EXPECT_NE(diagnostics.find("after ordering is retired"), std::string::npos)
+  EXPECT_NE(diagnostics.find("ac.after requires one predecessor"), std::string::npos)
       << diagnostics;
   HardwareSourceCheckLimits limits;
   detail::SourceCheckBudget preparationBudget(limits);
@@ -2348,7 +2348,7 @@ TEST_F(TransactionLoweringTest,
   EXPECT_EQ(text, print(file->getOperation()));
   // The registered route/lower pipeline must reject the same diamond rather
   // than silently dropping predecessor metadata and publishing new hardware.
-  rejects(*file, "after ordering is retired");
+  rejects(*file, "ac.after requires one predecessor");
 }
 
 TEST_F(TransactionLoweringTest,
@@ -2402,7 +2402,8 @@ TEST_F(TransactionLoweringTest,
         return acir::detail::verifyTransactionMaterialization(
             *prepared, *materialized, secondProofBudget);
       })));
-      EXPECT_NE(diagnostics.find("after ordering is retired"), std::string::npos)
+      auto category = callable ? "after ordering is retired" : "ac.after requires one predecessor";
+      EXPECT_NE(diagnostics.find(category), std::string::npos)
           << diagnostics;
       unchanged(*file, sourceBefore);
       EXPECT_EQ(sourceText, print(file->getOperation()));
@@ -2410,7 +2411,7 @@ TEST_F(TransactionLoweringTest,
       EXPECT_EQ(candidateText, print(materialized->module->getOperation()));
       // A prepared-plan cache and an already authenticated candidate do not
       // grant authority to newly attached ordering metadata, even when empty.
-      rejects(*file, "after ordering is retired");
+      rejects(*file, category);
       unchanged(*materialized->module, candidateBefore);
       EXPECT_EQ(candidateText, print(materialized->module->getOperation()));
     }

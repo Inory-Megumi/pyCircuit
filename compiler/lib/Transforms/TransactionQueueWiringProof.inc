@@ -85,7 +85,7 @@
         const auto &plan = *transaction.plan;
         if (plan.routingModule != definition.module) return reject("queue external occurrence routing owner differs");
         auto external = originalQueueExternalPops(transaction,
-            transaction.liveIns.size());
+            transaction.liveIns.size() + 2 * transaction.forwarding.size());
         if (failed(external)) return failure();
         for (const auto &capture : *external) {
           const auto &owner = plan.queueOwners[capture.owner];

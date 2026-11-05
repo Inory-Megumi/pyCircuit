@@ -218,6 +218,8 @@ def scan_public_surface() -> list[str]:
         expected = {
             "module",
             "rule",
+            "schedule",
+            "dwire",
             "method",
             "struct",
             "bits",

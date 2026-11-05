@@ -165,6 +165,10 @@ LogicalResult Importer::scanSourceCallables() {
     StringRef moduleName = module.string("name");
     for (size_t j = 0; j < module.array("body").size(); ++j) {
       AstNode declaration = module.item("body", j);
+      if (declaration.kind() == "AnnAssign" &&
+          declaration.child("value").kind() == "Call" &&
+          intrinsic(declaration.child("value").child("func"), "dwire"))
+        transactionModuleNames.insert(moduleName);
       if (declaration.kind() != "FunctionDef")
         continue;
       bool marked = false;
@@ -184,13 +188,10 @@ LogicalResult Importer::scanSourceCallables() {
       if (failed(syntax)) {
         return failure();
       }
-      if (syntax->after) return error() << "source after is retired; independent Rules read current state";
       staged[moduleName].push_back({declaration, *syntax});
       if (syntax->marker == MarkerKind::Rule) transactionModuleNames.insert(moduleName);
       if (syntax->marker == MarkerKind::Method)
         methodOwnerNames.insert(moduleName);
-      if (syntax->marker == MarkerKind::Rule && (syntax->guard || syntax->after))
-        transactionModuleNames.insert(moduleName);
       if (syntax->marker != MarkerKind::Rule || syntax->guard)
         continue;
       // Only statement-arm observations need the typed route here. Assertions
@@ -760,8 +761,6 @@ LogicalResult Importer::scanSourceCallables() {
     auto syntax = readCallableSyntax(
         declaration, [&](const AstNode &node) { return resolveBinding(node); },
         error);
-    if (succeeded(syntax) && syntax->after)
-      return error() << "source after is retired; independent Rules read current state";
     if (failed(syntax))
       return failure();
   }
@@ -2580,6 +2579,15 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
         sourceOccurrence(at, decl.symbol, statement));
     return success();
   };
+  auto scheduleCall = [&](const AstNode &statement) {
+    AstNode call = statement.kind() == "Expr" ? statement.child("value") : AstNode();
+    return call.kind() == "Call" &&
+                   resolvesMarker(call.child("func"), MarkerKind::Schedule,
+                                  [&](const AstNode &node) { return resolveBinding(node); })
+               ? call : AstNode();
+  };
+  AstNode scheduleDeclaration;
+  llvm::StringMap<DictionaryAttr> scheduledPredecessors;
   bool sawStructuralReturn = false;
   for (size_t i = 0; i < decl.node.array("body").size(); ++i) {
     AstNode statement = decl.node.item("body", i);
@@ -2592,7 +2600,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
     if (sawStructuralReturn &&
         (statement.kind() == "Assign" || statement.kind() == "AnnAssign" ||
          statement.kind() == "AugAssign" || statement.kind() == "If" ||
-         statement.kind() == "Match" || statement.kind() == "For"))
+         statement.kind() == "Match" || statement.kind() == "For" ||
+         scheduleCall(statement)))
       return error() << "new local binding after structural return";
   }
   size_t instanceCount = 0;
@@ -2643,6 +2652,41 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
         structuralCallSites.contains(sourceOccurrence(
             at, decl.symbol, statement.child("value")))) {
       ordinaryModuleAssignments.insert(sourceOccurrence(at, decl.symbol, statement));
+      continue;
+    }
+    if (auto call = scheduleCall(statement)) {
+      if (scheduleDeclaration)
+        return error() << "Module accepts one schedule declaration";
+      if (call.array("args").empty() || !call.array("keywords").empty())
+        return error() << "schedule requires positional local Rule names";
+      TableQueryCharge charge;
+      std::string reason;
+      bool fits = TableQueryBudget::addProduct(
+                      charge, TableQueryResource::Work, call.array("args").size(),
+                      call.path.size() + 4) &&
+                  TableQueryBudget::addProduct(
+                      charge, TableQueryResource::Slots, call.array("args").size(), 24);
+      if (!fits || !queryBudget.reserve(charge, reason))
+        return error() << "source schedule construction: "
+                       << (fits ? reason : "schedule storage counter exhausted");
+      llvm::StringSet<> scheduled;
+      DictionaryAttr previous;
+      for (size_t j = 0; j < call.array("args").size(); ++j) {
+        AstNode argument = call.item("args", j);
+        StringRef name = argument.string("id");
+        auto target = rules.find(name);
+        if (argument.kind() != "Name" || target == rules.end() ||
+            !target->second.autonomous)
+          return error() << "schedule requires directly nested autonomous Rule names";
+        DictionaryAttr occurrence = sourceOccurrence(at, decl.symbol, target->second.declaration);
+        if (!registeredTransactions.contains(occurrence))
+          return error() << "schedule must follow its Rule declarations";
+        if (!scheduled.insert(name).second)
+          return error() << "schedule cannot repeat a Rule";
+        if (previous) scheduledPredecessors[name] = previous;
+        previous = occurrence;
+      }
+      scheduleDeclaration = statement;
       continue;
     }
     if (statement.kind() == "Expr") {
@@ -2870,6 +2914,11 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
       auto target = tableState ? statement.item("targets", 0) : statement.child("target");
       AstNode annotation = tableState ? allocation.child("func") : statement.child("annotation");
       AstNode initializer = statement.child("value");
+      bool wire = initializer.kind() == "Call" && intrinsic(initializer.child("func"), "dwire");
+      if (wire) {
+        if (!initializer.array("args").empty() || !initializer.array("keywords").empty())
+          return error() << "dwire() takes no arguments; its payload type comes from the annotation";
+      }
       if (tableState) {
         if (!allocation.array("args").empty() || allocation.array("keywords").size() != 1 ||
             allocation.item("keywords", 0).string("arg") != "init")
@@ -2884,6 +2933,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
         return error() << "persistent owner name is duplicated or protected";
       auto type = portType(annotation, decl.symbol);
       if (failed(type)) return failure();
+      if (wire && !isa<ac::BitsType>(*type))
+        return error() << "dwire currently requires a scalar Bits payload";
       Port boundaryPort{name.str(), *type, annotation, annotationKind(annotation),
                         fixedAnnotation(annotation)};
       llvm::StringMap<Instance *> none;
@@ -2891,8 +2942,10 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
           states.contains(initializer.string("id")))
         return error()
                << "persistent initializer must be a static complete value";
-      auto initial = stateInitializer(boundaryPort, initializer, statement,
-                                       at, decl.symbol, moduleValues, none, true);
+      auto initial = wire
+          ? constant(*type, 0, statement, at, decl.symbol)
+          : stateInitializer(boundaryPort, initializer, statement,
+                             at, decl.symbol, moduleValues, none, true);
       if (failed(initial)) return failure();
       auto payloadConstraint = sourceConstraint(boundaryPort);
       if (failed(payloadConstraint)) return failure();
@@ -2903,6 +2956,7 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
           {at.getNamedAttr("instance_name", at.getStringAttr(name)),
            at.getNamedAttr("ac.payload_constraint", *payloadConstraint),
            at.getNamedAttr("occurrence", sourceOccurrence(at, decl.symbol, statement))});
+      if (wire) state->setAttr("ac.dwire", at.getUnitAttr());
       helperOwnerBindings.insert(name);
       states[name] = {name.str(), *type, *initial, state, statement};
       rememberState(state->getResult(0), states[name]);
@@ -3081,6 +3135,9 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
     if (!transaction || methodName == registrationMethods.end())
       return error() << "Rule registration lacks its shared callable entry";
     transaction->setAttr("ac.registration_entry", at.getUnitAttr());
+    if (localDeclaration)
+      if (auto predecessor = scheduledPredecessors.lookup(name))
+        transaction->setAttr("ac.after", at.getArrayAttr({predecessor}));
     SmallVector<Value> captures(ruleArguments[invocation]);
     transaction->insertOperands(2, captures);
     for (unsigned regionIndex = 0; regionIndex < 2; ++regionIndex) {
@@ -3135,7 +3192,8 @@ LogicalResult Importer::emitSourceTransactions(ModuleDecl &decl) {
     AstNode statement = decl.node.item("body", i);
     if (staticReferenceAssignments.contains(namespaceSite(statement)))
       continue;
-    if (statement.kind() == "FunctionDef" || statement.kind() == "AnnAssign" ||
+    if ((scheduleDeclaration && sameSourceSite(statement, scheduleDeclaration)) ||
+        statement.kind() == "FunctionDef" || statement.kind() == "AnnAssign" ||
         docstring(statement) || statement.kind() == "Pass")
       continue;
     AstNode value = statement.kind() == "Expr"     ? statement.child("value")

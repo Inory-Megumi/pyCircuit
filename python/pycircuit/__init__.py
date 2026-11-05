@@ -8,6 +8,8 @@ __all__ = [
     "module",
     "instance_ref",
     "rule",
+    "schedule",
+    "dwire",
     "method",
     "struct",
     "bits",
@@ -55,6 +57,16 @@ def instance_ref(module, *path):
 def rule(declaration=None, *, guard=None):
     """Declare automatic Module work, or a source-global Rule template."""
     raise RuntimeError("pyCircuit declarations require pycircuit compile")
+
+
+def schedule(*rules):
+    """Order local autonomous Rules within one cycle, forwarding successful writes."""
+    raise RuntimeError("pyCircuit schedules require pycircuit compile")
+
+
+def dwire():
+    """Declare a same-cycle wire, driven to zero when its writer does not commit."""
+    raise RuntimeError("pyCircuit wires require pycircuit compile")
 
 
 def method(declaration=None, *, guard=None):

@@ -621,7 +621,7 @@
         sameEndpoint(enable, candidate.enable))
       return success();
     auto base = peelDomainCommit(data, candidate, stateIndex);
-    auto oldQ = normal(state.storage->getResult(0), state.scope);
+    auto oldQ = normal(state.endpoint.wire ? state.endpoint.initial : state.storage->getResult(0), state.scope);
     if (failed(base) || failed(oldQ) || !sameEndpoint(*oldQ, *base) ||
         !sameEndpoint(enable, candidate.enable))
       return state.storage->emitOpError()
@@ -654,7 +654,7 @@
     }
     if (storage && expected != state.candidates.size())
       return state.storage->emitOpError() << "storage commit misses actual owner contributors";
-    auto oldQ = normal(state.storage->getResult(0), state.scope);
+    auto oldQ = normal(state.endpoint.wire ? state.endpoint.initial : state.storage->getResult(0), state.scope);
     if (failed(oldQ)) return failure();
     if (!*incoming && expected != local.size())
       return entry.module->emitOpError()
@@ -670,6 +670,29 @@
       if (failed(zero) || !zero->has_value() || **zero)
         return entry.module->emitOpError() << "empty transaction prefix requires old Q or known-zero data";
       return success();
+    }
+    if (!*incoming && !state.unordered.value_or(false)) {
+      // The producer starts an ordered local group with its exact first
+      // candidate, then folds later candidates using selection and enable OR.
+      // A descendant incoming closure must preserve this ancestor prefix; it
+      // does not turn that group into disjoint unordered domain writers.
+      for (size_t i = local.size(); i > 1; --i) {
+        const auto &candidate = *local[i - 1];
+        auto prior = peelSelection(data, candidate.enable, candidate.data,
+                                   stateIndex);
+        auto earlier = peelEnableOr(enable, candidate.enable, stateIndex);
+        if (failed(prior) || failed(earlier) ||
+            failed(privateRoute(data.value, data.scope, stateIndex,
+                                PrivateRoute::Data)) ||
+            failed(privateRoute(enable.value, enable.scope, stateIndex,
+                                PrivateRoute::Enable))) return failure();
+        data = *prior;
+        enable = *earlier;
+      }
+      // The first ancestor partial lane is already composed with physical
+      // old Q before routing. Authenticate its masks/base independently rather
+      // than requiring the raw Rule result used by a same-scope writer.
+      return proveSingleCandidate(data, enable, stateIndex, *local.front());
     }
     for (size_t i = local.size(); i > 0; --i) {
       const auto &candidate = *local[i - 1];
@@ -716,7 +739,7 @@
       prior = *base;
       if (i > 1) { auto previous = peelDomainEnable(enabled, state.candidates[i - 1].enable, stateIndex); if (failed(previous)) return failure(); enabled = *previous; }
     }
-    auto oldQ = normal(state.storage->getResult(0), state.scope);
+    auto oldQ = normal(state.endpoint.wire ? state.endpoint.initial : state.storage->getResult(0), state.scope);
     if (failed(oldQ) || failed(domainSame(prior, *oldQ, state.storage, "unordered old-Q")) ||
         failed(domainSame(enabled, state.candidates.front().enable, state.storage, "first enable"))) return failure();
     state.data = data; state.enable = enable; state.commitProven = true; return success();

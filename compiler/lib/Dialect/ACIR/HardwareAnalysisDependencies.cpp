@@ -541,6 +541,12 @@ struct Engine {
       out.push_back({require.getPath(), {}});
       return out;
     }
+    if (auto wire = dyn_cast<DWireOp>(op)) {
+      // Clock/reset authenticate the writer domain but do not drive the wire.
+      for (Value input : {wire.getEnable(), wire.getData(), wire.getInitial()})
+        if (failed(addAll(input))) return failure();
+      return out;
+    }
     if (!isa<BitsUnaryOp, BitsBinaryOp, BitsCompareOp, BitsSelectOp,
              BitsConcatOp, BitsExtractOp, BitsResizeOp>(op))
       return op->emitOpError() << "operation outside closed hardware graph";

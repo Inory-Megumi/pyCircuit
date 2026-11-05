@@ -442,7 +442,7 @@ class AvailabilityProof {
       return Uniform();
     }
     Operation *op = value.getDefiningOp();
-    if (isa<SourceStateOp>(op)) return Uniform(1);
+    if (isa<SourceStateOp, DWireOp>(op)) return Uniform(1);
     if (auto rule = dyn_cast<RuleOp>(op)) {
       if (rule->hasAttr("ac.sampled_admission"))
         return Uniform(availability(value, path));
@@ -1006,7 +1006,7 @@ class AvailabilityProof {
     Operation *op = value.getDefiningOp();
     if (inRow(value) && op->getNumRegions())
       return reject(op, "availability has unsupported nested row regions");
-    if (isa<BitsConstantOp, BitsConstant4Op, EnumCreateOp, SourceStateOp>(op))
+    if (isa<BitsConstantOp, BitsConstant4Op, EnumCreateOp, SourceStateOp, DWireOp>(op))
       return 1;
     if (auto rule = dyn_cast<RuleOp>(op)) {
       auto yields = cast<YieldOp>(rule.getBody().front().back()).getValues();

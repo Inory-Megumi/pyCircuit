@@ -368,10 +368,22 @@ def ACIR_SourceStateOp : ACIR_Op<"state", [
   let results = (outs ACIR_HardwareType:$q);
   let hasVerifier = 1;
   let extraClassDeclaration = [{
+    bool isDWire() const { return (*this)->hasAttr("ac.dwire"); }
     ::mlir::DictionaryAttr getPayloadConstraint() {
       return (*this)->getAttrOfType<::mlir::DictionaryAttr>("ac.payload_constraint");
     }
   }];
+}
+
+// Retain the declaration identity through standalone wiring verification.
+// It is combinational, but is not an anonymously CSE-able expression.
+def ACIR_DWireOp : ACIR_Op<"dwire"> {
+  let summary = "Defaulted combinational wire authenticated against its atomic writer";
+  let arguments = (ins ACIR_BitsType:$clk, ACIR_BitsType:$rst,
+      ACIR_BitsType:$enable, ACIR_BitsType:$data, ACIR_BitsType:$initial,
+      StrAttr:$instance_name, DictionaryAttr:$occurrence);
+  let results = (outs ACIR_BitsType:$q);
+  let hasVerifier = 1;
 }
 
 def ACIR_StateUpdateOp : ACIR_Op<"state.update", [

@@ -31,7 +31,7 @@ LogicalResult verifyEntryBoundaryAttribute(Operation *operation, Attribute attri
   if (stage) {
     auto contract = package->getAttrOfType<IntegerAttr>("ac.routed_contract");
     if (!contract || !contract.getType().isSignlessInteger(64) ||
-        contract.getInt() != 3)
+        (contract.getInt() != 3 && contract.getInt() != 4))
       return operation->emitOpError("ac.entry_boundary requires ac.routed_contract = 3 : i64 in routed and final packages");
   }
   return success();

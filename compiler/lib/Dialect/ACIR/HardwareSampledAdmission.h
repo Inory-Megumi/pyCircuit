@@ -43,6 +43,17 @@ struct SampledObservationView {
   mlir::Value path;
   llvm::SmallVector<mlir::Value> values;
 };
+struct SampledEhrPredecessor {
+  mlir::DictionaryAttr registration;
+  uint64_t dataCapture = 0, enableCapture = 0;
+  mlir::Value data, enable;
+};
+struct SampledEhrEntry {
+  mlir::DictionaryAttr stateID;
+  uint64_t oldQCapture = 0, result = 0;
+  mlir::Value oldQ, selected;
+  llvm::SmallVector<SampledEhrPredecessor> predecessors;
+};
 struct SampledQueueProspectiveView {
   uint64_t capacityCapture = 0;
   std::optional<uint64_t> validCapture, externalPopCapture;
@@ -92,6 +103,7 @@ struct SampledAdmissionView {
   llvm::SmallVector<SampledControlView> controls;
   llvm::SmallVector<SampledBodyCheckView> bodyChecks;
   llvm::SmallVector<SampledObservationView> observations;
+  llvm::SmallVector<SampledEhrEntry> ehrEntries;
   llvm::SmallVector<SampledValueRequirement> requirements;
   llvm::SmallVector<SampledResourceView> resources;
   llvm::SmallVector<SampledQueueProposalView> queueProposals;
@@ -242,8 +254,9 @@ private:
   llvm::SmallVector<std::unique_ptr<Entry>, 0> entries;
 };
 
-enum class StateEndpointForm { Logical, DFF, DFFE, DFFECollection };
+enum class StateEndpointForm { Logical, DFF, DFFE, DFFECollection, DWire };
 struct StateEndpoint {
+  bool wire = false;
   StateEndpointForm form = StateEndpointForm::Logical;
   HardwareIdentityScope ownerScope;
   ModuleOp owner;

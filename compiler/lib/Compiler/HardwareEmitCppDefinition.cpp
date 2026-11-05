@@ -843,6 +843,9 @@ private:
     if (isa<ac::BitsSelectOp>(op))
       return "gfsim::select(" + operands[0] + ", " + operands[1] + ", " +
              operands[2] + ")";
+    if (isa<ac::DWireOp>(op))
+      return "gfsim::select(" + operands[2] + ", " + operands[3] + ", " +
+             operands[4] + ")";
     if (isa<ac::BitsConcatOp>(op)) {
       std::string text = operands[0];
       for (unsigned i = 1; i < operands.size(); ++i)

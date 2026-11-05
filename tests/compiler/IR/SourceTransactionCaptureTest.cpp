@@ -4987,7 +4987,7 @@ def Top(value: ac.u8) -> ac.u8:
 }
 
 TEST_F(SourceTransactionCaptureTest,
-       SourceRuleAndMethodAfterAreRejectedBeforePublication) {
+       TupleAndMethodAfterAreRejectedBeforePublication) {
   for (StringRef marker : {"rule", "method"}) {
     auto text = "import pycircuit as ac\n@ac.module\ndef Top():\n"
         "    @ac.method\n    def first() -> None:\n        pass\n"
@@ -4998,7 +4998,7 @@ TEST_F(SourceTransactionCaptureTest,
 }
 
 TEST_F(SourceTransactionCaptureTest,
-       PublishedSummariesRejectRetiredAfterEvenWithAuthenticTargets) {
+       PublishedSummariesRejectUnversionedOrUnsupportedOrderMetadata) {
   auto captured = capture("automatic_summary.py", R"py(import pycircuit as ac
 @ac.module
 def Owner() -> ac.u8:
@@ -5049,15 +5049,94 @@ def Owner() -> ac.u8:
         provider->setAttr("transaction_summary", forged);
         diagnostics.clear();
         EXPECT_TRUE(failed(mlir::verify(*header)));
-        // callable_after was never an autonomous-row field. Its closed schema
-        // rejects that extra key before the retired-ordering semantic check.
+        // A forged edge cannot silently acquire the new summary schema.
         StringRef category = section == "autonomous" && field == "callable_after"
             ? "transaction summary has missing or extra fields"
-            : "after ordering is retired";
+            : section == "autonomous" ? "ordered autonomous Rules require schema"
+                                      : "after ordering is retired";
         EXPECT_NE(diagnostics.find(category.str()), std::string::npos)
             << diagnostics;
         EXPECT_EQ(provider.getTransactionSummaryAttr(), forged);
       }
+    }
+  }
+}
+
+TEST_F(SourceTransactionCaptureTest,
+       OrderedRuleForwardingIsRecheckedOnStandaloneReload) {
+  auto captured = capture("ordered_auth.py", R"py(import pycircuit as ac
+@ac.module
+def Counter(allow: ac.u1) -> ac.u8:
+    count: ac.u8 = 3
+    @ac.rule(guard=lambda: allow)
+    def first() -> None:
+        count = count + 1
+    @ac.rule
+    def second() -> None:
+        count = count * 2
+    ac.schedule(first, second)
+    return count
+)py");
+  ASSERT_TRUE(captured);
+  auto headers = compiler::SourceHeaderRegistry::create(&context, {}, error());
+  ASSERT_TRUE(succeeded(headers));
+  auto unit = compiler::compilePythonSourceUnit(
+      *captured, owner("ordered_auth.py"), *headers, error());
+  ASSERT_TRUE(succeeded(unit)) << diagnostics;
+  compiler::SourceLinkStages stages;
+  auto linked = compiler::linkSourceUnits(
+      {{*unit->body, *unit->interface}}, "ordered_auth.Counter", error(),
+      compiler::SourceLinkTarget::Hardware, &stages);
+  ASSERT_TRUE(succeeded(linked)) << diagnostics;
+  std::string finalText;
+  llvm::raw_string_ostream finalStream(finalText);
+  (*linked)->print(finalStream);
+  for (bool routed : {true, false}) {
+    for (unsigned mutation = 0; mutation != 5; ++mutation) {
+      SCOPED_TRACE(routed);
+      SCOPED_TRACE(mutation);
+      auto file = parseSourceString<ModuleOp>(
+          routed ? stages.routedTransactions : finalText, &context);
+      ASSERT_TRUE(file) << diagnostics;
+      auto check = [&] {
+        return routed ? ac::verifyRoutedPackage(*file)
+                      : ac::verifyHardwarePackage(*file);
+      };
+      ASSERT_TRUE(succeeded(check())) << diagnostics;
+      ac::RuleOp dependent;
+      for (auto rule : operations<ac::RuleOp>(*file))
+        if (rule->hasAttr("ac.after")) dependent = rule;
+      ASSERT_TRUE(dependent);
+      auto admission = dependent->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+      auto entries = admission.getAs<ArrayAttr>("ehr_entries");
+      ASSERT_TRUE(entries);
+      ASSERT_EQ(entries.size(), 1u);
+      auto entry = cast<DictionaryAttr>(entries[0]);
+      auto predecessors = entry.getAs<ArrayAttr>("predecessors");
+      ASSERT_EQ(predecessors.size(), 1u);
+      auto prior = cast<DictionaryAttr>(predecessors[0]);
+      auto index = [](DictionaryAttr row, StringRef key) {
+        return row.getAs<IntegerAttr>(key).getInt();
+      };
+      if (mutation == 0) {
+        dependent->removeAttr("ac.after");
+      } else if (mutation == 1) {
+        dependent->setOperand(index(prior, "data_capture"),
+                              dependent->getOperand(index(entry, "old_q_capture")));
+      } else if (mutation == 2) {
+        dependent->setOperand(index(prior, "enable_capture"),
+                              dependent->getOperand(index(admission, "reset_capture")));
+      } else if (mutation == 3) {
+        auto &body = dependent.getBody().front();
+        body.getTerminator()->setOperand(index(entry, "result"),
+                                         body.getArgument(index(entry, "old_q_capture")));
+      } else {
+        Builder b(&context);
+        dependent->setAttr("ac.after", b.getArrayAttr({dependent.getOccurrence()}));
+      }
+      diagnostics.clear();
+      EXPECT_TRUE(failed(check())) << "standalone reload accepted forged state forwarding";
+      EXPECT_FALSE(diagnostics.empty());
     }
   }
 }

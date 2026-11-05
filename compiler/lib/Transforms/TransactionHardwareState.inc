@@ -175,6 +175,21 @@ private:
     auto state = pair.source;
     auto update = logicalUpdate(state, budget);
     if (failed(update)) return failure();
+    if (state.isDWire()) {
+      auto wire = dyn_cast<ac::DWireOp>(pair.target);
+      Builder b(routed.getContext());
+      if (!wire || wire->getAttrs() != b.getDictionaryAttr({
+              b.getNamedAttr("instance_name", state.getInstanceNameAttr()),
+              b.getNamedAttr("occurrence", state.getOccurrence())}).getValue() ||
+          wire.getLoc() != state.getLoc() || wire.getQ().getType() != state.getQ().getType() ||
+          wire.getClk() != mapping.lookup(state.getClk()) ||
+          wire.getRst() != mapping.lookup(state.getRst()) ||
+          wire.getEnable() != mapping.lookup(update->getIntent()) ||
+          wire.getData() != mapping.lookup(update->getCandidate()) ||
+          wire.getInitial() != mapping.lookup(state.getInitial()))
+        return reject("defaulted wire declaration, default or committed drive differs");
+      return success();
+    }
     auto table = dyn_cast<ac::TableType>(state.getQ().getType());
     // Re-derive the restricted optimization from actual routed SSA. Neither a
     // producer flag nor the candidate primitive's missing enable is authority.

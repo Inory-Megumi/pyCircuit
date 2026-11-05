@@ -517,9 +517,29 @@ of a one-dimensional Table element even when its indices are dynamic. The
 unified callable path currently rejects separate-Rule dynamic disjoint-address
 writes to one Table; restoration of the address-grant behavior described below
 remains unfinished. Independent Rules read committed state; ordinary call
-order does not introduce state forwarding or write priority. Independent Rules
-always read committed current state. Rule/Method `after` and native ordering
-metadata are rejected through source, interface and saved-artifact validation.
+order does not introduce state forwarding or write priority. This fork additionally
+accepts one module-body `ac.schedule(first, second, third)` declaration after
+the named directly nested autonomous Rules and before the Module return. Each
+name appears once. The list orders same-cycle evaluation and forwards successful
+earlier state writes into each later Rule's guard and body. Each root retains
+its separate commit decision; a blocked earlier Rule does not block the rest.
+Rules omitted from the list still run independently with committed-state reads.
+`@rule(after=...)`, Method ordering and cross-instance ordering are unsupported. See
+[ordered Rule development](../development/ordered-rule-development.md).
+
+For same-cycle inter-Rule wires, this fork accepts
+`value: ac.bits[N] = ac.dwire()` at Module scope. There is one no-argument
+declaration for flags and wider Bits. It has no storage and always supplies a
+value: a successful write drives its payload; otherwise the compiler drives
+zero. Conditional writes and called Methods retain the whole writer Rule's
+atomic commit boundary. No written value is retained at the next sample.
+One actual root may write each DWire. A root cannot also read the wire it writes;
+multiple writers reject even with an explicit schedule. Same-cycle dependencies
+are independent of textual order; combinational cycles reject. A blocked reader
+does not undo or buffer a successful write. Ordinary state still follows the
+register and scheduling rules above. See the
+[DWire contract and counter](../development/dwire-development.md).
+
 Cycles and unproved conflicting writers reject. Ordinary local
 assignments, if/else, struct defaults/construction/projection and proven table
 indices retain their existing semantics. Overlapping writable parameter aliases
@@ -1670,11 +1690,13 @@ reference reject. A link root cannot expose unbound reference formals. Reference
 contracts and actual bindings survive independent source-interface publication;
 MLIR generates ordinary hierarchy ports and atomic control connections.
 
-Independent callbacks have no cross-transaction candidate forwarding. The retired
-`after`/`ac.callable_after`/`ac.after` contracts and EHR entry metadata reject in
-source IR, interfaces and loaded artifacts. Same-callback calls preserve their
-sequential candidates and snapshots. Multiple writers require disjointness or
-exclusivity; source order is not arbitration. Explicit combinational connections
+Independent callbacks have no cross-transaction candidate forwarding. Explicitly
+ordered autonomous Rules use the fork's schema-4 source summary and authenticated
+state-entry forwarding. The old callable-order contracts remain unsupported;
+forged or incomplete order/entry metadata reject on source and artifact reload.
+Same-callback calls preserve their
+sequential candidates and snapshots. Unordered multiple writers require
+disjointness or exclusivity; source order is not arbitration. Explicit combinational connections
 use existing dependency analysis and must remain acyclic after state cuts.
 
 A writable owner passed as an actual argument retains that owner through nested

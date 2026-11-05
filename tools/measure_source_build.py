@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -31,43 +32,56 @@ SIZES = {"shared": (1, 16, 64), "distinct": (1, 8, 32)}
 PARALLEL_JOBS = 4
 
 
-def _load_generator():
-    spec = importlib.util.spec_from_file_location(
-        "measurement_source_units_generator", GENERATOR
-    )
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load benchmark generator at {GENERATOR}")
+        raise RuntimeError(f"cannot load measurement helper at {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
+def _load_generator():
+    return _load_module(GENERATOR, "measurement_source_units_generator")
+
+
+PROCESS_USAGE = _load_module(
+    REPO / "tools/process_usage.py", "measurement_process_usage"
+)
+
+
 def _run(
     argv: list[str], *, cwd: Path, env: dict[str, str], timeout: int = 3600
 ) -> dict[str, Any]:
-    started = time.perf_counter_ns()
-    result = subprocess.run(
-        argv,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=timeout,
-    )
-    elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
+    with tempfile.TemporaryDirectory(prefix="pycircuit-measure-") as temporary:
+        result = PROCESS_USAGE.run_sampled(
+            argv,
+            cwd=cwd,
+            env=env,
+            log_dir=Path(temporary),
+            label="command",
+            timeout_seconds=timeout,
+        )
+        stdout = Path(result["stdout_log"]).read_text(
+            encoding="utf-8", errors="replace"
+        )
+        stderr = Path(result["stderr_log"]).read_text(
+            encoding="utf-8", errors="replace"
+        )
     return {
         "argv": argv,
         "cwd": str(cwd),
-        "wall_seconds": elapsed,
-        "exit_status": result.returncode,
-        "stdout": result.stdout,
-        "stderr": result.stderr,
+        "wall_seconds": result["wall_seconds"],
+        "exit_status": result["exit_status"],
+        "timed_out": result["timed_out"],
+        "rss": result["rss"],
+        "stdout": stdout,
+        "stderr": stderr,
     }
 
 
 def _must_succeed(result: dict[str, Any]) -> None:
-    if result["exit_status"]:
+    if result["exit_status"] or result.get("timed_out"):
         raise RuntimeError(
             f"command failed ({result['exit_status']}): {result['argv']}\n"
             f"{result['stdout']}\n{result['stderr']}"
@@ -153,10 +167,14 @@ def _executed_commands(stdout: str) -> list[dict[str, Any]]:
                     source = arguments[arguments.index("-c") + 1]
                 break
         is_cpp = any(
-            Path(arg).name in {"c++", "g++", "clang++", "clang-cl"} for arg in arguments
+            Path(arg).name in {"c++", "g++", "clang++", "clang-cl"}
+            or Path(arg).name.endswith(("-c++", "-g++", "-clang++"))
+            for arg in arguments
         )
         if is_cpp and "-c" in arguments:
-            if "pycircuit_dut.dir" in stripped:
+            if "pycircuit_modules.dir" in stripped:
+                command_kind = "cpp_module_target_compile"
+            elif "pycircuit_dut.dir" in stripped:
                 command_kind = "cpp_dut_target_compile"
             elif "pycircuit_system.dir" in stripped:
                 command_kind = "cpp_system_target_compile"
@@ -189,13 +207,26 @@ def _phase(
     after: list[dict[str, Any]],
     log_dir: Path,
 ) -> dict[str, Any]:
-    _must_succeed(result)
     _save_command_log(log_dir, name, result)
+    (log_dir / f"{name}.measurement.json").write_text(
+        json.dumps(
+            {
+                key: value
+                for key, value in result.items()
+                if key not in {"stdout", "stderr"}
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    _must_succeed(result)
     commands = _executed_commands(result["stdout"])
     return {
         "name": name,
         "wall_seconds": result["wall_seconds"],
         "exit_status": result["exit_status"],
+        "rss": result["rss"],
         "executed_command_counts": dict(Counter(row["kind"] for row in commands)),
         "executed_commands": commands,
         "artifact_bytes_before": _tree_bytes(before),
@@ -248,6 +279,8 @@ def _touch(path: Path) -> None:
     os.utime(path, ns=(timestamp, timestamp))
 
 
+# Retained for the legacy measure_build_resources.py consumer. The current
+# module-library benchmark does not invoke this System observation oracle.
 def _validate_events(path: Path, fixture: dict[str, Any]) -> dict[str, Any]:
     events = [
         json.loads(line)
@@ -308,7 +341,6 @@ def _measure_case(
     prefix: Path,
     cmake: str,
     env: dict[str, str],
-    rtl_run_largest: bool,
 ) -> dict[str, Any]:
     generator = _load_generator()
     fixture_root = root / "fixture"
@@ -356,7 +388,7 @@ def _measure_case(
             "interface": f"units/{stem}/{stem}.interface.ac",
             "receipt": f"units/{stem}/unit.json",
             "depfile": f"units/{stem}/{stem}.d",
-            "definition_count": 0 if stem == "types" else 1,
+            "definition_count": 1,
         }
         for stem in source_names
     ]
@@ -465,11 +497,9 @@ def _measure_case(
                 "implementation_files": [
                     path
                     for path in group["files"]
-                    if path.endswith(".cpp" if target == "cpp" else ".sv")
+                    if path.endswith(".cpp" if target == "cpp" else ".v")
                 ],
-                "definition_count": (
-                    0 if group["source"]["path"].endswith("types.py") else 1
-                ),
+                "definition_count": 1,
             }
             for group in receipt["source_groups"]
         ]
@@ -486,9 +516,9 @@ def _measure_case(
             len(row["implementation_files"])
             for row in report["inventory"]["generated_groups"][target]
         )
-        if implementation_tus != len(source_names) - 1:
+        if implementation_tus != info["definitions"]:
             raise RuntimeError(
-                f"{target} implementation TU ownership mismatch: expected {len(source_names) - 1}, got {implementation_tus}"
+                f"{target} implementation TU ownership mismatch: expected {info['definitions']}, got {implementation_tus}"
             )
 
     cpp_source = build / "cpp"
@@ -581,10 +611,15 @@ def _measure_case(
         }
     )
 
-    # Change a shared declaration to measure downstream interface invalidation.
-    types_source = fixture_root / "src/types.py"
-    types_source.write_text(
-        types_source.read_text(encoding="utf-8").replace("range(256)", "range(65536)"),
+    # Add a declaration in a real provider unit. Its interface changes without
+    # changing the circuit; the root depends on this provider's published header.
+    interface_source = fixture_root / "src" / f"{leaf_stems[-1]}.py"
+    interface_before = (
+        build / "units" / leaf_stems[-1] / f"{leaf_stems[-1]}.interface.ac"
+    ).read_bytes()
+    interface_source.write_text(
+        interface_source.read_text(encoding="utf-8")
+        + "\n\n@ac.struct\nclass MeasurementSpare:\n    flag: ac.u1\n",
         encoding="utf-8",
     )
     before = _snapshot(
@@ -599,6 +634,13 @@ def _measure_case(
     type_interface_phase = _phase(
         "type_interface_edit_compile_link", result, before, after, logs
     )
+    interface_after = (
+        build / "units" / leaf_stems[-1] / f"{leaf_stems[-1]}.interface.ac"
+    ).read_bytes()
+    if interface_before == interface_after:
+        raise RuntimeError(
+            "provider interface edit did not change its published header"
+        )
     report["phases"].append(type_interface_phase)
     for target in ("cpp", "verilog"):
         before = _artifacts(build / target)
@@ -618,7 +660,7 @@ def _measure_case(
     report["invalidation"].append(
         {
             "edit": "type_interface",
-            "source": str(types_source),
+            "source": str(interface_source),
             "observed_compile_commands": _phase_commands([type_interface_phase]),
             "observed_cpp_commands": report["phases"][-1]["executed_command_counts"],
             "observed_output_changes": type_interface_phase["artifact_changes"],
@@ -667,99 +709,10 @@ def _measure_case(
         }
     )
 
-    config_file = fixture_root / "runtime-config.json"
-    config_file.write_text(
-        '{"deadlock_window":null,"max_domain_cycles":{},"max_ticks":3,"schema":"agentic-model-config","version":"1"}\n',
-        encoding="utf-8",
-    )
-    runner = cpp_build / (
-        "pycircuit_system.exe" if os.name == "nt" else "pycircuit_system"
-    )
-    events_file = root / "three-cycle-events.jsonl"
-    simulation = _run(
-        [str(runner), "--config", str(config_file), "--events", str(events_file)],
-        cwd=root,
-        env=env,
-        timeout=180,
-    )
-    _must_succeed(simulation)
-    _save_command_log(logs, "three-cycle-simulation", simulation)
-    report["phases"].append(
-        {
-            "name": "cpp_runner_three_cycle",
-            "wall_seconds": simulation["wall_seconds"],
-            "exit_status": 0,
-            "executed_command_counts": {"runner": 1},
-            "executed_commands": [
-                {"kind": "runner", "command": simulation["argv"], "source": None}
-            ],
-            "artifacts_before": [],
-            "artifacts_after": [],
-        }
-    )
-    report["simulation_oracle"] = _validate_events(events_file, info)
-
-    if rtl_run_largest:
-        # Build and run RTL for the largest distinct-leaf case.
-        rtl_source = build / "verilog"
-        rtl_build = root / "rtl-build"
-        configure_rtl = _configure(cmake, rtl_source, rtl_build, prefix, env)
-        _must_succeed(configure_rtl)
-        _save_command_log(logs, "configure-rtl-model", configure_rtl)
-        report["phases"].append(
-            {
-                "name": "configure_largest_rtl_model",
-                "wall_seconds": configure_rtl["wall_seconds"],
-                "exit_status": 0,
-                "command": configure_rtl["argv"],
-                "stdout_log": "configure-rtl-model.stdout.txt",
-                "stderr_log": "configure-rtl-model.stderr.txt",
-                "executed_command_counts": {},
-                "executed_commands": [],
-            }
-        )
-        rtl_built = _run(
-            _cmake_build(cmake, rtl_build, "all", env),
-            cwd=rtl_source,
-            env=env,
-            timeout=7200,
-        )
-        _must_succeed(rtl_built)
-        report["phases"].append(
-            _phase(
-                "largest_rtl_model_build", rtl_built, [], _artifacts(rtl_build), logs
-            )
-        )
-        runner = rtl_build / (
-            "pycircuit_system.exe" if os.name == "nt" else "pycircuit_system"
-        )
-        config_file = fixture_root / "runtime-config.json"
-        config_file.write_text(
-            '{"deadlock_window":null,"max_domain_cycles":{},"max_ticks":3,"schema":"agentic-model-config","version":"1"}\n',
-            encoding="utf-8",
-        )
-        events_file = root / "rtl-three-cycle-events.jsonl"
-        simulation = _run(
-            [str(runner), "--config", str(config_file), "--events", str(events_file)],
-            cwd=root,
-            env=env,
-            timeout=180,
-        )
-        _must_succeed(simulation)
-        _save_command_log(logs, "rtl-three-cycle-simulation", simulation)
-        report["phases"].append(
-            {
-                "name": "largest_rtl_runner_three_cycle",
-                "wall_seconds": simulation["wall_seconds"],
-                "exit_status": 0,
-                "command": simulation["argv"],
-                "executed_command_counts": {"runner": 1},
-                "executed_commands": [
-                    {"kind": "runner", "command": simulation["argv"], "source": None}
-                ],
-            }
-        )
-        report["rtl_simulation_oracle"] = _validate_events(events_file, info)
+    report["not_measured"] = [
+        "C++ simulation: the source-unit fixture emits a module library, not a System runner",
+        "RTL simulation: this build benchmark has no behavioral testbench",
+    ]
     return report
 
 
@@ -875,10 +828,23 @@ def main() -> int:
             "toolchain_metadata": toolchain_metadata,
             "logical_cpu_count": os.cpu_count(),
             "parallel_jobs": PARALLEL_JOBS,
-            "timing_definition": "wall_seconds is perf_counter_ns elapsed time around the complete subprocess, including process startup and captured output; no-op builds include cmake and Ninja startup.",
-            "runner_timing_definition": "runner wall_seconds includes executable startup, runtime initialization, and the configured three-cycle run; it is not steady-state throughput.",
+            "timing_definition": "wall_seconds covers the whole subprocess, including startup and process-group RSS sampling; no-op builds include cmake and Ninja startup.",
+            "rss_definition": "sampled sum of RSS for the owned POSIX process group; short-lived peaks may be missed and shared pages may be counted more than once",
+            "measurement_script_sha256": hashlib.sha256(
+                Path(__file__).read_bytes()
+            ).hexdigest(),
+            "generator_sha256": hashlib.sha256(GENERATOR.read_bytes()).hexdigest(),
+            "process_usage_sha256": hashlib.sha256(
+                (REPO / "tools/process_usage.py").read_bytes()
+            ).hexdigest(),
             "cxx_compiler": _run(
-                [shutil.which("c++") or "c++", "--version"], cwd=REPO, env=env
+                (
+                    shlex.split(env["CXX"]) + ["--version"]
+                    if env.get("CXX")
+                    else [shutil.which("c++") or "c++", "--version"]
+                ),
+                cwd=REPO,
+                env=env,
             )["stdout"].splitlines()[0],
             "verilator": (
                 _run(
@@ -891,36 +857,44 @@ def main() -> int:
             ),
         },
         "cases": [],
-        "not_measured": ["RSS (no isolated per-phase measurement was collected)"],
+        "not_measured": [
+            "C++/RTL functional simulation",
+            "steady-state simulation throughput",
+        ],
     }
     for axis, sizes in selected.items():
         for size in sizes:
             case_dir = output / f"{axis}-{size}"
             case_dir.mkdir(parents=True)
-            report["cases"].append(
-                _measure_case(
+            try:
+                case = _measure_case(
                     axis=axis,
                     size=size,
                     root=case_dir,
                     prefix=prefix,
                     cmake=cmake,
                     env=env,
-                    rtl_run_largest=arguments.sizes == "all"
-                    and axis == "distinct"
-                    and size == 32,
                 )
-            )
+                case["status"] = "passed"
+            except RuntimeError as error:
+                case = {
+                    "case": {"axis": axis, "size": size},
+                    "status": "failed",
+                    "error": str(error),
+                    "logs": str(case_dir / "logs"),
+                }
+            report["cases"].append(case)
             (output / "report.json").write_text(
                 json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             print(
-                f"measured {axis} size={size}; report: {output / 'report.json'}",
+                f"{case['status']}: {axis} size={size}; report: {output / 'report.json'}",
                 flush=True,
             )
     (output / "report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    return 0
+    return int(any(case["status"] != "passed" for case in report["cases"]))
 
 
 if __name__ == "__main__":

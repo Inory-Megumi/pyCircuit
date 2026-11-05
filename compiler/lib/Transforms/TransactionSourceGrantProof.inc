@@ -200,8 +200,9 @@ private:
           if (!charge(budget, root)) return failure();
           if (read.result != *endpoint.bound) continue;
           const auto &version = plan.versions[read.version];
-          // Every independent registration starts from committed Q.
-          if (version.kind == ac::StateVersionKind::OldQ) {
+          // Explicit predecessors replace an owner's entry with its EHR
+          // candidate. Such reads must not alias another registration's Q0.
+          if (version.kind == ac::StateVersionKind::OldQ && plan.predecessors.empty()) {
             auto actual = bind(plan, endpoint.prefix, plan.owners[read.owner].oldQ);
             if (failed(actual)) return failure(); next = *actual;
           }

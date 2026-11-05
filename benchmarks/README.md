@@ -19,5 +19,20 @@ python tools/measure_source_build.py --prefix <installed-prefix> --output-dir .p
 The output directory must be absent or empty. Prefix metadata must match the
 checkout revision; dirty candidate bytes are separately bound in gate evidence.
 The report records executed Ninja commands, source and model invalidation,
-artifact sizes, wall times including startup, and literal simulation oracles.
-It does not measure RSS or promise a performance threshold or parallel simulation.
+artifact sizes, wall times including startup, and sampled process-group RSS.
+RSS sampling can miss short-lived peaks and counts shared pages in each process.
+Commands launched in separate process groups are excluded, so this is not a
+measurement of whole-build or compiler peak memory.
+The report binds the measurement script, generator and sampler by SHA-256.
+
+Every generated source owns one implementation unit. The fixture emits a module
+library, with `.cpp` and `.v` source groups; it does not emit a System runner.
+The measurement checks independent rebuild determinism, compiles the generated
+C++ library and exercises body, provider-interface and toolchain invalidation.
+It explicitly reports functional C++/RTL simulation as unmeasured. Use the
+separate example and API tests for behavioral evidence.
+Failed cases retain their diagnostics and measurements, and the remaining
+cases still run. Any failed case makes the overall command return nonzero.
+
+`measure_build_resources.py` still targets the retired System/C ABI fixture and
+is not the current source-unit benchmark entry point.

@@ -1669,6 +1669,42 @@ TEST_F(SampledTransactionLoweringTest,
 }
 
 TEST_F(SampledTransactionLoweringTest,
+       DWireRefinementAuthenticatesIdleValueDataAndWholeWriterEnable) {
+  auto staged = stage([&](mlir::ModuleOp file) {
+    addDffPrimitive(file);
+    logicalState(module(file), "saved")->setAttr("ac.dwire", builder.getUnitAttr());
+  });
+  ASSERT_TRUE(staged) << diagnostics;
+  ASSERT_TRUE(mlir::succeeded(verify(*staged))) << diagnostics;
+  const auto routedText = print(staged->candidate.module->getOperation());
+  for (unsigned mutation = 0; mutation < 3; ++mutation) {
+    SCOPED_TRACE(mutation);
+    auto final = refine(*staged->candidate.module);
+    ASSERT_TRUE(final) << diagnostics;
+    ASSERT_TRUE(mlir::succeeded(verifyRefinement(*staged->candidate.module, *final)))
+        << diagnostics;
+    ASSERT_TRUE(mlir::succeeded(capture([&] { return verifyHardwarePackage(*final); })))
+        << diagnostics;
+    auto owner = module(*final);
+    auto wires = owner.getBody().front().getOps<DWireOp>();
+    ASSERT_NE(wires.begin(), wires.end());
+    auto wire = *wires.begin();
+    EXPECT_EQ(wire.getInstanceName(), "saved");
+    if (mutation == 0)
+      wire->setOperand(2, owner.getBody().front().getArgument(2));
+    if (mutation == 1)
+      wire->setOperand(3, owner.getBody().front().getArgument(0));
+    if (mutation == 2) {
+      auto constants = owner.getBody().front().getOps<BitsConstantOp>();
+      wire->setOperand(4, (*std::next(constants.begin(), 2)).getResult());
+    }
+    EXPECT_TRUE(mlir::failed(verifyRefinement(*staged->candidate.module, *final)));
+    EXPECT_EQ(print(staged->candidate.module->getOperation()), routedText);
+    expectOriginalUnchanged(*staged);
+  }
+}
+
+TEST_F(SampledTransactionLoweringTest,
        RoutedToFinalRefinementPreservesOriginalAndRemovesOnlyLogicalState) {
   for (bool table : {false, true}) {
     SCOPED_TRACE(table);
