@@ -31,6 +31,7 @@ _GENERATED_ROLES = {
     "rtl",
     "runtime-glue",
     "source-map",
+    "rtl-names",
 }
 
 

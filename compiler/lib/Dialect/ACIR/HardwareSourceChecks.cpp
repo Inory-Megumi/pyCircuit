@@ -1533,6 +1533,11 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
                                        "execution for non-guard controls";
     }
     for (Operation &op : definition.getBody().front()) {
+      if (auto wire = dyn_cast<DWireOp>(op)) {
+        if (failed(pair(wire.getClk(), wire.getRst(), owner, &op)))
+          return failure();
+        continue;
+      }
       if (!isa<InstanceOp, CollectionOp>(op))
         continue;
       auto *callee = isa<InstanceOp>(op)
@@ -1592,6 +1597,10 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
         }
         if (auto expect = dyn_cast<SourceExpectOp>(op))
           transport = expect.getKind() == "guard_known" && index == 2;
+        // A DWire carries its authenticated sampling domain as metadata.
+        // Its enable, data and idle value remain ordinary combinational uses.
+        if (isa<DWireOp>(op))
+          transport = index == 0;
         if (!transport) {
           op->emitOpError() << "physical RTL forbids clock use as data or "
                                "combinational control";

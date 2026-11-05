@@ -152,6 +152,11 @@ def simulate(
     stateless=False,
     reset=True,
     verilator=False,
+    initialize=None,
+    domain_names=("clk", "rst"),
+    instance_name="dut",
+    module_name=None,
+    extra_instances="",
 ) -> str:
     assert shutil.which("iverilog") and shutil.which("vvp"), "four-state tools required"
     manifest = json.loads((output / "generated.json").read_text())
@@ -159,11 +164,12 @@ def simulate(
     assert ports["controls"] == [], "physical wrapper exposes no lifecycle controls"
     declarations, bindings = [], []
     domains = ports["domains"]
+    clock_name, reset_name = domain_names
     for row in ports["inputs"]:
         name = (
-            "clk"
+            clock_name
             if row["ordinal"] == domains["clock"]
-            else "rst" if row["ordinal"] == domains["reset"] else row["name"]
+            else reset_name if row["ordinal"] == domains["reset"] else row["name"]
         )
         declarations.append(f"logic [{row['width'] - 1}:0] {name};")
         bindings.append(f".{row['wire']}({name})")
@@ -175,21 +181,28 @@ def simulate(
         if stateless
         else ("first=8'h12;second=8'h34;enable_first=1;enable_second=1;")
     )
+    if initialize is not None:
+        init = initialize
     tb = tmp_path / "test.sv"
     tb.write_text(
         "module tb;\n"
         + "\n".join(declarations)
         + "\n"
-        + manifest["root_rtl_name"]
-        + " dut("
+        + (module_name or manifest["root_rtl_name"])
+        + f" {instance_name}("
         + ",".join(bindings)
         + ");\n"
-        + "task edge_up; #2;clk=1;#2;endtask\n"
-        "task edge_down; #2;clk=0;#2;endtask\n"
-        "initial begin clk=0;rst=1;"
+        + extra_instances
+        + f"task edge_up; #2;{clock_name}=1;#2;endtask\n"
+        f"task edge_down; #2;{clock_name}=0;#2;endtask\n"
+        f"initial begin {clock_name}=0;{reset_name}=1;"
         + init
         + "\n"
-        + ("edge_up();edge_down();rst=0;\n" if reset else "#1;rst=0;\n")
+        + (
+            f"edge_up();edge_down();{reset_name}=0;\n"
+            if reset
+            else f"#1;{reset_name}=0;\n"
+        )
         + body
         + '\n$display("PHYSICAL_TEST_COMPLETE");$finish;end\nendmodule\n'
     )
@@ -322,6 +335,54 @@ if(result_0!==16'h3c3d)$fatal(1,"collection candidate order");
     assert "PYCIRCUIT_PHYSICAL_FAULT" not in transcript
 
 
+def test_direct_exported_root_keeps_checks_private_and_instances_independent(
+    physical_designs, tmp_path
+):
+    output = physical_designs["Pair"][1]
+    mapping = json.loads((output / "rtl-names.json").read_text())
+    root = next(
+        row for row in mapping["definitions"] if row["definition"].endswith(".Pair")
+    )
+    rtl = (output / root["rtl_file"]).read_text()
+    header = rtl.split("module " + root["rtl_module"], 1)[1].split(");", 1)[0]
+    assert all(
+        name not in header for name in ("root_commit_ok", "reset_active", "local_error")
+    )
+    ports = json.loads((output / "ports.json").read_text())
+    connections = []
+    for row in ports["inputs"]:
+        if row["ordinal"] == ports["domains"]["clock"]:
+            signal = "clk"
+        elif row["ordinal"] == ports["domains"]["reset"]:
+            signal = "rst"
+        elif row["name"].startswith("enable_"):
+            signal = "1'b1"
+        else:
+            signal = row["name"]
+        connections.append(f".{row['wire']}({signal})")
+    for index, row in enumerate(ports["outputs"]):
+        connections.append(f".{row['wire']}(independent_{index})")
+    extra = "wire [7:0] independent_0, independent_1;\n"
+    extra += root["rtl_module"] + " independent(" + ",".join(connections) + ");\n"
+    transcript = simulate(
+        output,
+        tmp_path,
+        """
+edge_up();edge_down();
+if(result_0!==8'h12 || result_1!==8'h34)$fatal(1,"direct root has no permission");
+first=8'haa;second=8'hbb;enable_second=1'bx;edge_up();edge_down();
+if(result_0!==8'h12 || result_1!==8'h34)$fatal(1,"partial subtree update");
+if(independent_0!==8'haa || independent_1!==8'hbb)$fatal(1,"unrelated root was frozen");
+enable_second=1;first=8'hcc;edge_up();edge_down();
+if(result_0!==8'h12 || result_1!==8'h34)$fatal(1,"fault not sticky");
+if(independent_0!==8'hcc)$fatal(1,"independent root stopped");
+""",
+        module_name=root["rtl_module"],
+        extra_instances=extra,
+    )
+    assert transcript.count("PYCIRCUIT_PHYSICAL_FAULT") == 1
+
+
 def test_declared_wide_initializers_before_any_clock_or_reset(
     physical_designs, tmp_path
 ):
@@ -409,6 +470,7 @@ def test_physical_synthesis_elaborates_without_fault_history(
         for row in manifest["files"]
         if row["path"].endswith((".v", ".sv"))
     ]
+    generated_rtl = list(rtl)
     rtl += [str(ROOT / "include/verilog/dff.v"), str(ROOT / "include/verilog/dffe.v")]
     _ok(
         _run(
@@ -426,9 +488,22 @@ def test_physical_synthesis_elaborates_without_fault_history(
     )
     preprocessed = tmp_path / "synthesis.sv"
     _ok(
-        _run(["iverilog", "-g2012", "-DSYNTHESIS", "-E", "-o", str(preprocessed), *rtl])
+        _run(
+            [
+                "iverilog",
+                "-g2012",
+                "-DSYNTHESIS",
+                "-E",
+                "-o",
+                str(preprocessed),
+                *generated_rtl,
+            ]
+        )
     )
-    assert "pyc_physical_fault" not in preprocessed.read_text()
+    assert any("physical_fault" in open(path).read() for path in generated_rtl)
+    assert "physical_fault" not in preprocessed.read_text()
+    assert "PYCIRCUIT_PHYSICAL_FAULT" not in preprocessed.read_text()
+    assert "commit_ok" not in preprocessed.read_text()
 
 
 @pytest.mark.parametrize("image", ["(1,)", "[1, 2, 3]", "(1, 256)", "(1, incoming)"])

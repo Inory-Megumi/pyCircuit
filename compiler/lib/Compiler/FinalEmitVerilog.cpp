@@ -1,5 +1,6 @@
 #include "FinalEmitVerilog.h"
 #include "FinalCppNames.h"
+#include "llvm/Support/FormatVariadic.h"
 #include "HardwareEmitCommon.h"
 #include "pycircuit/Dialect/ACIR/SourceUnitValidation.h"
 #include "llvm/ADT/DenseSet.h"
@@ -93,9 +94,7 @@ FailureOr<std::string> managedReset(HardwareEmitContext &context,
       reset.getValue().getZExtValue() >= names.size())
     return root.emitOpError()
            << "managed module requires verified reset context";
-  auto name = legalizeIdentifier(
-      cast<StringAttr>(names[reset.getValue().getZExtValue()]).getValue(),
-      [&] { return root.emitOpError(); });
+  auto name = context.rtlPortName(root, false, reset.getValue().getZExtValue());
   if (failed(name))
     return failure();
   return context.rtlReset(*name);
@@ -597,34 +596,32 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     return failure();
   bool first = true;
   auto port = [&](StringRef direction, Type type,
-                  StringRef name) -> LogicalResult {
+                  unsigned ordinal) -> LogicalResult {
     auto resolved = context.analysis.resolveType(type, *bindings, root);
     if (failed(resolved))
       return failure();
-    auto rendered = context.rtlType(*resolved, root);
-    auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto rendered = context.rtlWireType(*resolved, root);
+    auto id = context.rtlPortName(root, direction == "output", ordinal);
     if (failed(rendered) || failed(id))
       return failure();
-    out << (first ? "\n" : ",\n") << "  " << direction << " wire " << *rendered
+    out << (first ? "\n" : ",\n") << "  " << direction << " " << *rendered
         << " " << *id;
     first = false;
     return success();
   };
   for (auto [i, type] : llvm::enumerate(
            signature.getInputs().take_front(layout->sourceInputCount)))
-    if (failed(port("input", type,
-                    cast<StringAttr>(root.getInputNames()[i]).getValue())))
+    if (failed(port("input", type, i)))
       return failure();
   for (auto [i, type] : llvm::enumerate(
            signature.getResults().take_front(layout->sourceOutputCount)))
-    if (failed(port("output", type,
-                    cast<StringAttr>(root.getOutputNames()[i]).getValue())))
+    if (failed(port("output", type, i)))
       return failure();
   for (int64_t companion : layout->outputValidity)
     if (companion >= 0 &&
         failed(port(
             "output", signature.getResult(companion),
-            cast<StringAttr>(root.getOutputNames()[companion]).getValue())))
+            companion)))
       return failure();
   if (context.managesChecks()) {
     out << (first ? "\n" : ",\n")
@@ -641,48 +638,14 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
                         : FailureOr<std::string>(std::string());
   if (failed(parameters))
     return failure();
-  if (context.isPhysical()) {
-    const auto &projection = context.physicalProjection();
-    auto clock = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.clockInput])
-            .getValue(),
-        [&] { return root.emitOpError(); });
-    auto reset = legalizeIdentifier(
-        cast<StringAttr>(root.getInputNames()[projection.resetInput])
-            .getValue(),
-        [&] { return root.emitOpError(); });
-    if (failed(clock) || failed(reset))
-      return failure();
-    out << "  wire pyc_local_error;\n"
-           "  wire pyc_root_commit_ok;\n"
-           "`ifndef SYNTHESIS\n"
-           "  bit pyc_physical_fault = 1'b0;\n"
-           "  wire pyc_physical_error = pyc_local_error | $isunknown("
-        << context.rtlReset(*reset)
-        << ");\n"
-           "  assign pyc_root_commit_ok = !pyc_physical_fault && "
-           "!pyc_physical_error;\n"
-           // A level change to one is a physical rising edge; transitions
-           // into X/Z are faults even when Verilog calls them falling edges.
-           "  always @("
-        << *clock
-        << ") begin\n"
-           "    if ($isunknown("
-        << *clock << ") || ((" << *clock
-        << " === 1'b1) && pyc_physical_error)) begin\n"
-           "      if (!pyc_physical_fault) "
-           "$display(\"PYCIRCUIT_PHYSICAL_FAULT\");\n"
-           "      pyc_physical_fault = 1'b1;\n"
-           "    end\n"
-           "  end\n"
-           "`else\n"
-           "  assign pyc_root_commit_ok = 1'b1;\n"
-           "`endif\n";
-  }
-  out << "  " << callee << *parameters << " dut (";
+  auto generated = [&](StringRef role) {
+    return context.rtlGeneratedName(root, role, role);
+  };
+  out << "  " << callee << *parameters << " "
+      << (context.isPhysical() ? generated("dut") : "dut") << " (";
   first = true;
-  auto connection = [&](StringRef name, StringRef expression) -> LogicalResult {
-    auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+  auto connection = [&](bool output, unsigned ordinal, StringRef expression) -> LogicalResult {
+    auto id = context.rtlPortName(root, output, ordinal);
     if (failed(id))
       return failure();
     out << (first ? "\n" : ",\n") << "    ." << *id << "(" << expression << ")";
@@ -690,10 +653,9 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
     return success();
   };
   for (auto [index, raw] : llvm::enumerate(root.getInputNames())) {
-    StringRef name = cast<StringAttr>(raw).getValue();
     std::string expression;
     if (index < layout->sourceInputCount) {
-      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      auto id = context.rtlPortName(root, false, index);
       if (failed(id))
         return failure();
       expression = std::move(*id);
@@ -707,21 +669,20 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
       expression =
           std::to_string(*width) + "'d" + std::to_string(initial.getInt());
     }
-    if (failed(connection(name, expression)))
+    if (failed(connection(false, index, expression)))
       return failure();
   }
   for (auto [index, raw] : llvm::enumerate(root.getOutputNames())) {
-    StringRef name = cast<StringAttr>(raw).getValue();
     std::string expression;
     if (index < layout->sourceOutputCount ||
         llvm::is_contained(layout->outputValidity,
                            static_cast<int64_t>(index))) {
-      auto id = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+      auto id = context.rtlPortName(root, true, index);
       if (failed(id))
         return failure();
       expression = std::move(*id);
     }
-    if (failed(connection(name, expression)))
+    if (failed(connection(true, index, expression)))
       return failure();
   }
   if (context.managesChecks()) {
@@ -736,18 +697,6 @@ LogicalResult emitWrapper(HardwareEmitContext &context, ac::ModuleOp root,
         << "    .pyc_check_complete(pyc_check_complete),\n"
            "    .pyc_sampling_error(pyc_sampling_error),\n"
         << "    .pyc_local_error(pyc_local_error)";
-    first = false;
-  }
-  if (context.isPhysical()) {
-    auto reset = managedReset(context, root);
-    if (failed(reset))
-      return failure();
-    out << (first ? "\n" : ",\n")
-        << "    .pyc_root_commit_ok(pyc_root_commit_ok),\n"
-           "    .pyc_reset_active("
-        << *reset
-        << "),\n"
-           "    .pyc_local_error(pyc_local_error)";
     first = false;
   }
   out << (first ? ");\n" : "\n  );\n") << "endmodule\n";
@@ -799,7 +748,7 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     return failure();
   parts.portMap = std::move(*portMap);
   parts.sourceCheckCount = context.sourceChecks().checks.size();
-  parts.rootRtlName = "pyc_root";
+  parts.rootRtlName = physical ? "design_top" : "pyc_root";
   llvm::StringSet<> standard;
   package.walk([&](ac::InstanceOp instance) {
     if (!ac::isQueueInstance(instance))
@@ -822,16 +771,6 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
   std::string typedefs;
   {
     llvm::raw_string_ostream out(typedefs);
-    out << "package pycircuit_types;\n"
-           "  function automatic logic signed [63:0] pyc_floordiv(input logic "
-           "signed [63:0] a, b);\n"
-           "    return a/b - ((a%b != 0 && (a<0)!=(b<0)) ? 64'sd1 : 64'sd0);\n"
-           "  endfunction\n"
-           "  function automatic logic signed [63:0] pyc_mod(input logic "
-           "signed [63:0] a, b);\n"
-           "    logic signed [63:0] r; r=a%b; return r != 0 && (r<0)!=(b<0) ? "
-           "r+b : r;\n"
-           "  endfunction\n";
     for (auto declaration : package.getOps<ac::EnumOp>())
       if (failed(emitEnum(context, declaration, out)))
         return failure();
@@ -839,7 +778,6 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
     for (auto record : analysis.getStructs())
       if (failed(emitRecord(context, record, out, done)))
         return failure();
-    out << "endpackage\n";
     out.flush();
   }
   auto emitError = [&] { return package.emitOpError(); };
@@ -847,16 +785,22 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
   if (failed(units))
     return failure();
   llvm::StringMap<DictionaryAttr> paths;
+  llvm::json::Array presentation;
   for (const ac::FinalSourceUnitView &unit : *units) {
     FinalVerilogSourceGroup group;
     group.sourceOwner = unit.owner;
     llvm::raw_string_ostream out(group.text);
     for (Operation *declaration : unit.declarations)
       if (auto module = dyn_cast<ac::ModuleOp>(declaration)) {
+        // Physical projection and its commit endpoints are root-specific.
+        // Do not emit unrelated definitions with an unverified storage ABI.
+        if (physical && !reachable.contains(module))
+          continue;
         group.path = context.names(module).verilog;
         group.definitions.push_back(
             FlatSymbolRefAttr::get(module.getContext(), module.getSymName()));
-        if (failed(emitHardwareVerilogDefinition(context, module, out)))
+        if (failed(emitHardwareVerilogDefinition(context, module, out,
+                                                 physical ? &presentation : nullptr)))
           return failure();
       }
     out.flush();
@@ -868,13 +812,42 @@ emitVerilogSourceParts(ModuleOp package, ac::HardwareAnalysis &analysis,
       return emitError() << "source owner Verilog path collision";
     parts.sourceGroups.push_back(std::move(group));
   }
-  parts.core = typedefs;
+  std::string wrapper;
+  if (physical) {
+    llvm::raw_string_ostream out(parts.presentationMap);
+    out << llvm::formatv("{0:2}\n", llvm::json::Value(llvm::json::Object{
+        {"kind", "pycircuit.rtl-names"}, {"version", 1},
+        {"definitions", std::move(presentation)}}));
+  }
   {
-    llvm::raw_string_ostream out(parts.core);
+    llvm::raw_string_ostream out(wrapper);
     if (failed(emitWrapper(context, *root, parts.rootRtlName,
                            context.names(*root).rtl, out)))
       return failure();
     out.flush();
+  }
+  {
+    // Rendering every definition, nominal type and wrapper first discovers
+    // helper dependencies without scanning or rewriting emitted RTL text.
+    llvm::raw_string_ostream out(parts.core);
+    bool floor = !physical || context.usesRtlHelper("floordiv");
+    bool mod = !physical || context.usesRtlHelper("mod");
+    if (!typedefs.empty() || floor || mod) {
+      out << "package pycircuit_types;\n";
+      if (floor)
+        out << "  function automatic logic signed [63:0] " << (physical ? "floordiv" : "pyc_floordiv") << "(input logic "
+               "signed [63:0] a, b);\n"
+               "    return a/b - ((a%b != 0 && (a<0)!=(b<0)) ? 64'sd1 : 64'sd0);\n"
+               "  endfunction\n";
+      if (mod)
+        out << "  function automatic logic signed [63:0] " << (physical ? "mod" : "pyc_mod") << "(input logic "
+               "signed [63:0] a, b);\n"
+               "    logic signed [63:0] r; r=a%b; return r != 0 && (r<0)!=(b<0) ? "
+               "r+b : r;\n"
+               "  endfunction\n";
+      out << typedefs << "endpackage\n";
+    }
+    out << wrapper;
   }
   if (system) {
     auto simulation = systemSimulationTop(context, *root, parts.rootRtlName);

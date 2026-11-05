@@ -1,6 +1,10 @@
 # Development guide
 
 - [NDF model specifications and traceability](model-spec-workflow.md)
+- [RTL readability research](rtl-readability-research.md): scoped reuse of the
+  earlier archlab presentation layer on the official scheduler/DWire baseline.
+- [Physical RTL presentation](rtl-presentation.md): source names, Rule sections,
+  bounded expressions and the generated name map.
 
 Development targets the approved source-unit pipeline: capture each Python
 source, resolve published interfaces and verify the linked final design in

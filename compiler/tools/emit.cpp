@@ -277,6 +277,7 @@ int main(int argc, char **argv) {
     result["rtl_standard_sources"] = std::move(standard);
     result["rtl_core"] = parts->core;
     result["rtl_mode"] = rtlMode;
+    if (physical) result["rtl_presentation_map"] = parts->presentationMap;
     result["simulation_top"] = parts->simulationTop;
     result["source_check_count"] = parts->sourceCheckCount;
     result["root_rtl_name"] = parts->rootRtlName;

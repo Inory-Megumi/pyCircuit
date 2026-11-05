@@ -1,5 +1,6 @@
 #include "FinalCppNames.h"
 #include "HardwareEmitCommon.h"
+#include "RtlPresentationPlan.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -11,17 +12,66 @@ public:
   NetEmitter(HardwareEmitContext &context, ac::ModuleOp definition,
              raw_ostream &out)
       : context(context), definition(definition), out(out) {}
-  FailureOr<std::string> physicalInitializer(Value value, unsigned depth = 0) {
+  LogicalResult preparePresentation() {
+    if (!context.isPhysical()) return success();
+    presentation = std::make_unique<RtlPresentationPlan>(context, definition);
+    return presentation->prepare();
+  }
+  void finishPresentation(raw_ostream &target, llvm::json::Array *mapping) {
+    if (!presentation) return;
+    presentation->emit(target);
+    if (mapping) mapping->push_back(presentation->mapping());
+  }
+  std::string netName(Value value) {
+    return presentation ? presentation->get(value).name
+                        : "pyc_net_" + std::to_string(next++);
+  }
+  std::string generated(StringRef role) {
+    return context.isPhysical() ? context.rtlGeneratedName(definition, role, role)
+                                : "pyc_" + role.str();
+  }
+  FailureOr<std::string> physicalReset() {
+    if (auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs")) {
+      if (auto ordinal = domain.getAs<IntegerAttr>("reset")) {
+        auto signal = context.rtlPortName(definition, false, ordinal.getValue().getZExtValue());
+        if (failed(signal)) return failure();
+        return context.rtlReset(*signal);
+      }
+    }
+    for (const auto &binding : context.sourceChecks().samplingBindings) {
+      if (binding.definition != definition) continue;
+      auto signal = net(binding.reset);
+      if (failed(signal)) return failure();
+      return context.rtlReset(*signal);
+    }
+    return definition.emitOpError() << "physical source checks require a local verified reset value";
+  }
+  void declareNet(Value value, StringRef type, StringRef name, bool variable = false) {
+    auto rendered = variable ? FailureOr<std::string>(type.str())
+                             : context.rtlWireType(value.getType(), definition);
+    assert(succeeded(rendered) && "previously rendered RTL type");
+    auto text = "  " + *rendered + " " + name.str() + ";\n";
+    if (presentation) {
+      if (presentation->get(value).local) out << text;
+      else presentation->declare(text);
+      presentation->record(value, name, "signal");
+    } else out << text;
+  }
+  FailureOr<std::string> physicalInitializer(Value value, StringRef hint = {}, unsigned depth = 0) {
+    auto source = value;
+    if (presentation) value = presentation->canonical(value);
     auto known = initializers.find(value);
-    if (known != initializers.end())
+    if (known != initializers.end()) {
+      if (presentation) presentation->recordInitializer(source, known->second);
       return known->second;
+    }
     auto *op = value.getDefiningOp();
     if (!op || depth > 256)
       return definition.emitOpError()
              << "physical initializer has no bounded constant DAG";
     SmallVector<std::string> operands;
     for (Value operand : op->getOperands()) {
-      auto rendered = physicalInitializer(operand, depth + 1);
+      auto rendered = physicalInitializer(operand, {}, depth + 1);
       if (failed(rendered))
         return failure();
       operands.push_back(*rendered);
@@ -40,10 +90,14 @@ public:
         return failure();
       if (context.isClosedStatic(constant.getValue())) {
         llvm::APSInt value(*literal);
+        auto bits = cast<ac::BitsType>(constant.getResult().getType());
+        if (context.isClosedStatic(bits.getWidth()) && !value.isNegative()) {
+          expression = *width + "'d" + *literal;
+        }
         *literal = std::to_string(std::max(1u, value.getActiveBits())) + "'d" +
                    *literal;
       }
-      expression = "(" + *width + ")'(" + *literal + ")";
+      if (expression.empty()) expression = "(" + *width + ")'(" + *literal + ")";
     } else if (auto create = dyn_cast<ac::EnumCreateOp>(op)) {
       auto enumeration =
           context.analysis.resolveEnum(create.getResult().getType(), op);
@@ -73,7 +127,10 @@ public:
       auto width = context.payloadWidth(value.getType(), op, true);
       if (failed(low) || failed(width))
         return failure();
-      expression = operands[0] + "[(" + *low + ") +: (" + *width + ")]";
+      auto inputWidth = context.payloadWidth(extract.getInput().getType(), op, true);
+      if (failed(inputWidth)) return failure();
+      expression = *low == "0" && *inputWidth == *width ? operands[0]
+          : operands[0] + "[(" + *low + ") +: (" + *width + ")]";
     } else if (auto resize = dyn_cast<ac::BitsResizeOp>(op)) {
       auto width = context.payloadWidth(value.getType(), op, true);
       if (failed(width))
@@ -87,27 +144,39 @@ public:
              << "physical initializer lacks constant RTL rendering";
     // Typed elaboration constants keep constructor layout and widths. No live
     // initializer wire participates in the primitive startup operation.
-    auto name = "pyc_initial_" + std::to_string(initializers.size());
+    auto label = context.rtlIdentifier(hint.empty() ? "initial_" + std::to_string(initializers.size()) : hint.str(), op);
+    if (failed(label)) return failure();
+    auto name = context.rtlGeneratedName(definition, "initializer:" + std::to_string(initializers.size()), *label);
     out << "  localparam " << *type << " " << name << " = " << expression
         << ";\n";
     initializers.try_emplace(value, name);
+    if (presentation) presentation->recordInitializer(source, name);
     return name;
   }
   LogicalResult emitSourceChecks() {
     if (context.isPhysical()) {
-      for (const auto &binding : context.sourceChecks().bindings) {
+      llvm::raw_string_ostream checks(physicalChecks);
+      for (auto [ordinal, binding] : llvm::enumerate(context.sourceChecks().bindings)) {
         if (binding.definition != definition)
           continue;
-        auto condition = net(binding.condition), path = net(binding.path);
-        if (failed(condition) || failed(path))
-          return failure();
-        auto name = "pyc_check_error_" + std::to_string(localErrors.size());
-        out << "`ifndef SYNTHESIS\n  wire " << name << " = $isunknown(" << *path
-            << ") || ((pyc_reset_active === 1'b0) && (" << *path
-            << " === 1'b1) && $isunknown(" << *condition
-            << "));\n"
-               "`else\n  wire "
-            << name << " = 1'b0;\n`endif\n";
+        const auto &plan = presentation->check(ordinal);
+        if (!plan.needed()) continue;
+        SmallVector<std::string> terms;
+        std::string path;
+        if (plan.pathUnknown || (plan.conditionUnknown && !plan.pathAlwaysOne)) {
+          auto signal = net(plan.path);
+          if (failed(signal)) return failure();
+          path = *signal;
+        }
+        if (plan.pathUnknown) terms.push_back("$isunknown(" + path + ")");
+        if (plan.conditionUnknown) {
+          auto condition = net(plan.condition), reset = physicalReset();
+          if (failed(condition) || failed(reset)) return failure();
+          terms.push_back("((" + *reset + " === 1'b0) && " +
+              (plan.pathAlwaysOne ? "" : "(" + path + " === 1'b1) && ") + "$isunknown(" + *condition + "))");
+        }
+        auto name = generated("check_error_" + std::to_string(localErrors.size()));
+        checks << "    wire " << name << " = " << join(terms, " || ") << ";\n";
         localErrors.push_back(name);
       }
       return success();
@@ -346,18 +415,20 @@ public:
     return success();
   }
   FailureOr<std::string> net(Value value) {
-    if (auto found = names.find(value); found != names.end())
+    if (presentation) value = presentation->canonical(value);
+    if (auto found = names.find(value); found != names.end()) {
+      if (presentation && presentation->get(value).disposition.empty())
+        presentation->record(value, found->second, "region-port");
       return found->second;
+    }
     if (auto argument = dyn_cast<BlockArgument>(value)) {
       auto *parent = argument.getOwner()->getParentOp();
       if (parent == definition) {
-        auto port = cast<StringAttr>(
-            definition.getInputNames()[argument.getArgNumber()]);
-        auto id = legalizeIdentifier(port.getValue(),
-                                     [&] { return definition.emitOpError(); });
+        auto id = context.rtlPortName(definition, false, argument.getArgNumber());
         if (failed(id))
           return failure();
         names.try_emplace(value, *id);
+        if (presentation) presentation->record(value, *id, "port");
         return *id;
       }
       if (auto rule = dyn_cast<ac::RuleOp>(parent))
@@ -368,11 +439,11 @@ public:
     if (!op)
       return definition.emitOpError() << "RTL wire has no producer";
     if (isa<ac::InstanceOp, ac::CollectionOp>(op)) {
-      auto name = "pyc_net_" + std::to_string(next++);
+      auto name = netName(value);
       auto type = context.rtlType(value.getType(), op);
       if (failed(type))
         return failure();
-      out << "  wire " << *type << " " << name << ";\n";
+      declareNet(value, *type, name);
       names.try_emplace(value, name);
       instances.insert(op);
       return name;
@@ -395,7 +466,7 @@ public:
     }
     // Register the complete net before following producers. A legal
     // field-level graph can refer to another field of this same aggregate.
-    auto name = "pyc_net_" + std::to_string(next++);
+    auto name = netName(value);
     auto type = context.rtlType(value.getType(), op);
     if (failed(type))
       return failure();
@@ -403,13 +474,47 @@ public:
     if (auto binary = dyn_cast<ac::BitsBinaryOp>(op))
       combinationalDivRem =
           binary.getOpcode() == "udiv" || binary.getOpcode() == "urem";
-    out << "  " << (combinationalDivRem ? "" : "wire ") << *type << " " << name
-        << ";\n";
-    names.try_emplace(value, name);
+    bool inlineValue = presentation && presentation->get(value).inlineValue;
+    if (!inlineValue) {
+      declareNet(value, *type, name, combinationalDivRem);
+      names.try_emplace(value, name);
+    }
+    auto finish = [&](std::string expression) -> FailureOr<std::string> {
+      if (inlineValue) {
+        // A removed wire's width and unsignedness remain expression boundaries.
+        auto &node = presentation->get(value);
+        if (!node.literal && !node.replacement && !isa<ac::BitsCompareOp>(op)) {
+          auto width = context.payloadWidth(value.getType(), op, true);
+          if (failed(width)) return failure();
+          expression = "$unsigned((" + *width + ")'(" + expression + "))";
+        }
+        names.try_emplace(value, expression);
+        presentation->record(value, expression, "inline");
+        return expression;
+      }
+      auto statement = "  " + std::string(combinationalDivRem ? "always_comb " : "assign ") + name
+          + " = " + expression + ";\n";
+      if (presentation && !presentation->get(value).local) presentation->statement(value, statement);
+      else out << statement;
+      return name;
+    };
+    if (presentation) {
+      auto &node = presentation->get(value);
+      if (node.constant < 4) return finish(std::string("1'b") + "01xz"[node.constant]);
+      if (node.replacement) {
+        auto rendered = net(node.replacement);
+        if (failed(rendered)) return failure();
+        return finish(*rendered);
+      }
+    }
     SmallVector<std::string> operands;
     auto runtimeOperands = op->getOperands();
     if (isa<ac::ValueRequireOp>(op))
       runtimeOperands = runtimeOperands.drop_front();
+    if (presentation && isa<ac::DWireOp>(op)) {
+      runtimeOperands = runtimeOperands.drop_front(2);
+      operands.append({"", ""});
+    }
     for (auto input : runtimeOperands) {
       auto item = net(input);
       if (failed(item))
@@ -461,6 +566,11 @@ public:
           cast<ac::BitsType>(value.getType()).getWidth(), op);
       if (failed(width))
         return failure();
+      auto decimal = [](StringRef value) {
+        return !value.empty() && llvm::all_of(value, [](char c) { return c >= '0' && c <= '9'; });
+      };
+      if (presentation && decimal(*width) && decimal(*literal))
+        return finish(*width + "'d" + *literal);
       if (context.isClosedStatic(constant.getValue())) {
         llvm::APSInt value(*literal);
         *literal = std::to_string(std::max(1u, value.getActiveBits())) + "'d" +
@@ -520,8 +630,8 @@ public:
                    predicate.str() + " " + (signedCompare ? "$signed(" : "") +
                    operands[1] + (signedCompare ? ")" : "") + ")";
     } else if (isa<ac::BitsSelectOp>(op))
-      expression =
-          "(" + operands[0] + " ? " + operands[1] + " : " + operands[2] + ")";
+      expression = "(" + operands[0] + (presentation ? "\n      ? " : " ? ") + operands[1]
+          + (presentation ? "\n      : " : " : ") + operands[2] + ")";
     else if (isa<ac::DWireOp>(op))
       expression = "(" + operands[2] + " ? " + operands[3] + " : " + operands[4] + ")";
     else if (isa<ac::BitsConcatOp>(op)) {
@@ -570,17 +680,15 @@ public:
       expression = operands[0] + "." + *name;
     } else
       return op->emitOpError() << "operation lacks RTL hardware emission";
-    out << "  " << (combinationalDivRem ? "always_comb " : "assign ") << name
-        << " = " << expression << ";\n";
-    return name;
+    return finish(expression);
   }
   LogicalResult tableOperation(Operation *op) {
     for (Value result : op->getResults()) {
       auto type = context.rtlType(result.getType(), op);
       if (failed(type))
         return failure();
-      auto name = "pyc_net_" + std::to_string(next++);
-      out << "  wire " << *type << " " << name << ";\n";
+      auto name = netName(result);
+      declareNet(result, *type, name);
       names.try_emplace(result, name);
     }
     SmallVector<std::string> operands;
@@ -608,7 +716,7 @@ public:
              ") +: (" + *w + ")]";
     };
     auto generate = [&](StringRef n, StringRef label) {
-      std::string i = "pyc_index_" + std::to_string(next++);
+      std::string i = generated("index_" + std::to_string(next++));
       out << "  for (genvar " << i << "=0; " << i << " < (" << n << "); ++" << i
           << ") begin : " << label << "\n";
       return i;
@@ -628,7 +736,7 @@ public:
       auto w = width(splat.getInput().getType());
       if (failed(n) || failed(w))
         return failure();
-      auto i = generate(*n, "pyc_broadcast_" + resultName());
+      auto i = generate(*n, generated("broadcast_" + resultName()));
       out << "    assign " << resultName() << "[((" << *n << ")-1-" << i
           << ")*(" << *w << ") +: (" << *w << ")] = " << operands[0]
           << ";\n  end\n";
@@ -640,7 +748,7 @@ public:
       auto n = count(dstType);
       if (failed(n))
         return failure();
-      auto i = generate(*n, "pyc_view_" + resultName());
+      auto i = generate(*n, generated("view_" + resultName()));
       auto mapped = context.viewIndex(view, i, true);
       if (failed(mapped))
         return failure();
@@ -719,7 +827,7 @@ public:
       auto n = context.shapeSize(shape, op, true);
       if (failed(n))
         return failure();
-      auto i = generate(*n, "pyc_map_" + resultName());
+      auto i = generate(*n, generated("map_" + resultName()));
       Block &block = op->getRegion(0).front();
       unsigned arg = 0;
       if (isMap) {
@@ -731,11 +839,11 @@ public:
       for (auto [j, value] : llvm::enumerate(tables)) {
         auto type = cast<ac::TableType>(value.getType());
         auto selected = element(operands[j], i, type);
-        auto dataType = context.rtlType(type.getElementType(), op);
+        auto dataType = context.rtlWireType(type.getElementType(), op);
         if (failed(selected) || failed(dataType))
           return failure();
-        auto local = "pyc_lane_" + std::to_string(next++);
-        out << "    wire " << *dataType << " " << local << " = " << *selected
+        auto local = generated("lane_" + std::to_string(next++));
+        out << "    " << *dataType << " " << local << " = " << *selected
             << ";\n";
         names[block.getArgument(arg++)] = local;
       }
@@ -765,33 +873,37 @@ public:
       if (failed(n) || failed(w))
         return failure();
       auto c = choose.getCount();
-      auto prefix = "pyc_choice_" + resultName();
-      out << "  wire [(" << *n << ")-1:0] " << prefix << "_mask [0:" << c
+      auto prefix = generated("choice_" + resultName());
+      auto member = [&](StringRef suffix) {
+        auto hint = prefix + "_" + suffix.str();
+        return context.isPhysical() ? generated(hint) : hint;
+      };
+      auto mask = member("mask"), index = member("index"), valid = member("valid");
+      out << "  wire [(" << *n << ")-1:0] " << mask << " [0:" << c
           << "];\n"
-          << "  wire [(" << *w << ")-1:0] " << prefix << "_index [0:" << c - 1
+          << "  wire [(" << *w << ")-1:0] " << index << " [0:" << c - 1
           << "][0:(" << *n << ")];\n"
-          << "  wire " << prefix << "_valid [0:" << c - 1 << "];\n"
-          << "  assign " << prefix << "_mask[0] = " << operands[1] << ";\n";
-      auto pass = generate(std::to_string(c), prefix + "_passes");
-      out << "    assign " << prefix << "_index[" << pass << "][0] = '0;\n"
-          << "    assign " << prefix << "_valid[" << pass << "] = |" << prefix
-          << "_mask[" << pass << "];\n";
-      auto step = generate(*n, prefix + "_scan");
+          << "  wire " << valid << " [0:" << c - 1 << "];\n"
+          << "  assign " << mask << "[0] = " << operands[1] << ";\n";
+      auto pass = generate(std::to_string(c), member("passes"));
+      out << "    assign " << index << "[" << pass << "][0] = '0;\n"
+          << "    assign " << valid << "[" << pass << "] = |" << mask << "[" << pass << "];\n";
+      auto step = generate(*n, member("scan"));
       auto k =
           choose.getOrder() == "low" ? "((" + *n + ")-1-" + step + ")" : step;
-      out << "    assign " << prefix << "_index[" << pass << "][" << step
-          << "+1] = " << prefix << "_mask[" << pass << "][" << k << "] ? ("
-          << *w << ")'(" << k << ") : " << prefix << "_index[" << pass << "]["
+      out << "    assign " << index << "[" << pass << "][" << step
+          << "+1] = " << mask << "[" << pass << "][" << k << "] ? ("
+          << *w << ")'(" << k << ") : " << index << "[" << pass << "]["
           << step << "];\n"
-          << "    assign " << prefix << "_mask[" << pass << "+1][" << step
-          << "] = " << prefix << "_mask[" << pass << "][" << step << "] & ~("
-          << prefix << "_valid[" << pass << "] & (" << prefix << "_index["
+          << "    assign " << mask << "[" << pass << "+1][" << step
+          << "] = " << mask << "[" << pass << "][" << step << "] & ~("
+          << valid << "[" << pass << "] & (" << index << "["
           << pass << "][" << *n << "] == (" << *w << ")'(" << step << ")));\n"
           << "  end\n  end\n";
       for (int64_t j = 0; j < c; ++j)
-        out << "  assign " << resultName(j) << " = " << prefix << "_index[" << j
+        out << "  assign " << resultName(j) << " = " << index << "[" << j
             << "][" << *n << "];\n"
-            << "  assign " << resultName(c + j) << " = " << prefix << "_valid["
+            << "  assign " << resultName(c + j) << " = " << valid << "["
             << j << "];\n";
       return success();
     }
@@ -800,14 +912,14 @@ public:
       auto n = count(type), w = width(type.getElementType());
       if (failed(n) || failed(w))
         return failure();
-      auto prefix = "pyc_fold_" + resultName();
+      auto prefix = generated("fold_" + resultName());
       out << "  wire [(" << *n << ")*(" << *w << ")-1:0] " << prefix
           << " [0:$clog2(" << *n << ")];\n"
           << "  assign " << prefix << "[0] = " << operands[0] << ";\n";
-      auto level = generate("$clog2(" + *n + ")", prefix + "_levels");
+      auto level = generate("$clog2(" + *n + ")", (context.isPhysical() ? generated(prefix + "_levels") : prefix + "_levels"));
       auto previousCount = "(((" + *n + ") + ((64'd1 << " + level +
                            ")-1)) / (64'd1 << " + level + "))";
-      auto lane = generate("((" + previousCount + "+1)/2)", prefix + "_pairs");
+      auto lane = generate("((" + previousCount + "+1)/2)", (context.isPhysical() ? generated(prefix + "_pairs") : prefix + "_pairs"));
       auto a = prefix + "[" + level + "][((" + *n + ")-1-2*" + lane + ")*(" +
                *w + ") +: (" + *w + ")]";
       auto b = prefix + "[" + level + "][((" + *n + ")-2-2*" + lane + ")*(" +
@@ -921,6 +1033,104 @@ public:
     return op->emitOpError() << "table operation lacks RTL emission";
   }
 
+  LogicalResult emitPhysicalStorage(Operation *occurrence, StringRef kind,
+                                    const ac::HardwareBindings &bindings,
+                                    ArrayRef<std::string> inputs,
+                                    ArrayRef<std::string> outputs) {
+    // The verified physical projection selects this backend for native storage.
+    // It implements the physical branch of dff/dffe without importing their
+    // managed-simulator ABI. Keep typed startup, reset priority and the common
+    // commit barrier, including all four-state control/type checks.
+    bool collection = isa<ac::CollectionOp>(occurrence);
+    bool enabled = kind == "dffe";
+    unsigned dataIndex = enabled ? 3 : 2, initialIndex = dataIndex + 1;
+    auto owner = occurrence->getAttrOfType<StringAttr>("instance_name").getValue();
+    auto initial = physicalInitializer(occurrence->getOperand(initialIndex), owner.str() + "_init");
+    if (failed(initial)) return failure();
+    auto label = context.rtlIdentifier("storage_" + owner.str(), occurrence);
+    if (failed(label)) return failure();
+    auto scope = context.rtlGeneratedName(definition, "storage:" + owner.str(), *label);
+    auto error = generated("storage_error_" + std::to_string(localErrors.size()));
+    llvm::raw_string_ostream checks(physicalChecks);
+    std::string count, lane;
+    if (collection) {
+      auto size = context.shapeSize(cast<ac::CollectionOp>(occurrence).getShape(), occurrence, true);
+      if (failed(size)) return failure();
+      count = *size;
+      lane = generated("instance_lane_" + std::to_string(next++));
+      checks << "    wire [(" << count << ")-1:0] " << error << ";\n";
+      localErrors.push_back("(|" + error + ")");
+    } else {
+      checks << "    wire " << error << ";\n";
+      localErrors.push_back(error);
+    }
+    auto *callee = collection ? context.analysis.resolveCallee(cast<ac::CollectionOp>(occurrence))
+                             : context.analysis.resolveCallee(cast<ac::InstanceOp>(occurrence));
+    auto signature = cast<FunctionType>(callee->getAttrOfType<TypeAttr>("function_type").getValue());
+    auto payload = context.analysis.resolveType(signature.getResult(0), bindings, occurrence);
+    if (failed(payload)) return failure();
+    auto type = context.rtlType(*payload, occurrence);
+    if (failed(type)) return failure();
+    auto select = [&](StringRef signal, Type portType) -> FailureOr<std::string> {
+      if (!collection) return signal.str();
+      auto width = context.payloadWidth(portType, occurrence, true, bindings);
+      if (failed(width)) return failure();
+      return signal.str() + "[((" + count + ")-1-" + lane + ")*(" + *width + ") +: (" + *width + ")]";
+    };
+    SmallVector<std::string> pins;
+    for (auto [i, signal] : llvm::enumerate(inputs)) {
+      auto pin = select(signal, signature.getInput(i));
+      if (failed(pin)) return failure();
+      pins.push_back(*pin);
+    }
+    auto q = select(outputs[0], signature.getResult(0));
+    auto startup = select(*initial, signature.getInput(initialIndex));
+    if (failed(q) || failed(startup)) return failure();
+    auto clock = pins[0], reset = context.rtlReset(pins[1]);
+    auto enable = enabled ? pins[2] : "1'b1";
+    auto fault = context.rtlCheckName(definition, "checks") + "." + error;
+    if (collection) fault += "[" + lane + "]";
+    // Local storage/check declarations must not shadow incoming functional
+    // signals referenced from the generate scope.
+    auto local = [&](StringRef role) {
+      return context.rtlGeneratedName(definition, "storage-local:" + role.str(), role);
+    };
+    auto payloadType = local("payload_t"), value = local("value");
+    auto probe = local("check_payload"), payloadX = local("payload_x_check"), packedX = local("packed_x_check");
+    if (collection)
+      out << "  for (genvar " << lane << "=0; " << lane << " < (" << count
+          << "); ++" << lane << ") begin : " << scope << "\n";
+    else
+      out << "  if (1) begin : " << scope << "\n";
+    out << "    typedef " << *type << " " << payloadType << ";\n"
+        << "    " << payloadType << " " << value << ";\n"
+        << "    initial " << value << " = " << *startup << ";\n"
+        << "    assign " << *q << " = " << value << ";\n"
+        << "`ifndef SYNTHESIS\n"
+        << "    assign " << fault << " = $isunknown(" << reset << ") || (("
+        << reset << " === 1'b0) && $isunknown(" << enable << "));\n"
+        << "    initial begin : " << probe << "\n"
+        << "      " << payloadType << " " << payloadX << ";\n"
+        << "      logic [$bits(" << payloadType << ")-1:0] " << packedX << ";\n"
+        << "      if ($bits(" << payloadType << ") == 0) $fatal(1, \"" << kind << ": payload must have positive packed width\");\n"
+        << "`ifndef VERILATOR\n"
+        << "      " << payloadX << " = " << payloadType << "'({$bits(" << payloadType << "){1'bx}});\n"
+        << "      " << packedX << " = " << payloadX << ";\n"
+        << "      if (" << packedX << " !== {$bits(" << payloadType << "){1'bx}})\n"
+        << "        $fatal(1, \"" << kind << ": T must be four-state packed bits or a four-state packed struct\");\n"
+        << "`endif\n    end\n"
+        << "`endif\n"
+        << "    always @(posedge " << clock << ") begin\n"
+        << "`ifndef SYNTHESIS\n"
+        << "      if ((" << context.rtlCheckRef(definition, "commit_ok") << " === 1'b1) && (" << clock << " === 1'b1)) begin\n"
+        << "`endif\n"
+        << "        if (" << reset << ") " << value << " <= " << pins[initialIndex] << ";\n"
+        << "        else if (" << enable << ") " << value << " <= " << pins[dataIndex] << ";\n"
+        << "        else " << value << " <= " << value << ";\n"
+        << "`ifndef SYNTHESIS\n      end\n`endif\n    end\n  end\n";
+    return success();
+  }
+
   LogicalResult emitInstances() {
     for (auto &operation : definition.getBody().front()) {
       if (auto queue = dyn_cast<ac::InstanceOp>(operation);
@@ -1022,13 +1232,18 @@ public:
           return failure();
         outputs.push_back(*value);
       }
+      if (context.isPhysical() && managedPrimitive && (kind == "dff" || kind == "dffe")) {
+        if (failed(emitPhysicalStorage(occurrence, kind, *bindings, inputs, outputs)))
+          return failure();
+        continue;
+      }
       auto parameters =
           collection
               ? context.rtlInstanceParameters(cast<ac::CollectionOp>(operation))
               : context.rtlInstanceParameters(cast<ac::InstanceOp>(operation));
-      auto name = legalizeIdentifier(
+      auto name = context.rtlIdentifier(
           occurrence->getAttrOfType<StringAttr>("instance_name").getValue(),
-          [&] { return occurrence->emitOpError(); });
+          occurrence);
       if (failed(parameters) || failed(name))
         return failure();
       if (managedPrimitive) {
@@ -1052,35 +1267,11 @@ public:
         if (failed(size))
           return failure();
         count = *size;
-        i = "pyc_instance_lane_" + std::to_string(next++);
-      }
-      if (context.isPhysical() && managedPrimitive &&
-          (kind == "dff" || kind == "dffe")) {
-        unsigned initialIndex = kind == "dff" ? 3 : 4;
-        auto initial =
-            physicalInitializer(occurrence->getOperand(initialIndex));
-        if (failed(initial))
-          return failure();
-        std::string selected = *initial;
-        if (collection) {
-          auto signature = cast<FunctionType>(
-              callee->getAttrOfType<TypeAttr>("function_type").getValue());
-          auto width = context.payloadWidth(signature.getInput(initialIndex),
-                                            occurrence, true, *bindings);
-          if (failed(width))
-            return failure();
-          selected += "[((" + count + ")-1-" + i + ")*(" + *width + ") +: (" +
-                      *width + ")]";
-        }
-        auto close = parameters->rfind(')');
-        if (close == std::string::npos)
-          return occurrence->emitOpError()
-                 << "physical primitive requires constant parameters";
-        parameters->insert(close, ", .pyc_initial(" + selected + ") ");
+        i = generated("instance_lane_" + std::to_string(next++));
       }
       std::string childError, childComplete, childSamplingError;
-      if ((context.managesChecks() || context.isPhysical())) {
-        childError = "pyc_child_error_" + std::to_string(localErrors.size());
+      if (context.managesChecks()) {
+        childError = generated("child_error_" + std::to_string(localErrors.size()));
         if (collection)
           out << "  wire [(" << count << ")-1:0] " << childError << ";\n";
         else
@@ -1102,15 +1293,14 @@ public:
       }
       if (collection)
         out << "  for (genvar " << i << "=0; " << i << " < (" << count
-            << "); ++" << i << ") begin : " << "pyc_instances_" << *name
+            << "); ++" << i << ") begin : " << generated("instances_" + *name)
             << "\n";
       out << "  " << (kind.empty() ? context.names(callee).rtl : kind.str())
-          << *parameters << " pyc_instance_" << *name << " (";
+          << *parameters << " " << generated("instance_" + *name) << " (";
       bool first = true;
-      auto connect = [&](StringRef port, StringRef signal,
+      auto connect = [&](bool output, unsigned ordinal, StringRef port, StringRef signal,
                          Type type) -> LogicalResult {
-        auto id =
-            legalizeIdentifier(port, [&] { return occurrence->emitOpError(); });
+        auto id = context.rtlPortName(callee, output, ordinal);
         if (failed(id))
           return failure();
         std::string net = signal.str();
@@ -1131,15 +1321,13 @@ public:
           callee->getAttrOfType<TypeAttr>("function_type").getValue());
       auto inputNames = callee->getAttrOfType<ArrayAttr>("input_names");
       auto outputNames = callee->getAttrOfType<ArrayAttr>("output_names");
-      for (auto [raw, signal, type] :
-           llvm::zip(inputNames, inputs, signature.getInputs()))
-        if (failed(connect(cast<StringAttr>(raw).getValue(), signal, type)))
+      for (auto [index, signal] : llvm::enumerate(inputs))
+        if (failed(connect(false, index, cast<StringAttr>(inputNames[index]).getValue(), signal, signature.getInput(index))))
           return failure();
-      for (auto [raw, signal, type] :
-           llvm::zip(outputNames, outputs, signature.getResults()))
-        if (failed(connect(cast<StringAttr>(raw).getValue(), signal, type)))
+      for (auto [index, signal] : llvm::enumerate(outputs))
+        if (failed(connect(true, index, cast<StringAttr>(outputNames[index]).getValue(), signal, signature.getResult(index))))
           return failure();
-      if ((context.managesChecks() || context.isPhysical())) {
+      if (context.managesChecks()) {
         auto managedConnection = [&](StringRef port, StringRef signal) {
           out << (first ? "\n" : ",\n") << "    ." << port << "(" << signal
               << ")";
@@ -1147,9 +1335,12 @@ public:
         };
         if (!context.isPhysical())
           managedConnection("pyc_phase", "pyc_phase");
-        managedConnection("pyc_root_commit_ok", "pyc_root_commit_ok");
+        auto control = [&](StringRef role, StringRef signal) {
+          managedConnection("pyc_" + role.str(), signal);
+        };
+        control("root_commit_ok", generated("root_commit_ok"));
         if (kind.empty()) {
-          managedConnection("pyc_reset_active", "pyc_reset_active");
+          control("reset_active", generated("reset_active"));
           if (!context.isPhysical())
             managedConnection("pyc_check_complete",
                               collection ? childComplete + "[" + i + "]"
@@ -1159,24 +1350,73 @@ public:
                               collection ? childSamplingError + "[" + i + "]"
                                          : childSamplingError);
         }
-        managedConnection("pyc_local_error",
+        control("local_error",
                           collection ? childError + "[" + i + "]" : childError);
       }
       out << (first ? ");\n" : "\n  );\n");
+      if (context.isPhysical()) {
+        auto instance = generated("instance_" + *name);
+        auto childScope = context.rtlCheckRef(callee, "commit_ok");
+        out << "`ifndef SYNTHESIS\n"
+            << "  assign " << instance << "." << childScope << " = "
+            << context.rtlCheckRef(definition, "commit_ok") << ";\n`endif\n";
+        llvm::raw_string_ostream checks(physicalChecks);
+        std::string error = generated("child_error_" + std::to_string(localErrors.size()));
+        std::string childPath = instance + "." + context.rtlCheckRef(callee, "error");
+        if (collection) {
+          auto group = generated("instances_" + *name);
+          auto gather = generated("check_children_" + std::to_string(next++));
+          checks << "    wire [(" << count << ")-1:0] " << error << ";\n"
+                 << "    for (genvar " << i << "=0; " << i << " < (" << count
+                 << "); ++" << i << ") begin : " << gather << "\n"
+                 << "      assign " << error << "[" << i << "] = " << group << "[" << i
+                 << "]." << childPath << ";\n    end\n";
+          localErrors.push_back("(|" + error + ")");
+        } else {
+          checks << "    wire " << error << " = " << childPath << ";\n";
+          localErrors.push_back(error);
+        }
+      }
       if (collection)
         out << "  end\n";
     }
     return success();
   }
 
-  void emitAggregateError() {
+  LogicalResult emitAggregateError() {
     if (context.isPhysical()) {
-      out << "  assign pyc_local_error = "
+      auto error = context.rtlCheckName(definition, "error");
+      auto commit = context.rtlCheckName(definition, "commit_ok");
+      out << "\n  // Simulation checks; no functional interface ports.\n"
+          << "`ifndef SYNTHESIS\n  if (1) begin : " << context.rtlCheckName(definition, "checks") << "\n"
+          << physicalChecks
+          << "    wire " << error << " = "
           << (localErrors.empty() ? "1'b0" : join(localErrors, " | ")) << ";\n";
-      return;
+      if (context.sourceChecks().owners.front().definition == definition) {
+        const auto &projection = context.physicalProjection();
+        auto clock = context.rtlPortName(definition, false, projection.clockInput);
+        auto reset = physicalReset();
+        if (failed(clock) || failed(reset)) return failure();
+        auto fault = context.rtlCheckName(definition, "physical_fault");
+        auto physicalError = context.rtlCheckName(definition, "physical_error");
+        out << "    bit " << fault << " = 1'b0;\n"
+            << "    wire " << physicalError << " = " << error << " | $isunknown(" << *reset << ");\n"
+            << "    wire " << commit << " = !" << fault << " && !" << physicalError << ";\n"
+            << "    always @(" << *clock << ") begin\n"
+            << "      if ($isunknown(" << *clock << ") || ((" << *clock << " === 1'b1) && " << physicalError << ")) begin\n"
+            << "        if (!" << fault << ") $display(\"PYCIRCUIT_PHYSICAL_FAULT\");\n"
+            << "        " << fault << " = 1'b1;\n"
+            << "      end\n    end\n";
+      } else {
+        // The enclosing generated module supplies this through a private
+        // hierarchical connection; synthesis contains neither endpoint.
+        out << "    wire " << commit << ";\n";
+      }
+      out << "  end\n`endif\n";
+      return success();
     }
     if (!context.managesChecks())
-      return;
+      return success();
     out << "  assign pyc_check_complete = "
         << (localCompletions.empty() ? "1'b1" : join(localCompletions, " & "))
         << ";\n"
@@ -1189,16 +1429,19 @@ public:
     if (!localErrors.empty())
       out << " | " << join(localErrors, " | ");
     out << ";\n";
+    return success();
   }
 
 private:
   HardwareEmitContext &context;
   ac::ModuleOp definition;
   raw_ostream &out;
+  std::unique_ptr<RtlPresentationPlan> presentation;
   llvm::DenseMap<Value, std::string> names;
   llvm::DenseMap<Value, std::string> initializers;
   llvm::DenseSet<Operation *> instances;
   llvm::DenseMap<uint64_t, std::string> samplingNames;
+  std::string physicalChecks;
   SmallVector<std::string> localErrors;
   SmallVector<std::string> localCompletions;
   SmallVector<std::string> localSamplingErrors;
@@ -1207,7 +1450,8 @@ private:
 } // namespace
 LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
                                             ac::ModuleOp definition,
-                                            raw_ostream &out) {
+                                            raw_ostream &out,
+                                            llvm::json::Array *presentation) {
   auto &names = context.names(definition);
   out << "module " << names.rtl;
   SmallVector<std::string> parameters;
@@ -1239,15 +1483,14 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
   out << " (";
   bool first = true;
   auto emitPort = [&](StringRef direction, Type type,
-                      StringRef name) -> LogicalResult {
-    auto rendered = context.rtlType(type, definition);
+                      unsigned ordinal) -> LogicalResult {
+    auto rendered = context.rtlWireType(type, definition);
     if (failed(rendered))
       return failure();
-    auto id =
-        legalizeIdentifier(name, [&] { return definition.emitOpError(); });
+    auto id = context.rtlPortName(definition, direction == "output", ordinal);
     if (failed(id))
       return failure();
-    out << (first ? "\n" : ",\n") << "  " << direction << " wire " << *rendered
+    out << (first ? "\n" : ",\n") << "  " << direction << " " << *rendered
         << " " << *id;
     first = false;
     return success();
@@ -1256,12 +1499,12 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
   for (auto [i, type] : llvm::enumerate(signature.getInputs()))
     if (failed(emitPort(
             "input", type,
-            cast<StringAttr>(definition.getInputNames()[i]).getValue())))
+            i)))
       return failure();
   for (auto [i, type] : llvm::enumerate(signature.getResults()))
     if (failed(emitPort(
             "output", type,
-            cast<StringAttr>(definition.getOutputNames()[i]).getValue())))
+            i)))
       return failure();
   if (context.managesChecks()) {
     out << (first ? "\n" : ",\n")
@@ -1273,26 +1516,21 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
            "  output wire pyc_local_error";
     first = false;
   }
-  if (context.isPhysical()) {
-    out << (first ? "\n" : ",\n")
-        << "  input wire pyc_root_commit_ok,\n"
-           "  input wire pyc_reset_active,\n"
-           "  output wire pyc_local_error";
-    first = false;
-  }
   out << (first ? ");\n" : "\n);\n");
-  NetEmitter nets(context, definition, out);
+  std::string deferred;
+  llvm::raw_string_ostream deferredOut(deferred);
+  auto &body = context.isPhysical() ? static_cast<raw_ostream &>(deferredOut) : out;
+  NetEmitter nets(context, definition, body);
+  if (failed(nets.preparePresentation())) return failure();
   auto yield = cast<ac::YieldOp>(definition.getBody().front().back());
   for (auto [i, value] : llvm::enumerate(yield.getValues())) {
     auto wire = nets.net(value);
     if (failed(wire))
       return failure();
-    auto id = legalizeIdentifier(
-        cast<StringAttr>(definition.getOutputNames()[i]).getValue(),
-        [&] { return definition.emitOpError(); });
+    auto id = context.rtlPortName(definition, true, i);
     if (failed(id))
       return failure();
-    out << "  assign " << *id << " = " << *wire << ";\n";
+    body << "  assign " << *id << " = " << *wire << ";\n";
   }
   if (failed(nets.emitSourceChecks()))
     return failure();
@@ -1300,7 +1538,11 @@ LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
     return failure();
   if (failed(nets.emitInstances()))
     return failure();
-  nets.emitAggregateError();
+  if (failed(nets.emitAggregateError())) return failure();
+  if (context.isPhysical()) {
+    nets.finishPresentation(out, presentation);
+    out << "\n  // Outputs, checks, structured logic and state/child instances\n" << deferred;
+  }
   out << "endmodule\n";
   return success();
 }

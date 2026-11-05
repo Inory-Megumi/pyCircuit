@@ -2,7 +2,10 @@
 #define PYCIRCUIT_HARDWARE_EMIT_COMMON_H
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/JSON.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -54,6 +57,20 @@ public:
                                            mlir::Operation *site) const;
   mlir::FailureOr<std::string> rtlType(mlir::Type type,
                                        mlir::Operation *site) const;
+  mlir::FailureOr<std::string> rtlWireType(mlir::Type type,
+                                           mlir::Operation *site) const;
+  mlir::FailureOr<std::string> rtlPortName(mlir::Operation *definition,
+                                           bool output, unsigned ordinal) const;
+  std::string rtlGeneratedName(mlir::Operation *definition,
+                               llvm::StringRef identity, llvm::StringRef hint) const;
+  std::string rtlCheckName(mlir::Operation *definition,
+                           llvm::StringRef member) const;
+  std::string rtlCheckRef(mlir::Operation *definition,
+                          llvm::StringRef member) const;
+  mlir::FailureOr<std::string> rtlIdentifier(llvm::StringRef name,
+                                             mlir::Operation *site) const;
+  std::string rtlHelper(llvm::StringRef name) const;
+  bool usesRtlHelper(llvm::StringRef name) const { return rtlHelpers_.contains(name); }
   mlir::FailureOr<std::string> staticValue(ac::StaticExprAttr expression,
                                            mlir::Operation *site) const;
   bool isClosedStatic(ac::StaticExprAttr expression,
@@ -97,6 +114,19 @@ public:
   ac::HardwareAnalysis &analysis;
 
 private:
+  struct RtlNameScope {
+    llvm::StringMap<std::string> names;
+    llvm::StringSet<> used;
+    llvm::StringMap<unsigned> suffixes;
+    llvm::SmallVector<std::string> inputs, outputs;
+    bool ready = false;
+    std::string claim(llvm::StringRef identity, llvm::StringRef spelling);
+  };
+  mutable llvm::DenseMap<mlir::Operation *, RtlNameScope> rtlScopes_;
+  mutable llvm::StringSet<> rtlHelpers_;
+  RtlNameScope &rtlScope(mlir::Operation *definition) const;
+  mlir::FailureOr<std::string> rtlPackedRange(mlir::Type type,
+                                              mlir::Operation *site) const;
   mlir::LogicalResult prepareImpl(bool allowSourceChecks);
   bool physical_ = false;
   std::optional<ac::HardwarePhysicalProjection> physicalProjection_;
@@ -166,6 +196,7 @@ mlir::LogicalResult cppObservationStaging(
     llvm::raw_ostream &out);
 mlir::LogicalResult emitHardwareVerilogDefinition(HardwareEmitContext &context,
                                                   ac::ModuleOp definition,
-                                                  llvm::raw_ostream &out);
+                                                  llvm::raw_ostream &out,
+                                                  llvm::json::Array *presentation = nullptr);
 } // namespace acir::compiler
 #endif

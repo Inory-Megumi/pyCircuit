@@ -15,6 +15,7 @@ struct FinalVerilogSourceParts {
   llvm::SmallVector<std::string> standardSources;
   std::string core, runtimeGlue, rootRtlName;
   std::string simulationTop, portMap;
+  std::string presentationMap;
   uint64_t sourceCheckCount = 0;
 };
 mlir::FailureOr<FinalVerilogSourceParts>

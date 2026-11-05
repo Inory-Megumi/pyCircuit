@@ -253,7 +253,7 @@ staticTree(HardwareEmitContext const &context, DictionaryAttr tree,
     return rtl ? "$signed(64'(" + value + "))" : "std::int64_t(" + value + ")";
   };
   if (opcode.getValue() == "floordiv" || opcode.getValue() == "mod")
-    return (rtl ? "pycircuit_types::pyc_" : "pyc_") + opcode.getValue().str() +
+    return (rtl ? context.rtlHelper(opcode.getValue()) : "pyc_" + opcode.getValue().str()) +
            "(" + signedValue(*a) + ", " + signedValue(*b) + ")";
   if (opcode.getValue() == "shl")
     return rtl ? "(" + signedValue(*a) + " <<< " + signedValue(*b) + ")"
@@ -1031,6 +1031,13 @@ HardwareEmitContext::cppFormalName(StringRef name, Operation *site) const {
 }
 FailureOr<std::string>
 HardwareEmitContext::rtlFormalName(StringRef name, Operation *site) const {
+  if (physical_) {
+    auto id = rtlIdentifier(name, site);
+    if (failed(id)) return failure();
+    auto *owner = isa<ac::ModuleOp>(site) ? site : site->getParentOfType<ac::ModuleOp>().getOperation();
+    if (!owner) return "parameter_" + *id;
+    return rtlGeneratedName(owner, "parameter:" + name.str(), "parameter_" + *id);
+  }
   auto legalized = identifier(name, site);
   if (failed(legalized))
     return failure();
@@ -1135,8 +1142,156 @@ FailureOr<std::string> HardwareEmitContext::cppType(Type type,
   }
   return site->emitOpError() << "unsupported C++ hardware type";
 }
+FailureOr<std::string> HardwareEmitContext::rtlIdentifier(StringRef name,
+                                                        Operation *site) const {
+    auto id = legalizeIdentifier(name, [&] { return site->emitOpError(); });
+    if (succeeded(id) && physical_ && StringRef(*id).starts_with("pyc_"))
+        *id = "id_" + id->substr(4);
+    return id;
+}
+
+std::string HardwareEmitContext::rtlHelper(StringRef name) const {
+    rtlHelpers_.insert(name);
+    return (physical_ ? "pycircuit_types::" : "pycircuit_types::pyc_") + name.str();
+}
+
+std::string HardwareEmitContext::RtlNameScope::claim(StringRef identity,
+                                                   StringRef spelling) {
+    if (auto found = names.find(identity); found != names.end())
+        return found->second;
+    std::string candidate = spelling.str();
+    unsigned &suffix = suffixes[spelling];
+    if (suffix < 2) suffix = 2;
+    while (!used.insert(candidate).second)
+        candidate = spelling.str() + "_" + std::to_string(suffix++);
+    names.try_emplace(identity, candidate);
+    return candidate;
+}
+
+HardwareEmitContext::RtlNameScope &
+HardwareEmitContext::rtlScope(Operation *definition) const {
+    auto &scope = rtlScopes_[definition];
+    if (scope.ready) return scope;
+    scope.ready = true;
+    auto inputs = definition->getAttrOfType<ArrayAttr>("input_names");
+    auto outputs = definition->getAttrOfType<ArrayAttr>("output_names");
+    scope.inputs.resize(inputs.size());
+    scope.outputs.resize(outputs.size());
+    auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs");
+    auto role = [&](unsigned ordinal) -> StringRef {
+        if (domain)
+            for (StringRef key : {StringRef("clock"), StringRef("reset")})
+                if (auto index = domain.getAs<IntegerAttr>(key))
+                    if (index.getValue().getZExtValue() == ordinal)
+                        return key == "clock" ? "clk" : "rst";
+        return {};
+    };
+    // Authored interface names have priority. Auto ports are identified by
+    // domain metadata, never by a source spelling or a reserved prefix.
+    for (bool automatic : {false, true}) {
+        for (auto [index, raw] : llvm::enumerate(inputs)) {
+            auto hint = role(index);
+            if (automatic != !hint.empty()) continue;
+            if (hint.empty()) hint = cast<StringAttr>(raw).getValue();
+            auto id = rtlIdentifier(hint, definition);
+            if (succeeded(id))
+                scope.inputs[index] = scope.claim("input:" + std::to_string(index), *id);
+        }
+        if (!automatic)
+            for (auto [index, raw] : llvm::enumerate(outputs)) {
+                auto id = rtlIdentifier(cast<StringAttr>(raw).getValue(), definition);
+                if (succeeded(id))
+                    scope.outputs[index] = scope.claim("output:" + std::to_string(index), *id);
+            }
+    }
+    // Verification is private to a named scope. Its members must not shadow
+    // functional signals referenced from that scope, including authored ports.
+    for (StringRef name : {"checks", "error", "commit_ok", "physical_error", "physical_fault"})
+        scope.claim("generated:check:" + name.str(), name);
+    for (auto raw : definition->getAttrOfType<ArrayAttr>("parameters")) {
+        auto name = cast<DictionaryAttr>(raw).getAs<StringAttr>("name").getValue();
+        auto id = rtlIdentifier(name, definition);
+        if (succeeded(id)) scope.claim("generated:parameter:" + name.str(), "parameter_" + *id);
+    }
+    for (auto raw : definition->getAttrOfType<ArrayAttr>("type_parameters")) {
+        auto name = cast<StringAttr>(raw).getValue();
+        auto id = rtlIdentifier(name, definition);
+        if (succeeded(id)) scope.claim("generated:parameter:" + name.str(), "parameter_" + *id);
+    }
+    return scope;
+}
+
+FailureOr<std::string> HardwareEmitContext::rtlPortName(Operation *definition,
+                                                       bool output,
+                                                       unsigned ordinal) const {
+    auto ports = definition->getAttrOfType<ArrayAttr>(output ? "output_names" : "input_names");
+    if (!ports || ordinal >= ports.size())
+        return definition->emitOpError() << "RTL port ordinal is outside its definition";
+    if (!physical_)
+        return rtlIdentifier(cast<StringAttr>(ports[ordinal]).getValue(), definition);
+    auto &scope = rtlScope(definition);
+    auto name = (output ? scope.outputs : scope.inputs)[ordinal];
+    if (name.empty()) return failure();
+    return name;
+}
+
+std::string HardwareEmitContext::rtlGeneratedName(Operation *definition,
+                                                  StringRef identity,
+                                                  StringRef hint) const {
+    return rtlScope(definition).claim("generated:" + identity.str(), hint);
+}
+
+std::string HardwareEmitContext::rtlCheckName(Operation *definition,
+                                              StringRef member) const {
+    return rtlGeneratedName(definition, "check:" + member.str(), member);
+}
+
+std::string HardwareEmitContext::rtlCheckRef(Operation *definition,
+                                             StringRef member) const {
+    return rtlCheckName(definition, "checks") + "." + rtlCheckName(definition, member);
+}
+
+FailureOr<std::string> HardwareEmitContext::rtlPackedRange(Type type,
+                                                         Operation *site) const {
+    std::function<bool(Type)> closed = [&](Type item) {
+        if (auto bits = dyn_cast<ac::BitsType>(item)) return isClosedStatic(bits.getWidth());
+        if (auto table = dyn_cast<ac::TableType>(item))
+            return llvm::all_of(table.getShape(), [&](Attribute extent) {
+                return isClosedStatic(cast<ac::StaticExprAttr>(extent));
+            }) && closed(table.getElementType());
+        return isa<ac::EnumType, ac::StructType>(item);
+    };
+    if (closed(type)) {
+        auto width = analysis.getPackedWidth(type, {}, site);
+        if (failed(width)) return failure();
+        // Packed containers retain a range: their consumers use indexed slices.
+        if (*width == 1 && isa<ac::BitsType>(type)) return std::string();
+        return " [" + std::to_string(*width - 1) + ":0]";
+    }
+    auto width = payloadWidth(type, site, true);
+    if (failed(width)) return failure();
+    return " [(" + *width + ")-1:0]";
+}
+
+FailureOr<std::string> HardwareEmitContext::rtlWireType(Type type,
+                                                      Operation *site) const {
+    if (physical_ && isa<ac::BitsType, ac::TableType>(type)) {
+        auto range = rtlPackedRange(type, site);
+        if (failed(range)) return failure();
+        return "wire" + *range;
+    }
+    auto rendered = rtlType(type, site);
+    if (failed(rendered)) return failure();
+    return "wire " + *rendered;
+}
+
 FailureOr<std::string> HardwareEmitContext::rtlType(Type type,
                                                     Operation *site) const {
+  if (physical_ && isa<ac::BitsType, ac::TableType>(type)) {
+    auto range = rtlPackedRange(type, site);
+    if (failed(range)) return failure();
+    return "logic" + *range;
+  }
   if (auto bits = dyn_cast<ac::BitsType>(type)) {
     auto width = staticTree(*this, bits.getWidth().getTree(), site, true);
     if (failed(width))
@@ -1306,9 +1461,10 @@ FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
     return failure();
   auto signature = root.getFunctionType();
   llvm::json::Array inputs, outputs, controls;
-  auto describe = [&](Type type, StringRef name,
+  auto describe = [&](Type type, StringRef name, bool output,
                       unsigned ordinal) -> FailureOr<llvm::json::Object> {
-    auto wire = legalizeIdentifier(name, [&] { return root.emitOpError(); });
+    auto wire = rtl ? rtlPortName(root, output, ordinal)
+                    : legalizeIdentifier(name, [&] { return root.emitOpError(); });
     auto width = analysis.getPackedWidth(type, *bindings, root);
     auto leaves = analysis.getLeaves(type, *bindings, root);
     if (failed(wire) || failed(width) || failed(leaves))
@@ -1330,7 +1486,7 @@ FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
   for (unsigned i = 0; i < layout->sourceInputCount; ++i) {
     auto row =
         describe(signature.getInput(i),
-                 cast<StringAttr>(root.getInputNames()[i]).getValue(), i);
+                 cast<StringAttr>(root.getInputNames()[i]).getValue(), false, i);
     if (failed(row))
       return failure();
     inputs.emplace_back(std::move(*row));
@@ -1339,13 +1495,13 @@ FailureOr<std::string> HardwareEmitContext::rootPortMap(bool rtl) {
   for (unsigned i = 0; i < layout->sourceOutputCount; ++i) {
     auto row =
         describe(signature.getResult(i),
-                 cast<StringAttr>(root.getOutputNames()[i]).getValue(), i);
+                 cast<StringAttr>(root.getOutputNames()[i]).getValue(), true, i);
     if (failed(row))
       return failure();
     (*row)["availability"] = nullptr;
     int64_t companion = layout->outputValidity[i];
     if (companion >= 0) {
-      auto wire = legalizeIdentifier(
+      auto wire = rtl ? rtlPortName(root, true, companion) : legalizeIdentifier(
           cast<StringAttr>(root.getOutputNames()[companion]).getValue(),
           [&] { return root.emitOpError(); });
       if (failed(wire))
@@ -1661,7 +1817,7 @@ HardwareEmitContext::viewIndex(ac::TableViewOp view, StringRef ordinal,
                     (*inShape)[axis] + ")";
           }
         } else
-          shift = (rtl ? "pycircuit_types::pyc_mod(" : "pyc_mod(") + *offset +
+          shift = (rtl ? rtlHelper("mod") + "(" : "pyc_mod(") + *offset +
                   ", " + (*inShape)[axis] + ")";
       }
       auto rotated = "((" + coordinates[axis] + " + (" + shift + ")) % (" +

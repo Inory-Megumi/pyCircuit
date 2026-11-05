@@ -27,6 +27,8 @@ function(add_acir_api_test target)
 endfunction()
 
 add_acir_api_test(ACIRSourceValueSemanticsTests SourceValueSemanticsTest.cpp)
+add_acir_api_test(ACIRRtlPresentationTests RtlPresentationTest.cpp)
+target_link_libraries(ACIRRtlPresentationTests PRIVATE ACIRCodegen)
 add_acir_api_test(ACIRRoutedAnchorTests RoutedAnchorTest.cpp)
 target_link_libraries(ACIRRoutedAnchorTests PRIVATE ACIRSourceCompiler)
 add_acir_api_test(ACIRAnchorArtifactTests AnchorArtifactTest.cpp)
@@ -195,6 +197,7 @@ add_custom_target(check-pycircuit
     ACIRTransactionEffectsTests
     ACIRTableDependencySummaryTests
     ACIRHardwareSourceChecksTests
+    ACIRRtlPresentationTests
     ACIREnumHardwareAnalysisTests
     ACIRFinalSourceUnitsTests ACIREnumSourceUnitAuthorityTests
     ACIRRegRuntimeTests ACIRCollectionRuntimeTests ACIRFifoRuntimeTests ACIRSystemLifecycleTests ACIRObservationTests ACIRSimExecutorTests

@@ -212,6 +212,8 @@ def _target_files(payload: dict, target: str):
     for row in payload["source_maps"]:
         add(row["path"], row["text"], "source-map")
         group(row["source"]).append(row["path"])
+    if target == "verilog" and payload.get("rtl_mode") == "physical":
+        add("rtl-names.json", payload.get("rtl_presentation_map"), "rtl-names")
     add(
         "CMakeLists.txt",
         _cmake(
