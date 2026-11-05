@@ -1,6 +1,7 @@
 import RuleSemantics.Acceptance
 import RuleSemantics.BitVecAcceptance
 import RuleSemantics.CounterReferenceAcceptance
+import RuleSemantics.SyntaxAcceptance
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -58,3 +59,26 @@ import RuleSemantics.CounterReferenceAcceptance
 #print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_all_states
 #print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_at_empty
 #print axioms RuleSemantics.CounterReferenceAcceptance.both_requests_at_capacity
+#print axioms RuleSemantics.Syntax.writeReg_same
+#print axioms RuleSemantics.Syntax.writeReg_other
+#print axioms RuleSemantics.Syntax.command_correspondence
+#print axioms RuleSemantics.Syntax.rule_correspondence
+#print axioms RuleSemantics.Syntax.runRule_correspondence
+#print axioms RuleSemantics.Syntax.schedule_correspondence
+#print axioms RuleSemantics.Syntax.history_correspondence
+#print axioms RuleSemantics.Syntax.invariant_transfer
+#print axioms RuleSemantics.Syntax.history_preserves
+#print axioms RuleSemantics.Syntax.every_prefix_preserves
+#print axioms RuleSemantics.SyntaxCounter.state_observe
+#print axioms RuleSemantics.SyntaxCounter.write_state
+#print axioms RuleSemantics.SyntaxCounter.step_refines
+#print axioms RuleSemantics.SyntaxCounter.cycle_state
+#print axioms RuleSemantics.SyntaxCounter.history_refines
+#print axioms RuleSemantics.SyntaxCounter.history_nat_refines
+#print axioms RuleSemantics.SyntaxCounter.history_bounded
+#print axioms RuleSemantics.SyntaxCounter.every_prefix_bounded
+#print axioms RuleSemantics.SyntaxAcceptance.heterogeneous_forwarding
+#print axioms RuleSemantics.SyntaxAcceptance.late_require_rejects_candidate
+#print axioms RuleSemantics.SyntaxAcceptance.late_require_rolls_back_both_registers
+#print axioms RuleSemantics.SyntaxAcceptance.separate_roots_retain_preceding_writes
+#print axioms RuleSemantics.SyntaxAcceptance.counter_ordering

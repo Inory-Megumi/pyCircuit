@@ -8,6 +8,8 @@ into safety of ordered schedules and finite execution histories. A separately
 defined BitVec counter now refines the natural-number specification under an
 explicit capacity constraint. A fixed counter artifact experiment connects these
 models to actual compiler output through a separately checked RTL reference.
+The [minimal syntax core](SYNTAX.md) adds closed typed Rule expressions and
+commands whose behavior comes from generic interpreters.
 
 ## Reproduce
 
@@ -63,9 +65,10 @@ failure. Such failures have different discard semantics in pyCircuit and are
 outside this first model. Events represent abstract transactional effects;
 their list order does not claim to model sampled `log`/`report` publication.
 
-The model permits arbitrary total action functions as semantic parameters. It
-does not define a source syntax, prove hardware realizability, infer resources,
-or establish which action functions the pyCircuit frontend accepts.
+The abstract Action model permits arbitrary total functions as semantic
+parameters. The new syntax layer restricts programs to explicit expression and
+command constructors and interprets them into that model. Neither layer proves
+hardware realizability, infers resources, or establishes frontend admission.
 
 ## Proofs and their scope
 
@@ -80,6 +83,9 @@ or establish which action functions the pyCircuit frontend accepts.
 | [BitVecAcceptance.lean](lean/RuleSemantics/BitVecAcceptance.lean) | Independent finite-width boundary, event-history and out-of-range-capacity examples. |
 | [CounterReference.lean](lean/RuleSemantics/CounterReference.lean) | A separate three-bit combinational reference refines the fixed increment/decrement schedule and its Nat state for arbitrary finite request histories. |
 | [CounterReferenceAcceptance.lean](lean/RuleSemantics/CounterReferenceAcceptance.lean) | All eight encoded states and four request combinations, plus independent boundary and order checks. |
+| [Syntax.lean](lean/RuleSemantics/Syntax.lean) | Closed typed expressions and commands, direct candidate evaluation, structural Action interpretation, register-update laws and correspondence/invariant lifting. |
+| [SyntaxCounter.lean](lean/RuleSemantics/SyntaxCounter.lean) | A counter defined as Rule syntax, interpreted generically and connected to the existing reference and Nat history proofs. |
+| [SyntaxAcceptance.lean](lean/RuleSemantics/SyntaxAcceptance.lean) | Independent heterogeneous-register, forwarding, modular arithmetic, rejection/rollback and schedule-order expectations. |
 | [Audit.lean](lean/RuleSemantics/Audit.lean) | Transitive axiom reports for principal proof results. |
 
 The generic safety theorem assumes each Rule preserves an invariant. It does
