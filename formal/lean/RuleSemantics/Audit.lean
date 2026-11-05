@@ -7,6 +7,7 @@ import RuleSemantics.SymbolicSerialize
 import RuleSemantics.Library
 import RuleSemantics.LibraryAcceptance
 import RuleSemantics.Witness
+import RuleSemantics.Abstraction
 
 /-! Rebuilt by the default Lake target; output exposes transitive proof axioms. -/
 
@@ -16,6 +17,21 @@ import RuleSemantics.Witness
 #print axioms RuleSemantics.Witness.Trace.observations
 #print axioms RuleSemantics.Witness.Trace.environment
 #print axioms RuleSemantics.Witness.check_observations
+
+#print axioms RuleSemantics.Abstraction.concrete_step
+#print axioms RuleSemantics.Abstraction.step_weaken
+#print axioms RuleSemantics.Abstraction.retain_includes
+#print axioms RuleSemantics.Abstraction.added_equation_excludes_edge
+#print axioms RuleSemantics.Abstraction.decode_stateValues
+#print axioms RuleSemantics.Abstraction.stateValues_injective
+#print axioms RuleSemantics.Abstraction.trace_weaken
+#print axioms RuleSemantics.Abstraction.concrete_trace
+#print axioms RuleSemantics.Abstraction.history_coverage
+#print axioms RuleSemantics.Abstraction.bounded_safety_transfer
+#print axioms RuleSemantics.Abstraction.Trace.head_state
+#print axioms RuleSemantics.Abstraction.Trace.edge
+#print axioms RuleSemantics.Abstraction.added_equation_excludes_trace
+#print axioms RuleSemantics.Abstraction.check_sound
 
 #print axioms RuleSemantics.Action.bind_rejects_left
 #print axioms RuleSemantics.Action.bind_rejects_right

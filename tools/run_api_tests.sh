@@ -9,6 +9,7 @@ formal_python_tests=(
   tests/system/test_formal_counter_artifact.py
   tests/system/test_formal_rule_library.py
   tests/system/test_formal_counterexample.py
+  tests/system/test_formal_cegar.py
 )
 while (($#)); do
   case "$1" in
@@ -132,7 +133,7 @@ if ((formal)); then
   if ((formal_status != 0 && status == 0)); then
     status=$formal_status
   fi
-  scope=common-ir-source-runtime-formal-rule-library-counterexample-replay
+  scope=common-ir-source-runtime-formal-rule-library-counterexample-replay-cegar
 fi
 ((status == 0)) || exit "$status"
 pyc_finish_test_run api "$tier" "$scope"

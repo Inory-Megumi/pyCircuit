@@ -19,6 +19,8 @@ The [contract and source-library stage](LIBRARY.md) extends that route to
 internal state, computed observations, Rule contracts and reusable buffers.
 The [counterexample workflow](COUNTEREXAMPLES.md) adds reachable Z3 search,
 kernel-checked concrete witnesses, and actual C++/RTL trace and waveform replay.
+The [bounded CEGAR loop](CEGAR.md) adds transition-equation abstraction, concrete
+feasibility checks and kernel-checked elimination of spurious paths.
 The [roadmap](ROADMAP.md) records the original proposal and deferred directions.
 
 ## Reproduce

@@ -11,6 +11,10 @@ import z3
 from formal_rule_model import RuleFormula, _natural, _require
 
 
+class _SearchLimitError(Exception):
+    """A caller's aggregate resource budget interrupted a solver query."""
+
+
 def _json_hash(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -81,6 +85,26 @@ def search(
 ):
     """Search increasing reachable depths; UNSAT is bounded, UNKNOWN stops."""
     formula = RuleFormula.load(formula_path)
+    return _search(
+        formula,
+        specification,
+        max_depth=max_depth,
+        timeout_ms=timeout_ms,
+        solver_factory=solver_factory,
+    )
+
+
+def _search(
+    formula,
+    specification,
+    *,
+    max_depth,
+    timeout_ms,
+    solver_factory=None,
+    retained_registers=None,
+    check_solver=None,
+):
+    """Shared bounded engine; omitted update equations are explicitly abstract."""
     specification = copy.deepcopy(specification)
     work = _specification(formula, specification)
     _require(_natural(max_depth) and max_depth <= 64, "search depth outside profile")
@@ -106,6 +130,11 @@ def search(
         "bound": max_depth,
         "depths": [],
     }
+    if retained_registers is not None:
+        result.update(
+            schema="pycircuit-rule-abstract-counterexample-v1",
+            retained_registers=list(retained_registers),
+        )
     solver = (solver_factory or z3.Solver)()
     solver.set(timeout=timeout_ms)
     states = [[z3.BitVec(f"s0_r{i}", width) for i, width in enumerate(formula.widths)]]
@@ -126,7 +155,13 @@ def search(
                 )
             )
         )
-        answer = solver.check()
+        try:
+            answer = (
+                solver.check() if check_solver is None else check_solver(solver, depth)
+            )
+        except _SearchLimitError as error:
+            result.update(status="resource_limit", reason=str(error))
+            return result
         result["depths"].append({"depth": depth, "status": str(answer)})
         if answer == z3.unknown:
             result["status"] = "unknown"
@@ -156,7 +191,14 @@ def search(
                     }
                 )
             result.update(
-                status="counterexample", rows=rows, violation_depth=depth, shortest=True
+                status=(
+                    "counterexample"
+                    if retained_registers is None
+                    else "abstract_counterexample"
+                ),
+                rows=rows,
+                violation_depth=depth,
+                shortest=True,
             )
             return result
         _require(answer == z3.unsat, "unexpected solver result")
@@ -181,9 +223,10 @@ def search(
             solver.add(
                 *[
                     register == _encode(formula, node, current, incoming)
-                    for register, node in zip(
-                        following, formula.data["next"], strict=True
+                    for index, (register, node) in enumerate(
+                        zip(following, formula.data["next"], strict=True)
                     )
+                    if retained_registers is None or index in retained_registers
                 ]
             )
             inputs.append(incoming)
@@ -289,26 +332,7 @@ def _lean_input(formula, values):
     return "fun index => match index with\n" + "\n".join(branches)
 
 
-def write_lean_witness(model_path, formula_path, case, destination):
-    """Emit a kernel-checkable certificate, never execute the solver in Lean."""
-    model_path, destination = Path(model_path), Path(destination)
-    formula = RuleFormula.load(formula_path)
-    validate_case(formula, case)
-    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
-    _require(
-        case.get("model_sha256") == model_hash,
-        "exported model identity mismatch",
-    )
-    property_ = _lean_expression(formula, case["specification"]["property"])
-    environment = _lean_expression(formula, case["specification"]["environment"])
-    definitions, rows = [], []
-    for index, row in enumerate(case["rows"]):
-        definitions.append(
-            f"def input{index} : Inputs signature :=\n{_lean_input(formula, row['inputs'])}\n"
-        )
-        rows.append(
-            f"{{ input := input{index}, state := {row['state']}, output := {row['outputs']} }}"
-        )
+def _lean_identities(formula):
     identities = [
         f"definitionName = {json.dumps(formula.definition, ensure_ascii=False)}"
     ]
@@ -331,6 +355,30 @@ def write_lean_witness(model_path, formula_path, case, destination):
     identities.append(
         f"outputExpressions.map (fun output => output.width) = {formula.output_widths}"
     )
+    return identities
+
+
+def write_lean_witness(model_path, formula_path, case, destination):
+    """Emit a kernel-checkable certificate, never execute the solver in Lean."""
+    model_path, destination = Path(model_path), Path(destination)
+    formula = RuleFormula.load(formula_path)
+    validate_case(formula, case)
+    model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    _require(
+        case.get("model_sha256") == model_hash,
+        "exported model identity mismatch",
+    )
+    property_ = _lean_expression(formula, case["specification"]["property"])
+    environment = _lean_expression(formula, case["specification"]["environment"])
+    definitions, rows = [], []
+    for index, row in enumerate(case["rows"]):
+        definitions.append(
+            f"def input{index} : Inputs signature :=\n{_lean_input(formula, row['inputs'])}\n"
+        )
+        rows.append(
+            f"{{ input := input{index}, state := {row['state']}, output := {row['outputs']} }}"
+        )
+    identities = _lean_identities(formula)
     content = (
         "import RuleSemantics.Witness\n" + model_path.read_text() + "\n"
         "namespace CounterexampleCertificate\nopen RuleSemantics RuleSemantics.Syntax PycircuitExport\n"

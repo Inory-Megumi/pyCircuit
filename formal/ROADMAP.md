@@ -2,8 +2,10 @@
 
 Recorded on 2026-11-06 after the delivered library checkpoint `596ccae`.
 This preserves the planning discussion. The first bounded search/certificate/
-replay slice is now implemented in [counterexamples](COUNTEREXAMPLES.md);
-broader abstraction and composition directions below remain deferred.
+replay slice is now implemented in [counterexamples](COUNTEREXAMPLES.md).
+The subsequent [bounded CEGAR stage](CEGAR.md) adds equation abstraction and
+counterexample-guided refinement. Predicate synthesis and broader composition
+directions below remain deferred.
 
 ## Deferred direction
 
@@ -137,5 +139,6 @@ counterexamples, but its negative-control API binds specified states and inputs.
 The library consumer already has generated C++/RTL execution and independent
 trace oracles. The first automatic Z3 search, concrete-witness Lean certificate,
 shared case artifact and actual backend waveform workflow is described in
-[counterexamples](COUNTEREXAMPLES.md). Automatic lemma discovery, abstraction
-refinement and the broader cross-module roadmap remain future work.
+[counterexamples](COUNTEREXAMPLES.md). The [bounded CEGAR stage](CEGAR.md) now
+adds refinement by restoring omitted register equations. Automatic lemma discovery,
+predicate abstraction and the broader cross-module roadmap remain future work.

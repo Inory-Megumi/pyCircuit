@@ -98,8 +98,10 @@ result must not be reported as a full nightly result.
 
 `tools/run_api_tests.sh --tier gate --formal` runs the ordinary API gate, builds
 the pinned Lean project, audits principal theorem axioms, and runs the exporter,
-artifact, source-library and reachable-counterexample pytest modules. The latter
-checks Z3 search, concrete Lean witnesses and actual C++/RTL replay with VCDs.
+artifact, source-library, reachable-counterexample and bounded-CEGAR pytest modules.
+These check Z3 search, concrete Lean witnesses, equation-abstraction refinement
+certificates and actual C++/RTL replay with VCDs. See `formal/CEGAR.md` for the
+bounded search and refinement limits.
 `--list --formal` lists that extra
 scope without claiming execution. The default API gate does not imply this
 optional formal coverage.

@@ -76,7 +76,9 @@ No `sorry`, custom axiom, `native_decide` or raised proof-search limit is used.
 The existing symbolic-correctness lemmas support lowering to the transition
 representation used in search. This stage does not automatically invent
 invariants, discover new lemmas, eliminate state via abstraction, or implement a
-general CEGAR loop. The broader abstraction roadmap remains deferred.
+general predicate-abstraction loop. The subsequent [bounded CEGAR stage](CEGAR.md)
+restores omitted register equations in response to spurious paths; predicate
+synthesis and the broader abstraction roadmap remain deferred.
 
 ## Actual C++ and RTL replay
 
