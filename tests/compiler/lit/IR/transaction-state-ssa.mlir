@@ -1,7 +1,7 @@
 // RUN: %pycircuit_opt %s -o %t.before.mlir
 // RUN: %pycircuit_opt %s --ac-analyze-transaction-state-ssa -o %t.after.mlir
 // RUN: diff %t.before.mlir %t.after.mlir
-// RUN: sed '/EFFECT$/s/#w1/#w0/' %s > %t.conditional.mlir
+// RUN: sed '/EFFECT[[:space:]]*$/s/#w1/#w0/' %s > %t.conditional.mlir
 // RUN: not %pycircuit_opt %t.conditional.mlir --ac-analyze-transaction-state-ssa 2>&1 | %FileCheck %s --check-prefix=REJECT
 // REJECT: error:
 // REJECT-SAME: path

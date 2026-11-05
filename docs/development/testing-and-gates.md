@@ -49,6 +49,15 @@ and `PYC_TOOLCHAIN_ROOT` to its installation. Reinstall after changing compiler,
 Runtime or shared example helpers. `PYC_PYTHON_EXECUTABLE` selects Python for
 package tests and receipts. No new native executable is needed for this split.
 
+The native Unicode identifier oracle requires CPython 3.14.6 with Unicode 16,
+matching the pinned identifier recipe. Select that interpreter with CMake's
+`-DPython3_EXECUTABLE=/absolute/path/to/python`; changing
+`PYC_PYTHON_EXECUTABLE` alone does not rebuild the native oracle's interpreter
+binding. For Windows/WSL builds, verify that `git rev-parse HEAD` works from the
+actual build-side checkout, and use source/build paths without whitespace for
+the current lit RUN substitutions. The checkout's shell scripts and canonical
+example runner configurations use LF as specified by `.gitattributes`.
+
 | Entry point | Gate | Additional nightly coverage |
 | --- | --- | --- |
 | API/framework | Native API/runtime GTests; IR/pass lit; source interface/check diagnostics and output protection | Remaining source/codegen matrices, native source-check execution, Runtime/CompilerDev install, public emit/source maps, incremental builds, relocation, publication recovery and presets |

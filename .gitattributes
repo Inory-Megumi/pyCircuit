@@ -1,0 +1,3 @@
+# Bash scripts and canonical example runner JSON require LF on every checkout.
+*.sh text eol=lf
+examples/**/config.json text eol=lf
