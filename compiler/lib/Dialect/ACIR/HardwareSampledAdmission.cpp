@@ -430,10 +430,50 @@ LogicalResult bindStateEndpoint(StateEndpoint &result, Operation *storage,
 }
 } // namespace
 
+LogicalResult SampledFireUses::verify(RuleOp rule, uint64_t fireResult,
+                                      const HardwareAnalysis &analysis,
+                                      SourceCheckBudget &budget) {
+  if (!rule)
+    return failure();
+  if (&analysis != &this->analysis || &budget != &this->budget ||
+      !package || analysis.getPackage() != package ||
+      rule->getParentOfType<mlir::ModuleOp>() != package ||
+      fireResult >= rule->getNumResults())
+    return rule.emitOpError() << "sampled fire-use proof differs from its "
+                                 "validation invocation";
+  if (failed(budget.debit(1, rule)))
+    return failure();
+
+  auto checkUses = [&](const Uses &uses) -> LogicalResult {
+    for (OpOperand &use : rule->getResult(fireResult).getUses()) {
+      if (failed(budget.debit(1, rule)))
+        return failure();
+      if (!uses.contains(&use))
+        return rule.emitOpError()
+               << "sampled external fire escapes availability routing";
+    }
+    return success();
+  };
+  if (verified)
+    return checkUses(*verified);
+
+  // The getter derives a fresh proof and does not access this invocation memo.
+  auto uses = getVerifiedValueAvailabilityUses(analysis);
+  if (failed(uses) || failed(checkUses(*uses)))
+    return failure();
+  auto storage = SourceCheckBudget::add(
+      SourceCheckBudget::bytes(sizeof(Uses)),
+      SourceCheckBudget::bytes(uses->getMemorySize()));
+  if (failed(budget.debit(storage, rule)))
+    return failure();
+  verified.emplace(std::move(*uses));
+  return success();
+}
+
 FailureOr<SampledAdmissionView>
 parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
-                      const HardwareBindings &bindings,
-                      SourceCheckBudget &budget) {
+                      const HardwareBindings &bindings, SourceCheckBudget &budget,
+                      SampledFireUses *fireUses) {
   auto lexical = dyn_cast<ModuleOp>(rule->getParentOp());
   if (bindings.owner != lexical)
     return rule->emitOpError()
@@ -571,11 +611,10 @@ parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
   result.reset = rule->getOperand(*reset);
   result.fire = yielded->getOperand(*fire);
   if (!rule->getResult(*fire).use_empty()) {
-    auto availabilityUses = getVerifiedValueAvailabilityUses(analysis);
-    if (failed(availabilityUses)) return failure();
-    for (OpOperand &use : rule->getResult(*fire).getUses())
-      if (!availabilityUses->contains(&use))
-        return rule->emitOpError() << "sampled external fire escapes availability routing";
+    SampledFireUses standalone(analysis, budget);
+    auto &uses = fireUses ? *fireUses : standalone;
+    if (failed(uses.verify(rule, *fire, analysis, budget)))
+      return failure();
   }
   auto parsePath = [&](DictionaryAttr row,
                        uint64_t before) -> FailureOr<SampledPathRef> {
@@ -1143,8 +1182,8 @@ parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
 
 FailureOr<TransactionWiringView>
 parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
-                       const HardwareBindings &bindings,
-                       SourceCheckBudget &budget) {
+                       const HardwareBindings &bindings, SourceCheckBudget &budget,
+                       SampledFireUses *fireUses) {
   if (bindings.owner != module)
     return module->emitOpError()
            << "transaction wiring bindings have the wrong owner";
@@ -1344,7 +1383,8 @@ parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
         return module->emitOpError()
                << "duplicate transaction writer registration";
     }
-    auto sampled = parseSampledAdmission(rule, analysis, bindings, budget);
+    auto sampled = parseSampledAdmission(rule, analysis, bindings, budget,
+                                         fireUses);
     if (failed(sampled))
       return failure();
     if (SourceCheckBudget::add(
@@ -2441,14 +2481,16 @@ private:
 };
 FailureOr<SmallVector<HardwareIdentityEndpoint>>
 localBoundaries(ModuleOp module, const HardwareIdentityScope &scope,
-                const HardwareAnalysis &analysis, SourceCheckBudget &budget) {
+                const HardwareAnalysis &analysis, SourceCheckBudget &budget,
+                SampledFireUses *fireUses) {
   SmallVector<HardwareIdentityEndpoint> result;
   std::optional<TransactionWiringView> wiring;
   auto bindings = scopeBindings(scope, analysis, budget, module);
   if (failed(bindings))
     return failure();
   if (module->hasAttr("ac.transaction_wiring")) {
-    auto parsed = parseTransactionWiring(module, analysis, *bindings, budget);
+    auto parsed =
+        parseTransactionWiring(module, analysis, *bindings, budget, fireUses);
     if (failed(parsed))
       return failure();
     wiring = std::move(*parsed);
@@ -2469,7 +2511,8 @@ localBoundaries(ModuleOp module, const HardwareIdentityScope &scope,
                  << "sampled Rule lacks its transaction writer";
         first = writer->ordinaryResults;
       } else {
-        auto sampled = parseSampledAdmission(rule, analysis, *bindings, budget);
+        auto sampled = parseSampledAdmission(rule, analysis, *bindings, budget,
+                                             fireUses);
         if (failed(sampled))
           return failure();
         first = sampled->fireResult;
@@ -2522,7 +2565,7 @@ PreparedSampledBoundaries::verifyFor(ModuleOp definition,
 FailureOr<std::optional<PreparedSampledBoundaries>>
 prepareSampledBoundaries(ModuleOp definition, const HardwareAnalysis &analysis,
                          const HardwareBindings &bindings,
-                         SourceCheckBudget &budget) {
+                         SourceCheckBudget &budget, SampledFireUses *fireUses) {
   if (!definition || !isa<ModuleOp>(definition.operator->()))
     return analysis.getPackage().emitOpError()
            << "sampled boundary preparation requires a Module definition";
@@ -2545,7 +2588,8 @@ prepareSampledBoundaries(ModuleOp definition, const HardwareAnalysis &analysis,
           definition)))
     return failure();
   HardwareIdentityScope scope{definition, bindings, {}};
-  auto boundaries = localBoundaries(definition, scope, analysis, budget);
+  auto boundaries = localBoundaries(definition, scope, analysis, budget,
+                                    fireUses);
   if (failed(boundaries))
     return failure();
   PreparedSampledBoundaries prepared(std::move(scope), std::move(*boundaries));
@@ -2707,7 +2751,7 @@ struct SampledAdmissionValidation::Entry {
 
 SampledAdmissionValidation::SampledAdmissionValidation(
     const HardwareAnalysis &analysis, SourceCheckBudget &budget)
-    : analysis(analysis), budget(budget) {}
+    : analysis(analysis), budget(budget), fireUses(analysis, budget) {}
 
 SampledAdmissionValidation::~SampledAdmissionValidation() = default;
 
@@ -2792,8 +2836,8 @@ SampledAdmissionValidation::prepare(ModuleOp definition,
     if (sameHardwareBindings(bindings, scope.rootBindings))
       return &entry->prepared;
   }
-  auto prepared =
-      prepareSampledBoundaries(definition, analysis, bindings, budget);
+  auto prepared = prepareSampledBoundaries(definition, analysis, bindings,
+                                           budget, &fireUses);
   if (failed(prepared))
     return failure();
   if (!*prepared)
@@ -2819,8 +2863,8 @@ SampledAdmissionValidation::wiring(ModuleOp definition,
     if (&entry->prepared != *prepared)
       continue;
     if (!entry->wiring) {
-      auto parsed =
-          parseTransactionWiring(definition, analysis, bindings, budget);
+      auto parsed = parseTransactionWiring(definition, analysis, bindings,
+                                           budget, &fireUses);
       if (failed(parsed))
         return failure();
       uint64_t moveWork = SourceCheckBudget::add(
@@ -2862,7 +2906,8 @@ SampledAdmissionValidation::verifySampledAdmissionImpl(
            << "sampled validation lacks prepared definition boundaries";
   // Parse current IR on every call. Only a completed prefix proof is reused,
   // under immutable IR, exact bindings and the prepared complete stop policy.
-  auto sampled = parseSampledAdmission(rule, analysis, bindings, budget);
+  auto sampled = parseSampledAdmission(rule, analysis, bindings, budget,
+                                       &fireUses);
   if (failed(sampled))
     return failure();
   for (const auto &entry : entries) {

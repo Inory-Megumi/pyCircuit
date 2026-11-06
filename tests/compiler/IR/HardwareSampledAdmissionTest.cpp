@@ -1,6 +1,7 @@
 #include "Dialect/ACIR/HardwareSampledAdmission.h"
 #include "Dialect/ACIR/HardwareSourceCheckPreflight.h"
 #include "Dialect/ACIR/HardwareSourceChecks.h"
+#include "Dialect/ACIR/HardwareValueAvailability.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Diagnostics.h"
@@ -1973,6 +1974,60 @@ TEST_F(HardwareSampledAdmissionTest, BudgetRejectsBeforeLateProofWork) {
       << diagnostics;
   EXPECT_TRUE(rule->hasAttr("ac.sampled_admission"));
   EXPECT_EQ(expect->getNumOperands(), 4u);
+}
+
+TEST_F(HardwareSampledAdmissionTest, NewValidationRechecksMutatedFireUses) {
+  build(true, 1);
+  auto &body = definition.getBody().front();
+  definition->setAttr("output_names", b.getStrArrayAttr({"value", "available"}));
+  definition->setAttr("function_type", TypeAttr::get(
+      b.getFunctionType({bit(), bit(), bit()}, {bit(), bit()})));
+  definition->setAttr("ac.internal_ports",
+      d({f("source_inputs", b.getI64IntegerAttr(3)),
+         f("source_outputs", b.getI64IntegerAttr(1)),
+         f("root_inputs", b.getArrayAttr({}))}));
+  definition->setAttr("ac.input_validity", b.getArrayAttr(
+      {b.getI64IntegerAttr(-1), b.getI64IntegerAttr(-1), b.getI64IntegerAttr(-1)}));
+  definition->setAttr("ac.output_validity",
+                      b.getArrayAttr({b.getI64IntegerAttr(1)}));
+  auto fire = rule.getResult(1);
+  b.setInsertionPoint(body.getTerminator());
+  auto bridge = binary("and", fire, fire).getDefiningOp();
+  body.getTerminator()->setOperands({rule.getResult(0), bridge->getResult(0)});
+  definition->setAttr(
+      "ac.transaction_wiring",
+      wiring({d({f("registration", occurrence(2)),
+                 f("ordinary_results", b.getI64IntegerAttr(1)),
+                 f("candidates", b.getArrayAttr({}))})}));
+  b.setInsertionPointToEnd(package->getBody());
+  op(ac::SystemOp::getOperationName(), {}, {},
+     {f("domain", b.getStringAttr("default")),
+      f("entry", d({f("callee", FlatSymbolRefAttr::get(
+                                    &context, definition.getSymName())),
+                    f("parameters", b.getArrayAttr({})),
+                    f("type_arguments", b.getArrayAttr({}))}))});
+  ASSERT_TRUE(succeeded(verify(*package)));
+  ac::HardwareAnalysis analysis(*package);
+  auto first = &bridge->getOpOperand(0);
+  auto second = &bridge->getOpOperand(1);
+  {
+    auto uses = detail::getVerifiedValueAvailabilityUses(analysis);
+    ASSERT_TRUE(succeeded(uses));
+    EXPECT_TRUE(uses->contains(first));
+    EXPECT_TRUE(uses->contains(second));
+  }
+  ASSERT_TRUE(succeeded(analysis.getSourceCheckPlan()));
+
+  // No immutable validation scope survives this in-place semantic mutation.
+  bridge->setAttr("opcode", b.getStringAttr("xor"));
+  EXPECT_EQ(first, &bridge->getOpOperand(0));
+  EXPECT_EQ(second, &bridge->getOpOperand(1));
+  EXPECT_TRUE(failed(detail::getVerifiedValueAvailabilityUses(analysis)));
+  EXPECT_TRUE(failed(analysis.getSourceCheckPlan()));
+  bridge->setAttr("opcode", b.getStringAttr("and"));
+  EXPECT_TRUE(succeeded(analysis.getSourceCheckPlan()));
+  EXPECT_TRUE(failed(analysis.getSourceCheckPlan({1})));
+  EXPECT_TRUE(succeeded(analysis.getSourceCheckPlan()));
 }
 
 } // namespace

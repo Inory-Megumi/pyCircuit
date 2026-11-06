@@ -30,7 +30,15 @@ public:
     return context.isPhysical() ? context.rtlGeneratedName(definition, role, role)
                                 : "pyc_" + role.str();
   }
-  FailureOr<std::string> physicalReset() {
+  FailureOr<std::string> physicalReset(ac::RuleOp rule = {}) {
+    if (rule) {
+      // Physical projection has verified the Rule and its actual domain.
+      auto sampled = rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+      auto capture = sampled.getAs<IntegerAttr>("reset_capture").getInt();
+      auto signal = net(rule.getCaptures()[capture]);
+      if (failed(signal)) return failure();
+      return context.rtlReset(*signal);
+    }
     if (auto domain = definition->getAttrOfType<DictionaryAttr>("ac.domain_inputs")) {
       if (auto ordinal = domain.getAs<IntegerAttr>("reset")) {
         auto signal = context.rtlPortName(definition, false, ordinal.getValue().getZExtValue());
@@ -161,23 +169,32 @@ public:
           continue;
         const auto &plan = presentation->check(ordinal);
         if (!plan.needed()) continue;
-        SmallVector<std::string> terms;
-        std::string path;
-        if (plan.pathUnknown || (plan.conditionUnknown && !plan.pathAlwaysOne)) {
-          auto signal = net(plan.path);
-          if (failed(signal)) return failure();
-          path = *signal;
-        }
-        if (plan.pathUnknown) terms.push_back("$isunknown(" + path + ")");
-        if (plan.conditionUnknown) {
-          auto condition = net(plan.condition), reset = physicalReset();
-          if (failed(condition) || failed(reset)) return failure();
-          terms.push_back("((" + *reset + " === 1'b0) && " +
-              (plan.pathAlwaysOne ? "" : "(" + path + " === 1'b1) && ") + "$isunknown(" + *condition + "))");
-        }
         auto name = generated("check_error_" + std::to_string(localErrors.size()));
-        checks << "    wire " << name << " = " << join(terms, " || ") << ";\n";
-        localErrors.push_back(name);
+        if (plan.assertion) {
+          auto condition = net(plan.condition), path = net(plan.path);
+          auto reset = physicalReset(binding.rule);
+          if (failed(condition) || failed(path) || failed(reset))
+            return failure();
+          checks << "    wire " << name << " = (((" << *path << ") & ~("
+                 << *reset << ") & ~(" << *condition << ")) !== 1'b0);\n";
+        } else {
+          SmallVector<std::string> terms;
+          std::string path;
+          if (plan.pathUnknown || (plan.conditionUnknown && !plan.pathAlwaysOne)) {
+            auto signal = net(plan.path);
+            if (failed(signal)) return failure();
+            path = *signal;
+          }
+          if (plan.pathUnknown) terms.push_back("$isunknown(" + path + ")");
+          if (plan.conditionUnknown) {
+            auto condition = net(plan.condition), reset = physicalReset();
+            if (failed(condition) || failed(reset)) return failure();
+            terms.push_back("((" + *reset + " === 1'b0) && " +
+                (plan.pathAlwaysOne ? "" : "(" + path + " === 1'b1) && ") + "$isunknown(" + *condition + "))");
+          }
+          checks << "    wire " << name << " = " << join(terms, " || ") << ";\n";
+        }
+        localErrors.push_back(std::move(name));
       }
       return success();
     }

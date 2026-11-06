@@ -283,7 +283,7 @@ public:
         return operation.emitOpError()
                << "transaction publication summary cannot represent this "
                   "module operation";
-      } else if (failed(scanPure(&operation, 0))) {
+      } else if (failed(scanPureRegions(&operation, 0))) {
         return failure();
       }
       if (invalid || !budget.ok())
@@ -597,10 +597,9 @@ private:
     return row ? FailureOr<DictionaryAttr>(row)
                : FailureOr<DictionaryAttr>(failure());
   }
-  LogicalResult scanPure(Operation *operation, unsigned depth) {
-    if (!budget.depth(depth) || !budget.charge(operation->getNumOperands() +
-                                               operation->getNumResults()))
-      return failure();
+  // The enclosing traversal has paid for this operation and its SSA edges.
+  // Only nested blocks and operations still need a charge here.
+  LogicalResult scanPureRegions(Operation *operation, unsigned depth) {
     for (Region &region : operation->getRegions())
       for (Block &block : region) {
         if (!budget.charge(block.getNumArguments()))
@@ -610,7 +609,9 @@ private:
               !detail::isCombinationalHardwareOperation(&nested))
             return nested.emitOpError()
                    << "transaction publication cannot omit nested effects";
-          if (failed(scanPure(&nested, depth + 1)))
+          if (!budget.depth(depth + 1) ||
+              !budget.charge(nested.getNumOperands() + nested.getNumResults()) ||
+              failed(scanPureRegions(&nested, depth + 1)))
             return failure();
         }
       }
@@ -628,6 +629,19 @@ private:
     for (Operation &operation : owner.getBody().front()) {
       if (!budget.charge())
         return failure();
+      // The root traversal runs before callable publication, regardless of
+      // where the state is declared. Child states have their own summaries.
+      if (auto state = dyn_cast<SourceStateOp>(operation);
+          owner == definition && state) {
+        auto name = state.getInstanceNameAttr();
+        if (!name)
+          return state.emitOpError() << "publication requires a named state";
+        if (localStates.contains(name))
+          return state.emitOpError() << "publication state names must be unique";
+        if (!budget.storage(1, sizeof(decltype(localStates)::value_type)))
+          return failure();
+        localStates.try_emplace(name, state);
+      }
       auto instance = dyn_cast<InstanceOp>(operation);
       if (!instance)
         continue;
@@ -893,15 +907,10 @@ private:
           return failure();
         result.push_back(row);
       } else if (isa<SourceStateReadOp, SourceStateWriteOp>(operation)) {
+        if (!budget.charge())
+          return failure();
         auto stateName = operation.getAttrOfType<StringAttr>("state");
-        SourceStateOp state;
-        for (Operation &operation : definition.getBody().front()) {
-          if (!budget.charge())
-            return failure();
-          auto candidate = dyn_cast<SourceStateOp>(operation);
-          if (candidate && candidate.getInstanceNameAttr() == stateName)
-            state = candidate;
-        }
+        auto state = stateName ? localStates.lookup(stateName) : SourceStateOp();
         if (!state)
           return operation.emitOpError()
                  << "publication requires an actual local state";
@@ -935,7 +944,7 @@ private:
       } else if (!detail::isCombinationalHardwareOperation(&operation)) {
         return operation.emitOpError()
                << "transaction publication cannot omit this callable operation";
-      } else if (failed(scanPure(&operation, depth)))
+      } else if (failed(scanPureRegions(&operation, depth)))
         return failure();
       if (invalid || !budget.ok())
         return failure();
@@ -1027,6 +1036,7 @@ private:
   Builder builder;
   PublicationBudget budget;
   llvm::DenseSet<Operation *> visiting, visited;
+  llvm::DenseMap<StringAttr, SourceStateOp> localStates;
   llvm::DenseMap<std::pair<Value, Operation *>, DictionaryAttr> dependencyCache;
   llvm::DenseSet<Type> admittedBranchTypes;
   bool invalid = false;

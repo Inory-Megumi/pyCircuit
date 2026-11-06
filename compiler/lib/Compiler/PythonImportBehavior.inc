@@ -677,6 +677,7 @@ Importer::loopTypeShape(Type type, const AstNode &site,
                    uint64_t(std::max(1u, llvm::Log2_64_Ceil(*size))));
       result.declarations += element->declarations;
       result.fields = element->fields;
+      result.rows = *size;
     } else if (auto record = dyn_cast<ac::StructType>(current)) {
       auto declaration = analysis.lookupStruct(record);
       if (!declaration)
@@ -712,24 +713,28 @@ Importer::loopTypeShape(Type type, const AstNode &site,
 FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     const AstNode &node, const BranchEnvironment &environment,
     FlatSymbolRefAttr symbol, LoopStatementEnvelope &envelope,
-    std::optional<Type> expected) {
+    std::optional<Type> expected, bool assignmentTarget) {
   auto diagnostic = [&] {
     return mlir::emitError(node.location(b.getContext(), source.path));
   };
   if (!pureCheckedAdd(envelope.nodes, 1))
     return failure();
-  auto include = [&](LoopResourceShape shape) -> FailureOr<LoopResourceShape> {
-    envelope.precision = std::max(envelope.precision, shape.precision);
-    envelope.words = std::max(envelope.words, shape.words);
+  auto include = [&](LoopResourceShape shape,
+                     bool produced = true) -> FailureOr<LoopResourceShape> {
+    if (produced)
+      envelope.includeProduced(shape.precision, shape.words);
+    else
+      envelope.includeOperand(shape.precision, shape.words);
     envelope.operands = std::max(envelope.operands, shape.fields);
     if (!pureCheckedAdd(envelope.declarations, shape.declarations))
       return failure();
     return shape;
   };
-  auto typed = [&](Type type) -> FailureOr<LoopResourceShape> {
+  auto typed = [&](Type type, bool produced = true)
+      -> FailureOr<LoopResourceShape> {
     auto shape = loopTypeShape(type, node);
     return failed(shape) ? FailureOr<LoopResourceShape>(failure())
-                         : include(*shape);
+                         : include(*shape, produced);
   };
   auto operation = [&](uint64_t count) {
     return pureCheckedAdd(envelope.operations, count);
@@ -738,11 +743,15 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
                    std::optional<Type> hint = std::nullopt) {
     return describeLoopExpression(child, environment, symbol, envelope, hint);
   };
+  auto visitBase = [&] {
+    return describeLoopExpression(node.child("value"), environment, symbol,
+                                  envelope, std::nullopt, assignmentTarget);
+  };
   auto scalar = [&](uint64_t width) -> FailureOr<LoopResourceShape> {
     if (!width ||
         width > 64 * TableQueryBudget::limit(TableQueryResource::PayloadWords))
       return diagnostic() << "bounded for scalar precision envelope exhausted";
-    return include({{}, width, width / 64 + (width % 64 != 0), 0, 0});
+    return include({{}, width, loopPrecisionWords(width), 0, 0});
   };
   if (node.kind() == "Name") {
     auto found = environment.values.find(node.string("id"));
@@ -751,12 +760,9 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
                           << node.string("id") << "'";
     const auto *fact = findValueInfo(found->second);
     if (fact && fact->interval)
-      for (const auto *endpoint :
-           {&fact->interval->lower, &fact->interval->upper})
-        envelope.factWords = std::max(
-            envelope.factWords, uint64_t(endpoint->getBitWidth() / 64 +
-                                         (endpoint->getBitWidth() % 64 != 0)));
-    return typed(found->second.getType());
+      envelope.includeFacts(*fact->interval);
+    // A Name borrows a value prepaid by the capture or defining statement.
+    return typed(found->second.getType(), /*produced=*/false);
   }
   if (node.kind() == "Constant") {
     if (!operation(1))
@@ -796,7 +802,7 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
       return typed(ac::EnumType::get(
           b.getContext(), b.getStringAttr(nominal->symbol.getValue())));
     }
-    auto base = visit(node.child("value"));
+    auto base = visitBase();
     if (failed(base))
       return failure();
     auto record = dyn_cast_or_null<ac::StructType>(base->type);
@@ -820,7 +826,7 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     return diagnostic() << "bounded for projection lacks a declared field";
   }
   if (node.kind() == "Subscript") {
-    auto base = visit(node.child("value"));
+    auto base = visitBase();
     if (failed(base))
       return failure();
     auto index = node.child("slice");
@@ -839,6 +845,15 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     if (table) {
       if (!operation(1))
         return failure();
+      if (assignmentTarget) {
+        // The update splats the complete index carrier and compares each row
+        // at the wider of the ordinal and index widths.
+        uint64_t words;
+        if (!pureCheckedProduct(base->rows,
+                                loopPrecisionWords(count->precision), words))
+          return failure();
+        envelope.includeProduced(count->precision, words);
+      }
       return typed(table.getElementType());
     }
     if (base->type && !isa<ac::BitsType>(base->type))
@@ -850,10 +865,8 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     // admission stays with expression(), as for ordinary scalar arithmetic.
     if (!operation(6))
       return failure();
-    envelope.precision = std::max(envelope.precision,
-                                  std::max(base->precision, count->precision));
-    envelope.words =
-        std::max(envelope.words, std::max(base->words, count->words));
+    envelope.includeProduced(std::max(base->precision, count->precision),
+                             std::max(base->words, count->words));
     return scalar(1);
   }
   if (node.kind() == "UnaryOp") {
@@ -889,8 +902,11 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     }
     if (!pureCheckedAdd(width, 2))
       return failure();
-    envelope.precision = std::max(envelope.precision, width);
-    return scalar(comparison ? 1 : width);
+    if (comparison) {
+      envelope.includeProduced(width);
+      return scalar(1);
+    }
+    return scalar(width);
   }
   if (node.kind() == "BoolOp") {
     for (size_t i = 0; i < node.array("values").size(); ++i)
@@ -1030,7 +1046,8 @@ FailureOr<LoopResourceShape> Importer::describeLoopExpression(
     for (size_t i = 0; i < node.array("args").size(); ++i)
       if (failed(visit(node.item("args", i))))
         return failure();
-    return typed((*helper)->results.front().type);
+    // Helper instantiation and its boundary conversions have their own prepay.
+    return typed((*helper)->results.front().type, /*produced=*/false);
   }
   return diagnostic() << "bounded for cannot reserve expression '"
                       << node.kind() << "'";
@@ -1198,16 +1215,16 @@ uint64_t loopIntegerDecimalBytes(uint64_t precision) {
 
 LogicalResult Importer::payLoopEnvelope(LoopStatementEnvelope &e,
                                         const AstNode &site, StringRef phase) {
-  uint64_t B = 0, L = 0, P = 0, h = 0, slots = 0, storage = 0, facts = 0,
-           constants = 0, work = 0, frames = 0;
-  uint64_t factPrecision = e.precision;
-  bool fits = pureCheckedAdd(factPrecision, 2) &&
+  uint64_t B = 0, L = 0, slots = 0, storage = 0, facts = 0, constants = 0,
+           work = 0, frames = 0;
+  e.factPrecision = std::max(e.factPrecision, e.producedPrecision);
+  bool fits = pureCheckedAdd(e.factPrecision, 2) &&
               pureCheckedProduct(4, e.maps, B) &&
               pureCheckedProduct(2, e.operations, L) && pureCheckedAdd(L, B);
-  h = std::max(e.factWords, e.precision / 64 + (e.precision % 64 != 0));
-  fits &= pureCheckedProduct(
-      e.words,
-      std::max(uint64_t(1), e.precision / 64 + (e.precision % 64 != 0)), P);
+  e.factWords = std::max(e.factWords, loopPrecisionWords(e.factPrecision));
+  // Layouts already count machine words, including aggregate leaves and Table
+  // rows. Only newly produced values and conversion scratch need payload here.
+  const uint64_t P = e.producedWords;
   fits &= pureCheckedProduct(e.operands + 2, e.operations, slots) &&
           pureCheckedAdd(slots, B);
   uint64_t part = 0;
@@ -1221,12 +1238,13 @@ LogicalResult Importer::payLoopEnvelope(LoopStatementEnvelope &e,
       pureCheckedAdd(slots, frames);
   fits &= pureCheckedProduct(3, P, storage) &&
           pureCheckedProduct(storage, L, storage);
-  fits &= pureCheckedProduct(2, h, facts) &&
+  fits &= pureCheckedProduct(2, e.factWords, facts) &&
           pureCheckedProduct(facts, L, facts) && pureCheckedAdd(storage, facts);
   fits &= pureCheckedProduct(e.patternBytes ? 64 : 8, P, constants) &&
           pureCheckedProduct(constants, L, constants);
-  fits &= pureCheckedProduct(3, loopIntegerDecimalBytes(factPrecision), part) &&
-          pureCheckedProduct(part, L, part) && pureCheckedAdd(constants, part);
+  fits &=
+      pureCheckedProduct(3, loopIntegerDecimalBytes(e.factPrecision), part) &&
+      pureCheckedProduct(part, L, part) && pureCheckedAdd(constants, part);
   work = e.nodes;
   fits &= pureCheckedProduct(2, e.operations, part) &&
           pureCheckedAdd(work, part) && pureCheckedAdd(work, B) &&
@@ -1247,8 +1265,6 @@ LogicalResult Importer::payLoopEnvelope(LoopStatementEnvelope &e,
            << ": " << (fits ? reason : "resource envelope counter exhausted");
   e.arguments = B;
   e.values = L;
-  e.words = P;
-  e.factWords = h;
   return success();
 }
 
@@ -1284,8 +1300,9 @@ Importer::reserveLoopStatement(const AstNode &statement,
       expected = *type;
     }
     if (target.kind() != "Name") {
-      auto shape =
-          describeLoopExpression(target, environment, symbol, envelope);
+      auto shape = describeLoopExpression(target, environment, symbol,
+                                          envelope, std::nullopt,
+                                          /*assignmentTarget=*/true);
       if (failed(shape))
         return failure();
       expected = shape->type;
@@ -1303,8 +1320,7 @@ Importer::reserveLoopStatement(const AstNode &statement,
                                      : 4) ||
           !pureCheckedAdd(envelope.operations, count))
         return failure();
-      envelope.precision = std::max(envelope.precision, aggregate->precision);
-      envelope.words = std::max(envelope.words, aggregate->words);
+      envelope.includeProduced(aggregate->precision, aggregate->words);
       envelope.operands = std::max(envelope.operands, aggregate->fields);
       envelope.declarations += aggregate->declarations;
       envelope.maps += aggregate->declarations;
@@ -1316,8 +1332,7 @@ Importer::reserveLoopStatement(const AstNode &statement,
       auto destination = loopTypeShape(*expected, target);
       if (failed(destination))
         return failure();
-      envelope.precision = std::max(envelope.precision, destination->precision);
-      envelope.words = std::max(envelope.words, destination->words);
+      envelope.includeProduced(destination->precision, destination->words);
       envelope.operands = std::max(envelope.operands, destination->fields);
       if (!pureCheckedAdd(envelope.declarations, destination->declarations))
         return failure();
@@ -1356,17 +1371,12 @@ FailureOr<LoopStatementEnvelope> Importer::reserveLoopJoin(
           continue;
         const auto &interval = *fact->interval;
         negativePeer |= interval.lower.isNegative();
-        for (const auto *endpoint : {&interval.lower, &interval.upper})
-          envelope.factWords =
-              std::max(envelope.factWords,
-                       uint64_t(endpoint->getBitWidth() / 64 +
-                                (endpoint->getBitWidth() % 64 != 0)));
+        envelope.includeFacts(interval);
       }
       if (negativePeer && isa<ac::BitsType>(value.getType()) &&
           !pureCheckedAdd(selectionPrecision, 1))
         return failure();
-      envelope.precision = std::max(envelope.precision, selectionPrecision);
-      envelope.words = std::max(envelope.words, shape->words);
+      envelope.includeProduced(selectionPrecision, shape->words);
       envelope.operands = std::max(envelope.operands, shape->fields);
       envelope.declarations += shape->declarations;
       envelope.maps += shape->declarations;
@@ -1387,10 +1397,7 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
   auto diagnostic = [&] {
     return mlir::emitError(site.location(b.getContext(), source.path));
   };
-  uint64_t factPrecision = envelope.precision;
-  if (!pureCheckedAdd(factPrecision, 2))
-    return diagnostic() << "bounded for fact precision envelope exhausted";
-  const uint64_t factBytes = loopIntegerDecimalBytes(factPrecision);
+  const uint64_t factBytes = loopIntegerDecimalBytes(envelope.factPrecision);
   TableQueryCharge measured;
   uint64_t operations = 0, arguments = 0, values = 0;
   StringRef violatedBound;
@@ -1411,13 +1418,14 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
       return failure();
     auto weight = loopStorageWords(value.getType(), analysis, site);
     if (failed(weight) ||
-        !within(*weight, envelope.words, "value layout words") ||
+        !within(*weight, envelope.producedWords, "value layout words") ||
         !TableQueryBudget::addProduct(
             measured, TableQueryResource::PayloadWords, 3 * *weight, rows))
       return failure();
     auto schema = loopTypeShape(value.getType(), site, &analysis);
     if (failed(schema) ||
-        !within(schema->precision, envelope.precision, "value precision"))
+        !within(schema->precision, envelope.producedPrecision,
+                "value precision"))
       return failure();
     const auto *fact = findValueInfo(value);
     if (fact) {
@@ -1427,12 +1435,11 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
       if (info.interval)
         for (const llvm::APSInt *endpoint :
              {&info.interval->lower, &info.interval->upper}) {
-          uint64_t words = endpoint->getBitWidth() / 64 +
-                           (endpoint->getBitWidth() % 64 != 0);
+          uint64_t words = loopPrecisionWords(endpoint->getBitWidth());
           if (words > envelope.factWords ||
               (endpoint->isSigned()
                    ? endpoint->getSignificantBits()
-                   : endpoint->getActiveBits()) > factPrecision ||
+                   : endpoint->getActiveBits()) > envelope.factPrecision ||
               !TableQueryBudget::add(measured, TableQueryResource::PayloadWords,
                                      words) ||
               !TableQueryBudget::add(measured,
@@ -1471,8 +1478,9 @@ Importer::auditLoopStatement(Block &block, Operation *previous,
         return failure();
       auto shape = loopTypeShape(operand.getType(), site, &analysis);
       if (failed(shape) ||
-          !within(shape->precision, envelope.precision, "operand precision") ||
-          !within(shape->words, envelope.words, "operand layout words"))
+          !within(shape->precision, envelope.operandPrecision,
+                  "operand precision") ||
+          !within(shape->words, envelope.operandWords, "operand layout words"))
         return failure();
     }
     for (Value result : operation.getResults())
@@ -1941,16 +1949,15 @@ LogicalResult Importer::lowerLiteralFor(const AstNode &statement, OpBuilder &at,
     LoopStatementEnvelope induction;
     induction.operations = 4;
     induction.nodes = 1;
-    induction.precision =
-        std::max(uint64_t(1), uint64_t(llvm::Log2_64_Ceil(ordinal + 1)));
+    induction.includeProduced(
+        std::max(uint64_t(1), uint64_t(llvm::Log2_64_Ceil(ordinal + 1))));
     auto boundary = staged.boundaries.find(syntax->target.string("id"));
     if (boundary != staged.boundaries.end() && boundary->second.contract().type) {
       auto shape =
           loopTypeShape(boundary->second.contract().type, syntax->target);
       if (failed(shape))
         return failure();
-      induction.precision = std::max(induction.precision, shape->precision);
-      induction.words = std::max(induction.words, shape->words);
+      induction.includeProduced(shape->precision, shape->words);
     }
     if (failed(payLoopEnvelope(induction, syntax->target, "binder")))
       return failure();

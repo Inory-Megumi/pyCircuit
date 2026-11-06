@@ -52,6 +52,7 @@ public:
     }
     if (failed(verifyHardwarePackageStage(analysis, profile))) return failure();
     {
+      budget.setPhase("native operation verification");
       NativeSourceCheckScope native(analysis, validation, budget, nativeChecks);
       // Establish the builtin package's own ODS/trait/custom shape before any
       // child verifier assumes its parent is well formed. Full nonrecursive
@@ -72,6 +73,7 @@ public:
       // cross-child region/dominance checks without scheduling them again.
       if (failed(mlir::verify(package, false))) return failure();
     }
+    budget.setPhase("package envelope verification");
     if (failed(verifyHardwarePackageEnvelope(
             analysis, profile, [&](uint64_t units, Operation *site) {
               return budget.debit(units, site);
@@ -590,27 +592,6 @@ private:
       }
       return success();
     };
-    auto callableCost = [&](ArrayAttr invocation, uint64_t before,
-                            bool parent) -> LogicalResult {
-      for (uint64_t j = 0; j < before; ++j) {
-        if (failed(budget.debit(1, site)))
-          return failure();
-        cost = add(cost, 1);
-        auto candidate = dyn_cast<DictionaryAttr>(controls[j]);
-        if (!validControl(candidate))
-          return fail();
-        if (kindOf(candidate).getValue() != "callable_guard")
-          continue;
-        auto prior = candidate.getAs<ArrayAttr>("invocation");
-        uint64_t requiredLength = parent ? add(prior.size(), 1) : prior.size();
-        if (requiredLength != invocation.size())
-          continue;
-        if (parent ? failed(prefixRelation(prior, invocation))
-                   : failed(comparison(prior, invocation)))
-          return failure();
-      }
-      return success();
-    };
     if (failed(attributeCost(sampled)) || failed(attributeCost(required)) ||
         failed(attributeCost(site->getAttr("occurrence"))))
       return failure();
@@ -631,30 +612,9 @@ private:
           failed(comparison(record.get("id"), id)) ||
           failed(pathCost(row, invocation, ordinal)))
         return failure();
-      for (uint64_t j = 0; j < ordinal; ++j) {
-        if (failed(budget.debit(1, site)))
-          return failure();
-        cost = add(cost, 1);
-        auto prior = dyn_cast<DictionaryAttr>(controls[j]);
-        if (!validControl(prior))
-          return fail();
-        auto priorInvocation = prior.getAs<ArrayAttr>("invocation");
-        if (kindOf(prior) != kindOf(row) ||
-            priorInvocation.size() != invocation.size())
-          continue;
-        if (failed(comparison(priorInvocation, invocation)))
-          return failure();
-        // Census all eligible selection-site comparisons without retaining
-        // structural identity verdicts or stopping at a successful owner.
-        if (kindOf(row).getValue() == "branch_select" &&
-            failed(comparison(prior.getAs<DictionaryAttr>("id").get("check"),
-                              id.get("check"))))
-          return failure();
-      }
-      if (ordinal && failed(callableCost(
-                         invocation, ordinal,
-                         kindOf(row).getValue() == "callable_guard")))
-        return failure();
+      // Earlier controls already passed these raw shape checks. Identity and
+      // callable-prefix comparisons are charged by native sampled validation;
+      // do not rescan every prior row to compute an unused speculative cost.
     }
     for (StringRef key : {"body_checks", "observations"}) {
       auto rows = sampled.getAs<ArrayAttr>(key);
@@ -672,7 +632,6 @@ private:
         frames = add(frames, invocation.size());
         if (failed(attributeCost(invocation)) ||
             failed(comparison(id.get("registration"), site->getAttr("occurrence"))) ||
-            failed(callableCost(invocation, g, false)) ||
             failed(pathCost(row, invocation, g)))
           return failure();
         if (key == "body_checks") {
@@ -1349,14 +1308,29 @@ private:
         check.samplingBindingIndex = known->second;
         continue;
       }
-      auto sampled =
-          parseSampledAdmission(check.rule, analysis, bindings, budget);
-      if (failed(sampled))
+      // catalog() supplies only the native-verified checks for this exact
+      // definition and owner-only bindings, with no intervening IR mutation.
+      // Reuse its authenticated domain captures instead of reparsing every
+      // control/identity in the Rule merely to recover these two operands.
+      if (failed(budget.debit(8, check.rule)))
         return failure();
-      auto clock =
-          makeIdentityEndpoint(sampled->clock, scope, analysis, budget);
-      auto reset =
-          makeIdentityEndpoint(sampled->reset, scope, analysis, budget);
+      auto sampled = check.rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
+      if (check.rule->getParentOp() != definition || !sampled)
+        return check.rule->emitOpError() << "sampling catalog requires its verified owning Rule";
+      auto error = [&] { return check.rule->emitOpError(); };
+      auto clockIndex = decodeU64(sampled.getAs<IntegerAttr>("clock_capture"),
+                                  "clock capture ordinal", error);
+      auto resetIndex = decodeU64(sampled.getAs<IntegerAttr>("reset_capture"),
+                                  "reset capture ordinal", error);
+      if (failed(clockIndex) || failed(resetIndex))
+        return failure();
+      if (*clockIndex >= check.rule->getNumOperands() ||
+          *resetIndex >= check.rule->getNumOperands())
+        return check.rule->emitOpError() << "sampling catalog capture is outside its verified Rule";
+      auto clock = makeIdentityEndpoint(check.rule->getOperand(*clockIndex),
+                                        scope, analysis, budget);
+      auto reset = makeIdentityEndpoint(check.rule->getOperand(*resetIndex),
+                                        scope, analysis, budget);
       if (failed(clock) || failed(reset))
         return failure();
       auto normalizedClock =

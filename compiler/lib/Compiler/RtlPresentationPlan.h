@@ -29,8 +29,9 @@ public:
     };
     struct Check {
         mlir::Value condition, path;
+        bool assertion = false;
         bool pathUnknown = true, conditionUnknown = true, pathAlwaysOne = false;
-        bool needed() const { return pathUnknown || conditionUnknown; }
+        bool needed() const { return assertion || pathUnknown || conditionUnknown; }
     };
 
     RtlPresentationPlan(HardwareEmitContext &context, ac::ModuleOp module)
@@ -280,6 +281,7 @@ public:
             if (binding.definition != module) continue;
             const auto &plan = check(ordinal);
             checkRows.push_back(llvm::json::Object{{"ordinal", ordinal},
+                {"kind", binding.kind.getValue().str()},
                 {"condition", ids.lookup(canonical(plan.condition))},
                 {"path", ids.lookup(canonical(plan.path))},
                 {"disposition", plan.needed() ? "runtime" : "proven-zero"}});
@@ -353,12 +355,14 @@ private:
             if (binding.definition != module) continue;
             auto &condition = nodes[idOf(binding.condition)], &path = nodes[idOf(binding.path)];
             Check plan{binding.condition, binding.path,
+                binding.kind.getValue() == "assert",
                 !path.oneBit || bool(path.domain & 12),
                 (!condition.oneBit || bool(condition.domain & 12)) && (!path.oneBit || bool(path.domain & 2)),
                 path.oneBit && path.domain == 2};
             checks.try_emplace(ordinal, plan);
-            if (plan.pathUnknown || (plan.conditionUnknown && !plan.pathAlwaysOne)) root(plan.path);
-            if (plan.conditionUnknown) root(plan.condition);
+            if (plan.assertion || plan.pathUnknown ||
+                (plan.conditionUnknown && !plan.pathAlwaysOne)) root(plan.path);
+            if (plan.assertion || plan.conditionUnknown) root(plan.condition);
         }
         module.walk([&](mlir::Operation *op) {
             if (!mlir::isa<ac::InstanceOp, ac::CollectionOp>(op)) return;

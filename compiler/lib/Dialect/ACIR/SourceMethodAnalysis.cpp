@@ -322,20 +322,29 @@ private:
     return isa<BitsType, StructType, EnumType, TableType, TypeParamType>(type);
   }
   LogicalResult boundType(Type type, const HardwareBindings &bindings,
-                          const HardwareAnalysis &hardware, Operation *site) {
+                          const HardwareAnalysis &hardware, Operation *site,
+                          llvm::DenseSet<Type> &checkedTypes) {
     // Arithmetic/index transport keeps its existing source verifier.
     if (!hardwareType(type)) return success();
+    if (!charge(site))
+      return failure();
+    if (checkedTypes.contains(type))
+      return success();
     if (!bindingCost(bindings, site) || failed(boundCost(type, site)))
       return failure();
     auto width = hardware.getPackedWidth(type, bindings, site);
     if (failed(width)) return failure();
     if (!*width)
       return site->emitOpError() << "bound Method payload requires positive width";
+    if (!charge(site, 8))
+      return failure();
+    checkedTypes.insert(type);
     return success();
   }
   LogicalResult boundMethodBody(Operation *operation,
                                 const HardwareBindings &bindings,
                                 const HardwareAnalysis &hardware,
+                                llvm::DenseSet<Type> &checkedTypes,
                                 unsigned depth = 0) {
     if (depth > maxDepth)
       return operation->emitOpError() << "bound Method region depth exceeded";
@@ -349,14 +358,14 @@ private:
                            TypeRange(operation->getResultTypes())})
       for (Type type : types) {
         hardwareOperands &= hardwareType(type);
-        if (failed(boundType(type, bindings, hardware, operation)))
+        if (failed(boundType(type, bindings, hardware, operation, checkedTypes)))
           return failure();
       }
     if (auto method = dyn_cast<SourceMethodOp>(operation))
       for (TypeRange types : {method.getFunctionType().getInputs(),
                              method.getFunctionType().getResults()})
         for (Type type : types)
-          if (failed(boundType(type, bindings, hardware, operation)))
+          if (failed(boundType(type, bindings, hardware, operation, checkedTypes)))
             return failure();
     // Reuse constant-fit/extract/resize/width semantics; mixed transport
     // operations retain their existing verifier instead of imposing Bits.
@@ -367,10 +376,11 @@ private:
       for (Block &block : region) {
         if (!charge(operation, block.getNumArguments())) return failure();
         for (Type type : block.getArgumentTypes())
-          if (failed(boundType(type, bindings, hardware, operation)))
+          if (failed(boundType(type, bindings, hardware, operation, checkedTypes)))
             return failure();
         for (Operation &nested : block)
-          if (failed(boundMethodBody(&nested, bindings, hardware, depth + 1)))
+          if (failed(boundMethodBody(&nested, bindings, hardware, checkedTypes,
+                                     depth + 1)))
             return failure();
       }
     return success();
@@ -624,9 +634,13 @@ private:
       for (Operation &op : body.getBody().front()) {
         // Include unused Methods and both arms: routing later removes them,
         // but their declarations must be valid for each actual occurrence.
-        if (verifyBodies && isa<SourceMethodOp>(op) &&
-            failed(boundMethodBody(&op, parent, hardware)))
-          return failure();
+        if (verifyBodies && isa<SourceMethodOp>(op)) {
+          // Reuse successful layout proofs only within this actual-bound
+          // Method body. Operation-specific verification still runs below.
+          llvm::DenseSet<Type> checkedTypes;
+          if (failed(boundMethodBody(&op, parent, hardware, checkedTypes)))
+            return failure();
+        }
         if (isa<InstanceOp, CollectionOp>(op) &&
             failed(edge(op.getAttrOfType<FlatSymbolRefAttr>("callee"),
                         op.getAttrOfType<ArrayAttr>("parameters"),

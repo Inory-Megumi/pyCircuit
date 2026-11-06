@@ -448,15 +448,45 @@ OwningOpRef<ModuleOp> unit(MLIRContext *ctx, Location loc, DictionaryAttr owner,
 struct LoopAdmissionSummary {
   uint64_t nodes = 0;
 };
+
+static uint64_t loopPrecisionWords(uint64_t precision) {
+  return precision / 64 + (precision % 64 != 0);
+}
+
 struct LoopStatementEnvelope {
   TableQueryCharge reservation;
   uint64_t operations = 0, arguments = 0, values = 0, operands = 4;
-  uint64_t precision = 1, words = 1, factWords = 1;
+  uint64_t operandPrecision = 1, operandWords = 1;
+  uint64_t producedPrecision = 1, producedWords = 1;
+  uint64_t factPrecision = 1, factWords = 1;
   uint64_t nodes = 0, declarations = 0, maps = 0, patternBytes = 0;
+
+  void includeOperand(uint64_t width, uint64_t layout) {
+    operandPrecision = std::max(operandPrecision, width);
+    operandWords = std::max(operandWords, layout);
+  }
+
+  void includeProduced(uint64_t width, uint64_t layout = 1) {
+    layout = std::max(layout, loopPrecisionWords(width));
+    includeOperand(width, layout);
+    producedPrecision = std::max(producedPrecision, width);
+    producedWords = std::max(producedWords, layout);
+  }
+
+  void includeFacts(const IntegerInterval &interval) {
+    for (const auto *endpoint : {&interval.lower, &interval.upper}) {
+      factWords =
+          std::max(factWords, loopPrecisionWords(endpoint->getBitWidth()));
+      factPrecision = std::max(
+          factPrecision, uint64_t(endpoint->isSigned()
+                                      ? endpoint->getSignificantBits()
+                                      : endpoint->getActiveBits()));
+    }
+  }
 };
 struct LoopResourceShape {
   Type type;
-  uint64_t precision = 1, words = 1, declarations = 0, fields = 0;
+  uint64_t precision = 1, words = 1, declarations = 0, fields = 0, rows = 1;
 };
 struct LoopLoweringContext {
   AstNode statement;
@@ -505,7 +535,8 @@ private:
   FailureOr<LoopResourceShape> describeLoopExpression(
       const AstNode &node, const BranchEnvironment &environment,
       FlatSymbolRefAttr symbol, LoopStatementEnvelope &envelope,
-      std::optional<Type> expected = std::nullopt);
+      std::optional<Type> expected = std::nullopt,
+      bool assignmentTarget = false);
   FailureOr<LoopStatementEnvelope>
   reserveLoopStatement(const AstNode &statement,
                        const BranchEnvironment &environment,

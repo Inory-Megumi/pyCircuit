@@ -399,6 +399,10 @@ struct PackageInventory {
   llvm::DenseMap<Operation *, uint64_t> operationCosts;
   llvm::DenseMap<Operation *, uint64_t> moduleCosts;
   llvm::DenseMap<Attribute, uint64_t> methodCosts;
+  // Index direct declarations for this analysis. A null entry marks a name
+  // shared by multiple declarations. Actual owner bindings are plan-local.
+  llvm::DenseMap<std::pair<Operation *, StringAttr>, SourceStateOp>
+      stateDeclarations;
 };
 
 LogicalResult preflight(mlir::ModuleOp package, StateAnalysisBudget &budget,
@@ -553,6 +557,21 @@ LogicalResult priceResolver(mlir::ModuleOp package, StateAnalysisBudget &budget,
           return failure();
         inventory.methodCosts.try_emplace(
             view.getSymbol(), inventory.operationCosts.lookup(method));
+      } else if (auto state = dyn_cast<SourceStateOp>(declaration)) {
+        auto name = state.getInstanceNameAttr();
+        if (!name)
+          continue;
+        if (!budget.charge(&declaration))
+          return failure();
+        auto key = std::make_pair(module.getOperation(), name);
+        auto found = inventory.stateDeclarations.find(key);
+        if (found != inventory.stateDeclarations.end()) {
+          found->second = {};
+          continue;
+        }
+        if (!budget.reserveMapInsert(&declaration, inventory.stateDeclarations))
+          return failure();
+        inventory.stateDeclarations.try_emplace(key, state);
       }
     }
     if (!budget.charge(module))
@@ -1310,21 +1329,16 @@ private:
   FailureOr<StateOwnerId> owner(Operation *effect, LexicalInstanceId anchor,
                                  StringAttr explicitName = {}) {
     auto module = plan.instances[anchor].definition;
-    auto name = explicitName ? explicitName : effect->getAttrOfType<StringAttr>("state");
-    SourceStateOp declaration;
-    for (Operation &op : module.getBody().front()) {
-      if (!budget.charge(effect))
-        return failure();
-      auto state = dyn_cast<SourceStateOp>(op);
-      if (state && state->getAttrOfType<StringAttr>("instance_name") == name) {
-        if (declaration)
-          return effect->emitOpError()
-                 << "transaction state owner is ambiguous";
-        declaration = state;
-      }
-    }
-    if (!declaration)
+    auto name = explicitName ? explicitName
+                             : effect->getAttrOfType<StringAttr>("state");
+    if (!budget.charge(effect))
+      return failure();
+    auto state = inventory.stateDeclarations.find({module.getOperation(), name});
+    if (state == inventory.stateDeclarations.end())
       return effect->emitOpError() << "transaction state owner is unresolved";
+    SourceStateOp declaration = state->second;
+    if (!declaration)
+      return effect->emitOpError() << "transaction state owner is ambiguous";
     auto key = OwnerKey{anchor, declaration};
     auto found = owners.find(key);
     if (found != owners.end())

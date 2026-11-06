@@ -1311,4 +1311,71 @@ TEST_F(HardwareValueAvailabilityTest,
                        f("validity", b.getI64IntegerAttr(1))})}));
   EXPECT_FALSE(proves());
 }
+TEST_F(HardwareValueAvailabilityTest, DeepWholeTableForwardingIsUniform) {
+  build(false);
+  auto table = ac::TableType::get(&context, b.getArrayAttr({literal(2)}), bits(8));
+  cast<BlockArgument>(payload).setType(table);
+  module->setAttr("function_type", TypeAttr::get(
+      b.getFunctionType({table, bits(1), bits(1)}, {table, bits(1)})));
+  b.setInsertionPoint(yield);
+  Value value = payload;
+  for (unsigned i = 0; i < 256; ++i)
+    value = op(ac::ValueMergeOp::getOperationName(), {value}, {table, bits(1)},
+               {f("paths", b.getArrayAttr({})),
+                f("operandSegmentSizes", b.getDenseI32ArrayAttr({1, 0, 0}))})
+                ->getResult(0);
+  yield->setOperand(0, value);
+  ASSERT_TRUE(succeeded(verify(*package)));
+  ac::HardwareAnalysis analysis(*package);
+  auto uniform = ac::detail::hasUniformTableAvailability(value, analysis);
+  ASSERT_TRUE(succeeded(uniform));
+  EXPECT_TRUE(*uniform);
+}
+
+TEST_F(HardwareValueAvailabilityTest, DeepPayloadProofRecoversAfterFailure) {
+  build();
+  b.setInsertionPoint(yield);
+  Value chain = yield->getOperand(0);
+  for (unsigned i = 0; i < 256; ++i)
+    chain = op(ac::BitsBinaryOp::getOperationName(), {chain, chain}, {bits(8)},
+               {f("opcode", b.getStringAttr("add"))})->getResult(0);
+  yield->setOperand(0, chain);
+  ASSERT_TRUE(succeeded(verify(*package)));
+  ac::HardwareAnalysis analysis(*package);
+  uint64_t completeWork = 0;
+  ASSERT_TRUE(succeeded(ac::detail::verifyHardwareValueAvailability(
+      analysis, [&](uint64_t amount, Operation *) {
+        completeWork += amount;
+        return success();
+      })));
+  const auto original = printPackage();
+  uint64_t remaining = completeWork / 2;
+  unsigned callbacksAfterFailure = 0;
+  bool denied = false;
+  EXPECT_TRUE(failed(ac::detail::verifyHardwareValueAvailability(
+      analysis, [&](uint64_t amount, Operation *) {
+        if (denied)
+          ++callbacksAfterFailure;
+        if (amount > remaining) {
+          denied = true;
+          return failure();
+        }
+        remaining -= amount;
+        return success();
+      })));
+  EXPECT_TRUE(denied);
+  EXPECT_EQ(callbacksAfterFailure, 0u);
+  EXPECT_EQ(original, printPackage());
+  EXPECT_TRUE(succeeded(ac::detail::verifyHardwareValueAvailability(analysis)));
+
+  // Mutate after verification to exercise the proof's cycle handling itself.
+  auto *last = chain.getDefiningOp();
+  auto previous = last->getOperand(0);
+  last->setOperand(0, chain);
+  EXPECT_TRUE(failed(ac::detail::verifyHardwareValueAvailability(analysis)));
+  last->setOperand(0, previous);
+  EXPECT_TRUE(succeeded(ac::detail::verifyHardwareValueAvailability(analysis)));
+  EXPECT_EQ(original, printPackage());
+}
+
 } // namespace

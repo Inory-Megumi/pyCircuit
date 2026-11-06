@@ -2,12 +2,33 @@
 #define PYCIRCUIT_HARDWARE_SAMPLED_ADMISSION_H
 
 #include "pycircuit/Dialect/ACIR/HardwareAnalysis.h"
+#include "llvm/ADT/DenseSet.h"
 #include <memory>
 #include <optional>
 #include <utility>
 
 namespace acir::ac::detail {
 class SourceCheckBudget;
+
+/// Owns successful external fire-use proof for one immutable validation.
+class SampledFireUses {
+public:
+  SampledFireUses(const HardwareAnalysis &analysis, SourceCheckBudget &budget)
+      : analysis(analysis), budget(budget), package(analysis.getPackage()) {}
+  SampledFireUses(const SampledFireUses &) = delete;
+  SampledFireUses &operator=(const SampledFireUses &) = delete;
+
+  mlir::LogicalResult verify(RuleOp rule, uint64_t fireResult,
+                             const HardwareAnalysis &analysis,
+                             SourceCheckBudget &budget);
+
+private:
+  using Uses = llvm::DenseSet<mlir::OpOperand *>;
+  const HardwareAnalysis &analysis;
+  SourceCheckBudget &budget;
+  mlir::ModuleOp package;
+  std::optional<Uses> verified;
+};
 
 enum class SampledControlKind : uint8_t { CallableGuard, BranchSelect, ValueAvailable, ResourceAvailable };
 struct SampledValueRequirement {
@@ -185,7 +206,7 @@ private:
   prepareSampledBoundaries(ModuleOp definition,
                            const HardwareAnalysis &analysis,
                            const HardwareBindings &bindings,
-                           SourceCheckBudget &budget);
+                           SourceCheckBudget &budget, SampledFireUses *fireUses);
 
   HardwareIdentityScope scope;
   llvm::SmallVector<HardwareIdentityEndpoint> boundaries;
@@ -194,9 +215,11 @@ private:
 mlir::FailureOr<std::optional<PreparedSampledBoundaries>>
 prepareSampledBoundaries(ModuleOp definition, const HardwareAnalysis &analysis,
                          const HardwareBindings &bindings,
-                         SourceCheckBudget &budget);
+                         SourceCheckBudget &budget,
+                         SampledFireUses *fireUses = nullptr);
 
-/// Reuses only definition-local preparation and completed prefix proofs.
+/// Reuses definition-local preparation, completed prefix proofs and the
+/// package-level proof of permitted external fire-use edges.
 /// The analysis, budget, package and complete boundaries must remain fixed for
 /// this object's lifetime. Actual occurrence and root wiring proofs stay
 /// separate.
@@ -251,6 +274,7 @@ private:
   struct Entry;
   const HardwareAnalysis &analysis;
   SourceCheckBudget &budget;
+  SampledFireUses fireUses;
   llvm::SmallVector<std::unique_ptr<Entry>, 0> entries;
 };
 
@@ -269,12 +293,12 @@ struct StateEndpoint {
 
 mlir::FailureOr<SampledAdmissionView>
 parseSampledAdmission(RuleOp rule, const HardwareAnalysis &analysis,
-                      const HardwareBindings &bindings,
-                      SourceCheckBudget &budget);
+                      const HardwareBindings &bindings, SourceCheckBudget &budget,
+                      SampledFireUses *fireUses = nullptr);
 mlir::FailureOr<TransactionWiringView>
 parseTransactionWiring(ModuleOp module, const HardwareAnalysis &analysis,
-                       const HardwareBindings &bindings,
-                       SourceCheckBudget &budget);
+                       const HardwareBindings &bindings, SourceCheckBudget &budget,
+                       SampledFireUses *fireUses = nullptr);
 mlir::FailureOr<StateEndpoint>
 resolveTransactionState(ModuleOp relativeTo, mlir::DictionaryAttr stateID,
                         const HardwareAnalysis &analysis,

@@ -1421,6 +1421,33 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
            rst = reset.getValue().getZExtValue();
   detail::SourceCheckBudget budget(limits);
   budget.setPhase("physical RTL projection");
+  detail::SampledFireUses fireUses(*this, budget);
+  using InstanceKey = std::pair<uint64_t, Operation *>;
+  llvm::DenseMap<InstanceKey, uint64_t> instanceOccurrences;
+  llvm::DenseMap<Operation *, unsigned> sourceOutputs;
+  for (auto [ordinal, occurrence] : llvm::enumerate(plan.owners)) {
+    auto definition = occurrence.definition;
+    if (!sourceOutputs.contains(definition)) {
+      if (failed(budget.debit(
+              detail::SourceCheckBudget::bytes(sizeof(std::pair<Operation *, unsigned>)),
+              definition)))
+        return failure();
+      auto ports = getModulePortLayout(definition);
+      if (failed(ports))
+        return failure();
+      sourceOutputs.try_emplace(definition, ports->sourceOutputCount);
+    }
+    if (!occurrence.parent)
+      continue;
+    auto *allocation = occurrence.path.back().allocation;
+    if (!isa<InstanceOp>(allocation))
+      continue;
+    if (failed(budget.debit(
+            detail::SourceCheckBudget::bytes(sizeof(std::pair<InstanceKey, uint64_t>)),
+            allocation)))
+      return failure();
+    instanceOccurrences.try_emplace({*occurrence.parent, allocation}, ordinal);
+  }
   // Identity-only transport is sufficient for domain proof. Uniform Tables
   // preserve identity through Collection slicing and layout permutations.
   // Derived expressions deliberately have no domain identity.
@@ -1455,6 +1482,15 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
         return identity(cast<YieldOp>(rule.getBody().front().back())
                             .getValues()[result.getResultNumber()],
                         owner, depth + 1);
+      auto instance = instanceOccurrences.find({owner, result.getOwner()});
+      if (instance != instanceOccurrences.end()) {
+        auto child = plan.owners[instance->second].definition;
+        unsigned index = result.getResultNumber();
+        if (index >= sourceOutputs.lookup(child))
+          return identity(cast<YieldOp>(child.getBody().front().back())
+                              .getValues()[index],
+                          instance->second, depth + 1);
+      }
     }
     if (auto extract = value.getDefiningOp<BitsExtractOp>()) {
       auto low = evaluateStatic(extract.getLow(), occurrence.bindings, extract);
@@ -1496,15 +1532,20 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
                 "actual root clock/reset pair";
     return success();
   };
-  llvm::DenseSet<Operation *> reachable;
-  for (const auto &owner : plan.owners)
-    reachable.insert(owner.definition);
-  for (const auto &check : plan.bindings)
-    if (reachable.contains(check.definition) &&
-        check.kind.getValue() != "guard_known")
-      return check.expect->emitOpError()
-             << "physical RTL requires managed execution for residual "
-             << check.kind.getValue() << " checks";
+  for (const auto &check : plan.bindings) {
+    if (!sourceOutputs.contains(check.definition))
+      continue;
+    StringRef kind = check.kind.getValue();
+    // Verification above authenticates the owning Rule and its body-check
+    // suffix. The sampled Rule's actual domain is checked below.
+    if (kind == "guard_known" ||
+        (kind == "assert" && check.rule &&
+         check.rule->hasAttr("ac.sampled_admission")))
+      continue;
+    return check.expect->emitOpError()
+           << "physical RTL requires managed execution for residual " << kind
+           << " checks";
+  }
   for (const auto &sampling : plan.samplingOccurrences) {
     const auto &binding = plan.samplingBindings[sampling.bindingIndex];
     if (failed(pair(binding.clock, binding.reset, sampling.ownerOccurrence,
@@ -1522,13 +1563,14 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
     for (auto rule : definition.getBody().front().getOps<RuleOp>()) {
       if (!rule->hasAttr("ac.sampled_admission"))
         continue;
-      auto view = detail::parseSampledAdmission(rule, *this,
-                                                occurrence.bindings, budget);
+      auto view = detail::parseSampledAdmission(
+          rule, *this, occurrence.bindings, budget, &fireUses);
       if (failed(view) || failed(pair(view->clock, view->reset, owner, rule)))
         return failure();
       for (const auto &control : view->controls)
         if (control.kind != detail::SampledControlKind::CallableGuard &&
-            control.kind != detail::SampledControlKind::BranchSelect)
+            control.kind != detail::SampledControlKind::BranchSelect &&
+            control.kind != detail::SampledControlKind::ValueAvailable)
           return rule.emitOpError() << "physical RTL requires managed "
                                        "execution for non-guard controls";
     }
@@ -1579,11 +1621,17 @@ FailureOr<HardwarePhysicalProjection> HardwareAnalysis::getPhysicalProjection(
           transport = *result == 1;
         }
         if (auto rule = dyn_cast<RuleOp>(op)) {
-          auto metadata =
-              rule->getAttrOfType<DictionaryAttr>("ac.sampled_admission");
-          auto capture = metadata ? metadata.getAs<IntegerAttr>("clock_capture")
-                                  : IntegerAttr();
-          transport = capture && index == capture.getValue().getZExtValue();
+          // A sampled Rule can capture a hidden domain carrier alongside its
+          // primary sampling clock. Walk its body to check all actual uses.
+          transport = rule->getBlock() == &definition.getBody().front() &&
+                      rule->hasAttr("ac.sampled_admission");
+        }
+        if (op == definition.getBody().front().getTerminator()) {
+          // The source result prefix remains public. Only ordinary instance
+          // suffix results participate in the actual-occurrence identity map.
+          transport = index >= sourceOutputs.lookup(definition) &&
+                      (!occurrence.parent ||
+                       isa<InstanceOp>(occurrence.path.back().allocation));
         }
         if (isa<InstanceOp, CollectionOp>(op)) {
           auto *callee = isa<InstanceOp>(op)

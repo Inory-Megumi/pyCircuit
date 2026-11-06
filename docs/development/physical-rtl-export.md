@@ -1,4 +1,4 @@
-# Physical-edge RTL export proposal
+# Physical-edge RTL export
 
 Design supplement: [four-state values, reset policy and System](../rfcs/four-state-system.md)
 defines explicit source literals, common root reset semantics and generated
@@ -6,9 +6,9 @@ four-state stimuli. The linked root now selects strict (default) or if_one for
 both native and RTL emission. References to reset below use that interpreted
 value. Reset policy is independent of the RTL adapter choice.
 
-Status: independently reviewed, ready for bounded implementation after the
-review corrections below. This does not claim
-current compiler support. It addresses C08 in the compiler benchmark audit.
+Status: implemented for the bounded single-domain DFF/DFFE profile below.
+Other storage resources and unsupported checks still require managed execution.
+This document records the physical execution contract and its validation scope.
 
 ## Interface and execution policy
 
@@ -42,8 +42,9 @@ A read-only physical projection of `HardwareSourceCheckPlan` must establish:
   and Collection bindings, not port names;
 - all state endpoints are existing DFF/DFFE leaves, including Collections;
 - no data/combinational use of clock and no derived clocks;
-- residual checks are guard-known checks; other checks must be proved nonfailing
-  by common SSA/binding analysis or rejected as requiring managed execution;
+- residual checks are guard-known checks or authenticated sampled Rule
+  assertions; other checks must be proved nonfailing by common SSA/binding
+  analysis or rejected as requiring managed execution;
 - no ordinary-module observations, unsupported primitive or unresolved domain.
 
 Enumerate both sampling bindings and physical storage endpoints, including
@@ -56,10 +57,24 @@ predicates combinationally and aggregate with existing leaf-control errors.
 The knownness error is unknown(reached), or, when reset is known zero and reached
 is known one, unknown(predicate). A known false guard retains hold semantics.
 Constant true guards fold naturally; proving knownness never proves true fire.
-Guard-known controls include both callable guards and branch selectors from the
-current authenticated controls schema. Preserve actual raw/reached operands and
-ordered paths; do not infer them from generated enables. Any other check may be
-discharged only with a common proof covering every applicable input and X/Z case.
+Guard-known controls include callable guards, branch selectors and value
+availability requirements from the authenticated controls schema. A known-zero
+availability requirement stalls its Rule; a reached unknown requirement faults
+the root. Preserve actual raw/reached operands and ordered paths; do not infer
+them from generated enables.
+
+Sampled Rule assertions retain their condition, reached path and interpreted
+reset. On an active edge, a reached false or unknown condition prevents every
+state update, including independent writes elsewhere in the hierarchy. Inactive
+paths and asserted reset mask the assertion using the existing four-state
+predicate semantics. Other checks may be discharged only with a common proof
+covering every applicable input and X/Z case.
+
+Compiler-created hidden Method outputs on ordinary instances may forward the
+actual domain clock. Projection authenticates those hidden ports and follows
+their actual instance bindings to domain consumers. This does not admit public
+clock-as-data outputs, combinational clock use or hidden clock forwarding through
+Collections.
 
 Reuse `dff.v::next_q` and `dffe.v::next_q/edge_control_error` in a checked-autonomous
 selection distinct from managed phases. Each leaf exposes prospective rising-edge

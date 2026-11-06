@@ -8,6 +8,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ScopeExit.h"
 #include <limits>
+#include <memory>
 #include <optional>
 
 using namespace mlir;
@@ -270,13 +271,36 @@ class ValueAvailabilityMaterializer {
     }
     return success();
   }
-  FailureOr<SmallVector<ac::FieldPath>> leafPaths(Type type, Operation *site) {
-    SmallVector<ac::FieldPath> leaves;
-    ac::FieldPath path;
-    SmallVector<Type> stack;
-    if (failed(leafPaths(type, leaves, path, stack, site)))
+  using Paths = SmallVector<ac::FieldPath>;
+  // These layouts use immutable Struct declarations and no actual bindings.
+  // The row traversal rejects Table fields, so it has a separate cache.
+  // The heap-owned vectors stay stable when nested queries grow either map.
+  DenseMap<Type, std::unique_ptr<Paths>> rowShapePaths, hardwareShapePaths;
+  FailureOr<ArrayRef<ac::FieldPath>> cachedPaths(Type type, Operation *site,
+                                               bool hardwarePaths) {
+    auto &memo = hardwarePaths ? hardwareShapePaths : rowShapePaths;
+    if (failed(keyLookup(site))) return failure();
+    if (auto found = memo.find(type); found != memo.end())
+      return ArrayRef<ac::FieldPath>(*found->second);
+    if (failed(budget.debit(ac::detail::SourceCheckBudget::bytes(sizeof(Paths)), site)))
       return failure();
-    return leaves;
+    auto leaves = std::make_unique<Paths>();
+    if (hardwarePaths) {
+      auto computed = hardware.getFieldPaths(type, {}, site,
+          [&](uint64_t units, Operation *at) { return budget.debit(units, at); });
+      if (failed(computed)) return failure();
+      *leaves = std::move(*computed);
+    } else {
+      ac::FieldPath path;
+      SmallVector<Type> stack;
+      if (failed(leafPaths(type, *leaves, path, stack, site))) return failure();
+    }
+    if (failed(reserveKey(site, memo))) return failure();
+    auto entry = memo.try_emplace(type, std::move(leaves));
+    return ArrayRef<ac::FieldPath>(*entry.first->second);
+  }
+  FailureOr<ArrayRef<ac::FieldPath>> leafPaths(Type type, Operation *site) {
+    return cachedPaths(type, site, /*hardwarePaths=*/false);
   }
   bool below(ArrayRef<StringAttr> leaf, ArrayRef<StringAttr> path) {
     return path.size() <= leaf.size() &&
@@ -1204,8 +1228,8 @@ class ValueAvailabilityMaterializer {
           return failure();
         return fold->getResult(0);
       }
-      auto leaves = hardware.getFieldPaths(merge.getBase().getType(), {}, site,
-          [&](uint64_t units, Operation *at) { return budget.debit(units, at); });
+      auto leaves =
+          cachedPaths(merge.getBase().getType(), site, /*hardwarePaths=*/true);
       if (failed(leaves)) return failure();
       Value result;
       for (const auto &leaf : *leaves) {

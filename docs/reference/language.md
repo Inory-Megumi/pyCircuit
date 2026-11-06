@@ -766,7 +766,10 @@ supported unary/comparison/Boolean expressions,
 nominal Struct construction and contextual Table literals. Calls are limited to
 `concat`, `enum_to_bits` and verified pure value helpers. This does not broaden
 the loop grammar or named Table callback restrictions; helper expansion is
-charged to the existing loop and source-wide budgets.
+charged to the existing loop and source-wide budgets. In this expansion path,
+existing operands retain their layout checks. New projections, conversions,
+arithmetic intermediates and reconstructed aggregates contribute their own
+layouts to the storage budget.
 Unary `not` and fixed-bit `~` retain their existing rules. Unary `+` and `-`
 are not implemented in this profile, including zero-trip bodies; binary
 subtraction such as `0 - 1` can produce a negative Integer.
@@ -1021,9 +1024,10 @@ Predicates use the Boolean or authoritative fixed-one-bit boundary below.
 Check IDs, ordered obligations and condition/path result pairs are verified in
 the same source-unit and common hardware flow, including under Python `-O`.
 Both emitters consume verified source checks. C++ uses the shared whole-system
-check lifecycle; RTL assertions require the managed lifecycle described in
-[system execution](../architecture/system-execution.md). Compilation or linking
-alone does not establish runtime assertion checking.
+check lifecycle. RTL checks assertions through the managed lifecycle described in
+[system execution](../architecture/system-execution.md), or admits sampled Rule
+assertions under the bounded [physical-edge policy](../development/physical-rtl-export.md).
+Compilation or linking alone does not establish runtime assertion checking.
 
 Statement `if` in behavioral rules and conditional expressions (`a if test else
 b`) share predicate and value-join rules. A condition must be Boolean or an
@@ -1756,10 +1760,11 @@ in a closed system may contain only supported `log` or `report` calls, including
 statement-arm observations and systems with
 persistent state. No dummy assertion or instance binding is required; empty
 rules and unsupported observation forms
-still diagnose. Ordinary modules with
-reachable assertions require the managed RTL lifecycle described in
-[system execution](../architecture/system-execution.md); ordinary-module RTL
-observations still diagnose. Unsupported effects must not be silently dropped.
+still diagnose. Ordinary modules with reachable assertions use the managed RTL
+lifecycle described in [system execution](../architecture/system-execution.md),
+or the bounded [physical-edge policy](../development/physical-rtl-export.md) for
+admitted sampled Rule assertions. Ordinary-module RTL observations still diagnose.
+Unsupported effects must not be silently dropped.
 
 Dynamic hardware creation, host I/O inside designs, arbitrary Python execution,
 legacy CycleAwareSignal/JIT/builders, QueueGraph, `acc.py`, `acc` and `pycc` are

@@ -115,11 +115,16 @@ checks aggregate internally before any edge commits. It preserves declared
 closed startup values and synchronous reset, and reports
 `PYCIRCUIT_PHYSICAL_FAULT` on invalid controls or clock transitions. Simulation
 then freezes state; a physical reset does not clear the fault. Runners must reject
-that diagnostic even if a testbench later prints success. This is not a host
-Work/Discard interface. Residual non-guard checks, observations, non-register
-resources, multiple domains, clock-data use and dynamic initializers require
-managed execution. See [physical export](physical-rtl-export.md) for the precise
-timing and verification policy.
+that diagnostic even if a testbench later prints success. Physical execution
+checks sampled Rule assertions on active edges using the assertion's reached
+path and interpreted reset. A failing assertion prevents every state update
+on that edge, including independent writes elsewhere in the hierarchy.
+The compiler can forward the actual domain clock through hidden Method ports
+on ordinary instances. The same domain checks apply at each destination.
+Residual checks outside guard-known controls and sampled Rule assertions,
+observations, non-register resources, multiple domains, clock-data use and
+dynamic initializers require managed execution. See
+[physical export](physical-rtl-export.md) for the timing and verification policy.
 
 Likewise, a pure region's admitted operations must be supported by both target
 emitters. Nested Table construction and mapping inside an existing TableMap
